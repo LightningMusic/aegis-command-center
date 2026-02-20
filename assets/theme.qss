@@ -1,0 +1,45 @@
+QMainWindow {
+    background-color: #121212;
+}
+
+QWidget {
+    background-color: #1E1E1E;
+    color: #EAEAEA;
+    font-family: Segoe UI;
+    font-size: 14px;
+}
+
+QPushButton {
+    background-color: #2A2A2A;
+    border: none;
+    padding: 8px;
+    border-radius: 6px;
+    text-align: left;
+    padding-left: 12px;
+}
+
+QPushButton:hover {
+    background-color: #2F2F2F;
+}
+
+QPushButton:checked {
+    background-color: #1F2A35;
+    border-left: 4px solid #4F8EDC;
+    color: white;
+}
+
+QPushButton:focus {
+    outline: none;
+}
+
+QStatusBar {
+    background-color: #1A1A1A;
+    border-top: 1px solid #2A2A2A;
+}
+QComboBox {
+    font-size: 14px;
+}
+
+QComboBox QAbstractItemView {
+    font-size: 14px;
+}

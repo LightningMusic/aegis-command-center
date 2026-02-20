@@ -1,0 +1,507 @@
+🛡️ Aegis
+Personal Automation Command Center (P.A.C.C.)
+
+A dark, modern, desktop-only automation suite combining:
+
+📊 Productivity Command Center
+
+📁 Smart File Organizer
+
+📈 Analytics Dashboard
+
+⚙ Unified Backend
+
+Built for you. Not corporate. Not sanitized. Clean power-user tool.
+
+🎨 Design Identity
+Theme Philosophy
+
+Dark
+
+Controlled
+
+Sharp
+
+Efficient
+
+Slight edge
+
+No fluff
+
+Color Palette
+
+Background:
+#121212
+
+Panels:
+#1E1E1E
+
+Borders:
+#2A2A2A
+
+Primary Accent (Soft Professional Electric Blue):
+#007ACC
+
+Hover Accent:
+#1493E6
+
+Primary Text:
+#EAEAEA
+
+Secondary Text:
+#A0A0A0
+
+Blue is used with restraint:
+
+Left border highlight
+
+Focus outlines
+
+Progress bars
+
+Subtle hover effects
+
+🖥️ Application Layout
+Main Window Structure
+
+QMainWindow
+→ Central Widget
+→ Horizontal Layout
+
+Left:
+
+Vertical Sidebar
+
+Right:
+
+QStackedWidget (main content area)
+
+Bottom:
+
+Status Bar
+
+📂 Sidebar Tabs
+
+Dashboard
+
+Tasks
+
+File Organizer
+
+Analytics
+
+Settings
+
+Selected Tab:
+
+Blue left border
+
+Slight background tint
+
+Transitions:
+
+Instant switching
+
+Minimal fade animation (150ms max)
+
+📊 Dashboard Overview (Launch Screen)
+
+Top Summary Strip:
+
+High Priority Tasks
+
+Due Soon
+
+Active Monitors
+
+Active Session (if running)
+
+Main Panels:
+
+Productivity Snapshot
+
+Tasks due today
+
+Overdue count
+
+Completed this week
+
+Active Session Panel
+
+Timer display
+
+Task linked (if any)
+
+Progress bar
+
+File Activity Panel
+
+Files sorted today
+
+Duplicates detected
+
+Monitored folders active
+
+Bottom Section:
+
+Weekly productivity mini-graph
+
+No motivational quotes.
+No emojis.
+Just information.
+
+📊 Productivity Module
+Features
+
+Add / Edit / Delete tasks
+
+Categories (School, Personal, Projects)
+
+Estimated time (minutes)
+
+Due date
+
+Completion toggle
+
+Task filtering
+
+Smart Priority Algorithm
+
+Example logic:
+
+urgency_score = max(0, 10 - days_until_due)
+importance_score = importance * 2
+time_weight = min(5, estimated_minutes / 60)
+
+priority_score = urgency_score + importance_score + time_weight
+
+This score determines:
+
+Task sorting
+
+“Work Now” suggestion
+
+Dashboard high-priority count
+
+Study Timer
+
+Linked or standalone
+
+Start / Pause / Stop
+
+Stored in Study Sessions table
+
+Updates status bar
+
+Appears in dashboard panel
+
+Uses QTimer (safe in GUI thread)
+
+Optional later:
+
+Deep Work Mode toggle
+
+📁 Smart File Organizer
+Core Features
+
+Add monitored folders
+
+Activate / deactivate monitors
+
+Real-time file detection (watchdog)
+
+Auto-sort rules:
+
+By extension
+
+By creation date
+
+By file type folder
+
+Duplicate Detection
+
+SHA-256 hashing
+
+Compare hashes against DB
+
+If match:
+
+Move to “Duplicates” folder OR
+
+Log and prompt user
+
+Runs in QThread to avoid freezing UI.
+
+Rename Engine
+
+Template rules:
+
+{date}_{original}
+
+{category}_{counter}
+
+{ext}_{timestamp}
+
+Action Log
+
+Every file action logs:
+
+Original path
+
+New path
+
+Timestamp
+
+Action type
+
+Undo feature:
+
+Reverse last move using stored paths
+
+📈 Analytics Module
+
+Embedded Matplotlib graphs:
+
+Productivity
+
+Tasks completed per week
+
+Study time per day
+
+Completion rate trend
+
+File Activity
+
+Files sorted per day
+
+Duplicates detected over time
+
+Graphs update dynamically.
+
+🧠 Architecture
+Folder Structure
+aegis/
+│
+├── core/
+│   ├── database.py
+│   ├── config.py
+│   ├── event_bus.py
+│   ├── logger.py
+│
+├── modules/
+│   ├── task_manager.py
+│   ├── timer_service.py
+│   ├── file_watcher.py
+│   ├── duplicate_detector.py
+│
+├── ui/
+│   ├── main_window.py
+│   ├── sidebar.py
+│   ├── dashboard_view.py
+│   ├── tasks_view.py
+│   ├── files_view.py
+│   ├── analytics_view.py
+│   ├── settings_view.py
+│
+├── assets/
+│   ├── theme.qss
+│   ├── icons/
+│
+└── main.py
+🧵 Threading Model
+QThread Used For:
+
+File monitoring
+
+Duplicate scanning
+
+Large directory scans
+
+QTimer Used For:
+
+Study timer
+
+Small UI refresh tasks
+
+Never block the main thread.
+
+🗃️ Database Schema
+Tasks
+
+id
+
+title
+
+description
+
+category
+
+importance
+
+estimated_minutes
+
+due_date
+
+created_at
+
+completed
+
+completed_at
+
+Study Sessions
+
+id
+
+task_id
+
+start_time
+
+end_time
+
+duration_minutes
+
+Monitored Folders
+
+id
+
+path
+
+sort_rule
+
+active
+
+File Logs
+
+id
+
+original_path
+
+new_path
+
+action_type
+
+timestamp
+
+hash
+
+⚙ Settings Panel
+
+Controls:
+
+Theme accent override (optional future)
+
+Default sort rule
+
+Duplicate handling mode
+
+Auto-start monitors toggle
+
+🗓 5-Week Execution Plan
+Week 1 – Foundation
+
+Project structure
+
+Main window
+
+Sidebar
+
+QStackedWidget
+
+Dark theme QSS
+
+Database initialization
+
+Deliverable:
+App launches and navigates cleanly.
+
+Week 2 – Productivity System
+
+Task CRUD
+
+Priority scoring
+
+Task list UI
+
+Study timer
+
+Dashboard integration
+
+Deliverable:
+Functional productivity engine.
+
+Week 3 – File Organizer
+
+Folder monitoring
+
+Auto-sort
+
+Log system
+
+GUI integration
+
+Deliverable:
+Drop file → auto-sorts.
+
+Week 4 – Intelligence + Analytics
+
+Duplicate hashing
+
+Undo system
+
+Matplotlib graphs
+
+Dashboard integration
+
+Deliverable:
+System feels smart.
+
+Week 5 – Polish
+
+Error handling
+
+Thread safety audit
+
+UI refinements
+
+Minimal animations
+
+Build executable (PyInstaller)
+
+Deliverable:
+Stable, polished application.
+
+🎬 Animation Strategy
+
+Minimal life:
+
+Sidebar highlight slide (subtle)
+
+Card fade-in on load (150ms)
+
+Progress bar smooth fill
+
+Hover glow
+
+Transitions remain fast and responsive.
+
+💡 Identity Summary
+
+Aegis is:
+
+Personal
+
+Controlled
+
+Structured
+
+Powerful
+
+Clean without being sterile
+
+Functional without being bland
+
+It feels like:
+
+A private control station.
+
+You now have a full blueprint.
