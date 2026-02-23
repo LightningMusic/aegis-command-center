@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QStatusBar
 )
 
-
+from core.analytics import AnalyticsEngine
 from ui.sidebar import Sidebar
 from ui.dashboard_view import DashboardView
 from ui.tasks_view import TasksView
@@ -19,6 +19,7 @@ class MainWindow(QMainWindow):
     def __init__(self, task_manager):
         super().__init__()
         self.task_manager = task_manager
+        self.analytics = AnalyticsEngine(self.task_manager)
         self.setWindowTitle("Aegis")
         self.resize(1200, 800)
 
@@ -43,11 +44,12 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.stack)
 
         # Pages
-        self.dashboard_view = DashboardView()
+        self.dashboard_view = DashboardView(self.task_manager, self.analytics)
         self.tasks_view = TasksView(self.task_manager)
         self.files_view = FilesView()
-        self.analytics_view = AnalyticsView()
+        self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView()
+        self.analytics = AnalyticsEngine(self.task_manager)
 
         self.stack.addWidget(self.dashboard_view)
         self.stack.addWidget(self.tasks_view)

@@ -216,6 +216,9 @@ class TasksView(QWidget):
                 meta.setStyleSheet("font-size: 12px; color: #E74C3C;")
 
         layout.addWidget(meta)
+        item.setSizeHint(container.sizeHint())
+        self.task_list.addItem(item)
+        self.task_list.setItemWidget(item, container)
 
     # -------------------------
     # COMPLETE TOGGLE
@@ -224,6 +227,8 @@ class TasksView(QWidget):
     def toggle_complete(self, task_id, state):
         if state == Qt.CheckState.Checked.value:
             self.task_manager.mark_completed(task_id)
+        else:
+            self.task_manager.mark_incomplete(task_id)
         self.load_tasks()
 
     # -------------------------
