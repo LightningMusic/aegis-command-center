@@ -49,7 +49,6 @@ class MainWindow(QMainWindow):
         self.files_view = FilesView()
         self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView()
-        self.analytics = AnalyticsEngine(self.task_manager)
 
         self.stack.addWidget(self.dashboard_view)
         self.stack.addWidget(self.tasks_view)
