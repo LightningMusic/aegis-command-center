@@ -7,7 +7,38 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from PyQt6.QtGui import QPainter, QColor, QPaintEvent
+from typing import Optional
 
+class SimpleBar(QWidget):
+    def __init__(self, value, max_value, label_text=""):
+        super().__init__()
+        self.value = value
+        self.max_value = max_value
+        self.label_text = label_text
+        self.setMinimumHeight(22)
+
+    def paintEvent(self, a0: Optional[QPaintEvent]):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+
+        # Background
+        painter.setBrush(QColor("#333333"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(0, 0, width, height, 6, 6)
+
+        # Fill
+        if self.max_value > 0:
+            ratio = self.value / self.max_value
+            fill_width = int(width * ratio)
+
+            painter.setBrush(QColor("#4CAF50"))
+            painter.drawRoundedRect(0, 0, fill_width, height, 6, 6)
+
+        painter.end()
 class AnalyticsView(QWidget):
     def __init__(self, analytics_engine):
         super().__init__()
@@ -78,11 +109,18 @@ class AnalyticsView(QWidget):
 
         self.scroll_layout.addWidget(section)
 
+        completion_bar = SimpleBar(
+            stats["completed"],
+            stats["total"],
+        )
+        layout.addWidget(completion_bar)
+
     # -------------------------
     # TIME SECTION
     # -------------------------
 
     def _build_time_section(self):
+
         weekly = self.analytics_engine.get_weekly_stats()
         monthly = self.analytics_engine.get_monthly_stats()
 
@@ -90,22 +128,34 @@ class AnalyticsView(QWidget):
 
         layout.addWidget(QLabel("Weekly:"))
 
+        max_week_value = max(
+            (data["created"] for data in weekly.values()),
+            default=0,
+        )
+
         for week, data in sorted(weekly.items()):
-            label = QLabel(
-                f"{week} | Created: {data['created']} | Completed: {data['completed']}"
-            )
-            label.setStyleSheet("font-size: 13px; color: #AAAAAA;")
+            label = QLabel(f"{week}")
+            label.setStyleSheet("font-size: 13px;")
             layout.addWidget(label)
+
+            bar = SimpleBar(data["created"], max_week_value)
+            layout.addWidget(bar)
 
         layout.addSpacing(10)
         layout.addWidget(QLabel("Monthly:"))
 
+        max_month_value = max(
+            (data["created"] for data in monthly.values()),
+            default=0,
+        )
+
         for month, data in sorted(monthly.items()):
-            label = QLabel(
-                f"{month} | Created: {data['created']} | Completed: {data['completed']}"
-            )
-            label.setStyleSheet("font-size: 13px; color: #AAAAAA;")
+            label = QLabel(f"{month}")
+            label.setStyleSheet("font-size: 13px;")
             layout.addWidget(label)
+
+            bar = SimpleBar(data["created"], max_month_value)
+            layout.addWidget(bar)
 
         self.scroll_layout.addWidget(section)
 

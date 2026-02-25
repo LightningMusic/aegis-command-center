@@ -10,7 +10,7 @@ from core.analytics import AnalyticsEngine
 from ui.sidebar import Sidebar
 from ui.dashboard_view import DashboardView
 from ui.tasks_view import TasksView
-from ui.files_view import FilesView
+from ui.file_view import FilesView
 from ui.analytics_view import AnalyticsView
 from ui.settings_view import SettingsView
 
