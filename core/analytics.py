@@ -1,5 +1,6 @@
 from PyQt6.QtCore import QDate
 
+from datetime import datetime, timedelta
 
 class AnalyticsEngine:
     def __init__(self, task_manager):
@@ -13,25 +14,17 @@ class AnalyticsEngine:
     # -------------------------
 
     def get_summary_stats(self):
-        tasks = self._get_tasks()
-        today = QDate.currentDate()
+        tasks = self.task_manager.get_all_tasks() or []
 
         total = len(tasks)
-        completed = sum(1 for t in tasks if t["completed"] == 1)
-        active = total - completed
+        completed = sum(1 for t in tasks if t.completed)
+        active = sum(1 for t in tasks if not t.completed)
+        overdue = sum(1 for t in tasks if not t.completed and t.is_overdue())
+        due_today = sum(1 for t in tasks if t.is_due_today())
 
-        overdue = 0
-        due_today = 0
-
-        for t in tasks:
-            if t.get("due_date") and t["completed"] == 0:
-                due = QDate.fromString(t["due_date"], "yyyy-MM-dd")
-                if due < today:
-                    overdue += 1
-                elif due == today:
-                    due_today += 1
-
-        completion_rate = round((completed / total) * 100, 1) if total else 0
+        completion_rate = 0
+        if total > 0:
+            completion_rate = round((completed / total) * 100, 1)
 
         return {
             "total": total,
@@ -47,22 +40,19 @@ class AnalyticsEngine:
     # -------------------------
 
     def get_weekly_stats(self):
-        tasks = self._get_tasks()
-
+        tasks = self.task_manager.get_all_tasks() or []
         weekly = {}
 
-        for t in tasks:
-            created = QDate.fromString(t["created_at"][:10], "yyyy-MM-dd")
-            week_number = created.weekNumber()[0]
-            key = f"{created.year()}-W{week_number}"
+        for task in tasks:
+            week_key = task.created_at.strftime("%Y-W%U")
 
-            if key not in weekly:
-                weekly[key] = {"created": 0, "completed": 0}
+            if week_key not in weekly:
+                weekly[week_key] = {"created": 0, "completed": 0}
 
-            weekly[key]["created"] += 1
+            weekly[week_key]["created"] += 1
 
-            if t["completed"]:
-                weekly[key]["completed"] += 1
+            if task.completed:
+                weekly[week_key]["completed"] += 1
 
         return weekly
 
@@ -71,21 +61,19 @@ class AnalyticsEngine:
     # -------------------------
 
     def get_monthly_stats(self):
-        tasks = self._get_tasks()
-
+        tasks = self.task_manager.get_all_tasks() or []
         monthly = {}
 
-        for t in tasks:
-            created = QDate.fromString(t["created_at"][:10], "yyyy-MM-dd")
-            key = f"{created.year()}-{created.month():02d}"
+        for task in tasks:
+            month_key = task.created_at.strftime("%Y-%m")
 
-            if key not in monthly:
-                monthly[key] = {"created": 0, "completed": 0}
+            if month_key not in monthly:
+                monthly[month_key] = {"created": 0, "completed": 0}
 
-            monthly[key]["created"] += 1
+            monthly[month_key]["created"] += 1
 
-            if t["completed"]:
-                monthly[key]["completed"] += 1
+            if task.completed:
+                monthly[month_key]["completed"] += 1
 
         return monthly
 
@@ -94,45 +82,37 @@ class AnalyticsEngine:
     # -------------------------
 
     def get_average_completion_days(self):
-        tasks = self._get_tasks()
+        tasks = self.task_manager.get_all_tasks() or []
+        completed_tasks = [t for t in tasks if t.completed]
 
-        total_days = 0
-        count = 0
+        if not completed_tasks:
+            return 0
 
-        for t in tasks:
-            if t["completed"] and t.get("completed_at"):
-                created = QDate.fromString(t["created_at"][:10], "yyyy-MM-dd")
-                completed = QDate.fromString(t["completed_at"][:10], "yyyy-MM-dd")
+        total_days = sum(
+            (t.completed_at - t.created_at).days
+            for t in completed_tasks
+            if t.completed_at and t.created_at
+        )
 
-                days = created.daysTo(completed)
-                total_days += days
-                count += 1
-
-        return round(total_days / count, 1) if count else 0
+        return round(total_days / len(completed_tasks), 1)
 
     # -------------------------
     # CURRENT COMPLETION STREAK
     # -------------------------
 
     def get_completion_streak(self):
-        tasks = self._get_tasks()
-
+        tasks = self.task_manager.get_all_tasks() or []
         completed_dates = sorted(
-            {
-                t["completed_at"][:10]
-                for t in tasks
-                if t["completed"] and t.get("completed_at")
-            },
-            reverse=True,
+            {t.completed_at.date() for t in tasks if t.completed and t.completed_at},
+            reverse=True
         )
 
-        streak = 0
-        today = QDate.currentDate()
+        if not completed_dates:
+            return 0
 
-        for date_str in completed_dates:
-            date = QDate.fromString(date_str, "yyyy-MM-dd")
-
-            if date == today.addDays(-streak):
+        streak = 1
+        for i in range(1, len(completed_dates)):
+            if (completed_dates[i - 1] - completed_dates[i]).days == 1:
                 streak += 1
             else:
                 break
@@ -143,16 +123,14 @@ class AnalyticsEngine:
     # NEXT 7 DAYS WORKLOAD
     # -------------------------
 
+
+
     def get_upcoming_7_days(self):
-        tasks = self._get_tasks()
-        today = QDate.currentDate()
+        tasks = self.task_manager.get_all_tasks() or []
+        now = datetime.now()
+        future = now + timedelta(days=7)
 
-        count = 0
-
-        for t in tasks:
-            if t.get("due_date") and not t["completed"]:
-                due = QDate.fromString(t["due_date"], "yyyy-MM-dd")
-                if 0 <= today.daysTo(due) <= 7:
-                    count += 1
-
-        return count
+        return sum(
+            1 for t in tasks
+            if not t.completed and t.due_date and now <= t.due_date <= future
+        )
