@@ -30,10 +30,7 @@ class TaskManager:
 
         created_at = datetime.now().isoformat()
 
-        conn = self.db.connect()
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = self.db.execute(
             """
             INSERT INTO tasks (
                 title, description, category,
@@ -53,10 +50,10 @@ class TaskManager:
             ),
         )
 
-        conn.commit()
         task_id = cursor.lastrowid
         if task_id is None:
             raise RuntimeError("Failed to retrieve task ID after insertion.")
+
         return int(task_id)
 
     # -------------------------
@@ -64,32 +61,36 @@ class TaskManager:
     # -------------------------
 
     def get_all_tasks(self, include_completed: bool = True) -> List[Dict]:
-        conn = self.db.connect()
-        cursor = conn.cursor()
 
         if include_completed:
-            cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC")
+            rows = self.db.fetchall(
+                "SELECT id, title, due_date, completed FROM tasks"
+            )
         else:
-            cursor.execute(
-                "SELECT * FROM tasks WHERE completed = 0 ORDER BY created_at DESC"
+            rows = self.db.fetchall(
+                "SELECT id, title, due_date, completed FROM tasks WHERE completed = 0"
             )
 
-        rows = cursor.fetchall()
-        columns = [col[0] for col in cursor.description]
+        tasks = []
+        for row in rows:
+            tasks.append({
+                "id": row[0],
+                "title": row[1],
+                "due_date": row[2],
+                "completed": row[3]
+            })
 
-        return [dict(zip(columns, row)) for row in rows]
+        return tasks
 
     # -------------------------
     # COMPLETE
     # -------------------------
 
     def mark_completed(self, task_id: int):
+
         completed_at = datetime.now().isoformat()
 
-        conn = self.db.connect()
-        cursor = conn.cursor()
-
-        cursor.execute(
+        self.db.execute(
             """
             UPDATE tasks
             SET completed = 1,
@@ -98,8 +99,6 @@ class TaskManager:
             """,
             (completed_at, task_id),
         )
-
-        conn.commit()
 
     # -------------------------
     # UPDATE
@@ -118,9 +117,6 @@ class TaskManager:
 
         if importance is not None and (importance < 1 or importance > 5):
             raise ValueError("Importance must be between 1 and 5.")
-
-        conn = self.db.connect()
-        cursor = conn.cursor()
 
         fields = []
         values = []
@@ -160,16 +156,15 @@ class TaskManager:
             WHERE id = ?
         """
 
-        cursor.execute(query, values)
-        conn.commit()
+        self.db.execute(query, values)
 
     # -------------------------
     # DELETE
     # -------------------------
 
     def delete_task(self, task_id: int):
-        conn = self.db.connect()
-        cursor = conn.cursor()
 
-        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        conn.commit()
+        self.db.execute(
+            "DELETE FROM tasks WHERE id = ?",
+            (task_id,)
+        )

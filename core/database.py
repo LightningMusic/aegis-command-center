@@ -1,77 +1,58 @@
 import sqlite3
 from pathlib import Path
-from typing import Optional
+
+
+DB_PATH = Path("aegis.db")
 
 
 class Database:
-    def __init__(self, db_name: str = "aegis.db"):
-        self.db_path = Path(db_name)
-        self.connection: Optional[sqlite3.Connection] = None
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_PATH)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.create_tables()
 
-    def connect(self) -> sqlite3.Connection:
-        if self.connection is None:
-            self.connection = sqlite3.connect(self.db_path)
-            self.connection.execute("PRAGMA foreign_keys = ON;")
-        return self.connection
-
-    def close(self):
-        if self.connection is not None:
-            self.connection.close()
-            self.connection = None
-
-    def initialize(self):
-        conn = self.connect()
-        cursor = conn.cursor()
-
-        # Tasks Table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                description TEXT,
-                category TEXT,
-                importance INTEGER,
-                estimated_minutes INTEGER,
-                due_date TEXT,
-                created_at TEXT,
-                completed INTEGER DEFAULT 0,
-                completed_at TEXT
-            );
+    def create_tables(self):
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id TEXT PRIMARY KEY,
+            absolute_path TEXT UNIQUE,
+            name TEXT,
+            extension TEXT,
+            size_bytes INTEGER,
+            created_at TEXT,
+            modified_at TEXT,
+            last_seen TEXT,
+            parent_directory TEXT,
+            is_directory INTEGER,
+            hash TEXT,
+            depth INTEGER
+        );
         """)
 
-        # Study Sessions Table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS study_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER,
-                start_time TEXT,
-                end_time TEXT,
-                duration_minutes INTEGER,
-                FOREIGN KEY(task_id) REFERENCES tasks(id)
-            );
+        self.conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_parent_directory
+        ON files(parent_directory);
         """)
 
-        # Monitored Folders Table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS monitored_folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT NOT NULL,
-                sort_rule TEXT,
-                active INTEGER DEFAULT 1
-            );
+        self.conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_size_bytes
+        ON files(size_bytes);
         """)
 
-        # File Logs Table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS file_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                original_path TEXT,
-                new_path TEXT,
-                action_type TEXT,
-                timestamp TEXT,
-                file_hash TEXT
-            );
+        self.conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_modified_at
+        ON files(modified_at);
         """)
 
-        conn.commit()
-        print("Database initialized.")
+        self.conn.commit()
+
+    def execute(self, query, params=()):
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        self.conn.commit()
+        return cur
+
+    def fetchall(self, query, params=()):
+        cur = self.conn.cursor()
+        cur.execute(query, params)
+        return cur.fetchall()
