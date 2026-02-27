@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt
 from core.database import Database
 from modules.task_manager import TaskManager
 from ui.main_window import MainWindow
+from core.file_manager import FileManager
 
 
 def main():
@@ -40,8 +41,6 @@ def main():
     app.processEvents()
 
     db = Database()
-    db.initialize()
-
     task_manager = TaskManager(db)
 
 

@@ -13,12 +13,13 @@ from ui.tasks_view import TasksView
 from ui.file_view import FilesView
 from ui.analytics_view import AnalyticsView
 from ui.settings_view import SettingsView
-
+from core.file_manager import FileManager
 
 class MainWindow(QMainWindow):
     def __init__(self, task_manager):
         super().__init__()
         self.task_manager = task_manager
+        self.file_manager = FileManager()
         self.analytics = AnalyticsEngine(self.task_manager)
         self.setWindowTitle("Aegis")
         self.resize(1200, 800)
@@ -46,13 +47,13 @@ class MainWindow(QMainWindow):
         # Pages
         self.dashboard_view = DashboardView(self.task_manager, self.analytics)
         self.tasks_view = TasksView(self.task_manager)
-        self.files_view = FilesView()
+        self.file_view = FilesView(self.file_manager)
         self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView()
 
         self.stack.addWidget(self.dashboard_view)
         self.stack.addWidget(self.tasks_view)
-        self.stack.addWidget(self.files_view)
+        self.stack.addWidget(self.file_view)
         self.stack.addWidget(self.analytics_view)
         self.stack.addWidget(self.settings_view)
 
