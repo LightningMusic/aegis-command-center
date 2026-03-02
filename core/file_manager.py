@@ -7,6 +7,7 @@ from core.database import Database
 from datetime import datetime
 from core.drive_indexer import DriveIndexer
 from core.organization_engine import OrganizationEngine
+from datetime import datetime, timedelta
 
 
 
@@ -158,16 +159,41 @@ class FileManager:
         """)
 
 
+
     def get_cleanup_suggestions(self):
         suggestions = []
 
-        duplicates = self.get_duplicate_files()
-        if duplicates:
-            suggestions.append(f"Remove {len(duplicates)} duplicate files.")
+        one_year_ago = (datetime.now() - timedelta(days=365)).isoformat()
 
-        large_files = self.get_largest_files(5)
-        for path, size in large_files:
-            if size > 1024**3:
-                suggestions.append(f"Large file detected: {path}")
+        candidates = self.db.fetchall("""
+            SELECT absolute_path, size_bytes, modified_at
+            FROM files
+            WHERE is_directory = 0
+            AND size_bytes > ?
+            AND modified_at < ?
+            ORDER BY size_bytes DESC
+            LIMIT 50
+        """, (500 * 1024 * 1024, one_year_ago))  # >500MB and older than 1 year
+
+        for path, size, modified in candidates:
+
+            lower_path = path.lower()
+
+            # 🚫 Exclusion rules
+            if any(x in lower_path for x in [
+                "windows",
+                "program files",
+                "programdata",
+                "steamapps",
+                "$recycle.bin",
+                "system volume information"
+            ]):
+                continue
+
+            if lower_path.endswith((".sys", ".dll", ".exe", ".vmdk", ".vdi", ".iso")):
+                continue
+
+            size_gb = round(size / (1024**3), 2)
+            suggestions.append(f"{size_gb} GB — Possibly unused: {path}")
 
         return suggestions
