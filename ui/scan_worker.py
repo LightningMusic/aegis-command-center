@@ -15,7 +15,13 @@ class ScanWorker(QObject):
         self.file_manager = file_manager
         self.drives = drives
         self._running = True
-        
+        self.protected_paths = [
+            "windows",
+            "program files",
+            "steamapps",
+            "vmware",
+            "virtualbox"
+        ]
 
     def run(self):
         total_indexed = 0
@@ -48,6 +54,9 @@ class ScanWorker(QObject):
                         modified = datetime.fromtimestamp(
                             os.path.getmtime(full_path)
                         ).isoformat()
+                        last_accessed = datetime.fromtimestamp(
+                            os.path.getatime(full_path)
+                        ).isoformat()
 
                         file_data = {
                             "id": str(uuid.uuid4()),
@@ -56,11 +65,14 @@ class ScanWorker(QObject):
                             "extension": os.path.splitext(name)[1],
                             "size_bytes": size,
                             "modified_at": modified,
+                            "last_accessed": last_accessed,
                             "parent_directory": root,
                             "depth": full_path.count(os.sep)
                         }
 
-                        self.file_manager._save_file_record(file_data)
+
+
+                        self.file_manager._save_file_record(file_data, last_accessed)
 
                         total_indexed += 1
                         batch_counter += 1

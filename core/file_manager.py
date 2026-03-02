@@ -19,7 +19,14 @@ class FileManager:
         self.indexer = DriveIndexer()
         self.file_index = []
         self.organizer = None
-
+        self.protected_paths = [
+            "windows",
+            "program files",
+            "steamapps",
+            "vmware",
+            "virtualbox"
+        ]
+        
     def _save_file_record(self, file_data):
         self.db.execute("""
             INSERT OR REPLACE INTO files (
@@ -157,43 +164,54 @@ class FileManager:
             GROUP BY parent_directory
             ORDER BY SUM(size_bytes) DESC
         """)
-
-
-
+    
     def get_cleanup_suggestions(self):
         suggestions = []
 
-        one_year_ago = (datetime.now() - timedelta(days=365)).isoformat()
+        two_years_ago = (datetime.now() - timedelta(days=730)).isoformat()
 
         candidates = self.db.fetchall("""
-            SELECT absolute_path, size_bytes, modified_at
+            SELECT absolute_path, size_bytes, last_accessed
             FROM files
             WHERE is_directory = 0
             AND size_bytes > ?
-            AND modified_at < ?
+            AND last_accessed < ?
             ORDER BY size_bytes DESC
-            LIMIT 50
-        """, (500 * 1024 * 1024, one_year_ago))  # >500MB and older than 1 year
+            LIMIT 100
+        """, (300 * 1024 * 1024, two_years_ago))  # >300MB unused 2+ years
 
-        for path, size, modified in candidates:
+        for path, size, last_accessed in candidates:
+            lower = path.lower()
 
-            lower_path = path.lower()
-
-            # 🚫 Exclusion rules
-            if any(x in lower_path for x in [
+            # 🚫 Exclusions
+            if any(x in lower for x in [
                 "windows",
                 "program files",
                 "programdata",
                 "steamapps",
                 "$recycle.bin",
-                "system volume information"
+                "system volume information",
+                "virtualbox",
+                "vmware"
             ]):
                 continue
 
-            if lower_path.endswith((".sys", ".dll", ".exe", ".vmdk", ".vdi", ".iso")):
+            if lower.endswith((".sys", ".dll", ".exe", ".vmdk", ".vdi", ".iso")):
+                continue
+
+            # 🟢 Prefer user folders
+            if not any(x in lower for x in [
+                "downloads",
+                "desktop",
+                "documents",
+                "videos",
+                "pictures"
+            ]):
                 continue
 
             size_gb = round(size / (1024**3), 2)
-            suggestions.append(f"{size_gb} GB — Possibly unused: {path}")
+            suggestions.append(
+                f"{size_gb} GB — Unused for 2+ years: {path}"
+            )
 
         return suggestions

@@ -10,6 +10,7 @@ class Database:
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.create_tables()
+        self._ensure_columns()
 
     def create_tables(self):
         self.conn.execute("""
@@ -22,6 +23,7 @@ class Database:
             created_at TEXT,
             modified_at TEXT,
             last_seen TEXT,
+            last_accessed TEXT,
             parent_directory TEXT,
             is_directory INTEGER,
             hash TEXT,
@@ -56,3 +58,12 @@ class Database:
         cur = self.conn.cursor()
         cur.execute(query, params)
         return cur.fetchall()
+    
+    def _ensure_columns(self):
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(files)")
+        columns = [row[1] for row in cur.fetchall()]
+
+        if "last_accessed" not in columns:
+            cur.execute("ALTER TABLE files ADD COLUMN last_accessed TEXT")
+            self.conn.commit()
