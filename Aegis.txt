@@ -505,3 +505,19 @@ It feels like:
 A private control station.
 
 You now have a full blueprint.
+
+Now that you have structure, you can add:
+
+🔍 Duplicate detection (using hash column)
+
+📁 “Show largest folders”
+
+🎮 “Show storage used by Steam”
+
+📂 “Show space used per drive”
+
+🗑 “Show old files not accessed in 2 years”
+
+📊 Visual charts (pie charts for file types)
+
+🧠 AI-based organization suggestions

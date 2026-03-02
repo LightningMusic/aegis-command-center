@@ -7,7 +7,7 @@ DB_PATH = Path("aegis.db")
 
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect(DB_PATH)
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.create_tables()
 
