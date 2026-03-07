@@ -46,6 +46,15 @@ class Database:
         ON files(modified_at);
         """)
 
+        self.execute("""
+        CREATE TABLE IF NOT EXISTS scan_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time TEXT,
+            total_files INTEGER,
+            total_size INTEGER
+        )
+        """)
+
         self.conn.commit()
 
     def execute(self, query, params=()):

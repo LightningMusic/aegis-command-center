@@ -63,34 +63,41 @@ class FileManager:
 
 
     def full_scan(self, root_path):
+
         files_indexed = []
 
-        for root, dirs, files in os.walk(root_path):
-            for name in files:
-                try:
-                    full_path = os.path.join(root, name)
-                    size = os.path.getsize(full_path)
-                    modified = datetime.fromtimestamp(
-                        os.path.getmtime(full_path)
-                    ).isoformat()
+        for entry in os.scandir(root_path):
+
+            try:
+
+                if entry.is_dir(follow_symlinks=False):
+
+                    files_indexed += self.full_scan(entry.path)
+
+                else:
+
+                    stat = entry.stat()
 
                     file_data = {
                         "id": str(uuid.uuid4()),
-                        "absolute_path": full_path,
-                        "name": name,
-                        "extension": os.path.splitext(name)[1],
-                        "size_bytes": size,
-                        "modified_at": modified,
-                        "parent_directory": root,
-                        "depth": full_path.count(os.sep)
+                        "absolute_path": entry.path,
+                        "name": entry.name,
+                        "extension": os.path.splitext(entry.name)[1],
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        "last_accessed": stat.st_atime,
+                        "parent_directory": os.path.dirname(entry.path),
+                        "depth": entry.path.count(os.sep)
                     }
 
                     self._save_file_record(file_data)
+
                     files_indexed.append(file_data)
 
-                except Exception as e:
-                    print("Error indexing file:", e)
-                    continue
+            except PermissionError:
+                pass
+            except Exception as e:
+                print("Scan error:", e)
 
         return files_indexed
 
@@ -215,3 +222,36 @@ class FileManager:
             )
 
         return suggestions
+    
+    def get_top_folders(self):
+
+        return self.db.fetchall("""
+
+            SELECT parent_directory, SUM(size_bytes)
+
+            FROM files
+
+            GROUP BY parent_directory
+
+            ORDER BY SUM(size_bytes) DESC
+
+            LIMIT 20
+
+        """)
+    def get_filetype_storage(self):
+
+        return self.db.fetchall("""
+
+            SELECT extension, COUNT(*), SUM(size_bytes)
+
+            FROM files
+
+            WHERE is_directory = 0
+
+            GROUP BY extension
+
+            ORDER BY SUM(size_bytes) DESC
+
+            LIMIT 15
+
+        """)

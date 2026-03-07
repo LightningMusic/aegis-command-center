@@ -14,10 +14,11 @@ from ui.scan_worker import ScanWorker
 
 
 class FilesView(QWidget):
-    def __init__(self, file_manager):
+    def __init__(self, file_manager, storage_dashboard=None):
         super().__init__()
 
         self.file_manager = file_manager
+        self.storage_dashboard = storage_dashboard
         self.scan_thread = None
         self.worker = None
 
@@ -101,6 +102,8 @@ class FilesView(QWidget):
         self.scan_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("Scan Complete")
+        if self.storage_dashboard:
+            self.storage_dashboard.update()
 
         self.load_dashboard()
 

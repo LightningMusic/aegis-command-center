@@ -6,95 +6,156 @@ import hashlib
 
 
 class ScanWorker(QObject):
+
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
     finished = pyqtSignal(int)
 
     def __init__(self, file_manager, drives):
         super().__init__()
+
         self.file_manager = file_manager
         self.drives = drives
         self._running = True
-        self.protected_paths = [
-            "windows",
+
+        # directories we NEVER scan
+        self.excluded_dirs = {
+            "Windows",
+            "System Volume Information",
+            "$Recycle.Bin",
+            "PerfLogs"
+        }
+
+        # directories we avoid indexing for cleanup suggestions
+        self.protected_keywords = [
             "program files",
             "steamapps",
             "vmware",
             "virtualbox"
         ]
 
+    # -------------------------
+
     def run(self):
+
         total_indexed = 0
         batch_counter = 0
 
         for drive in self.drives:
+
             self.status.emit(f"Scanning {drive}")
 
-            for root, dirs, files in os.walk(drive, topdown=True):
-                # Exclude protected/system directories
-                excluded_dirs = {
-                    "Windows",
-                    "System Volume Information",
-                    "$Recycle.Bin",
-                    "PerfLogs"
-                }
-                dirs[:] = [
-                    d for d in dirs
-                    if d not in excluded_dirs
-                    and not d.startswith(".")
-                ]
-                for name in files:
-                    if not self._running:
-                        self.finished.emit(total_indexed)
-                        return
+            stack = [drive]
 
-                    try:
-                        full_path = os.path.join(root, name)
-                        size = os.path.getsize(full_path)
-                        modified = datetime.fromtimestamp(
-                            os.path.getmtime(full_path)
-                        ).isoformat()
-                        last_accessed = datetime.fromtimestamp(
-                            os.path.getatime(full_path)
-                        ).isoformat()
+            while stack:
 
-                        file_data = {
-                            "id": str(uuid.uuid4()),
-                            "absolute_path": full_path,
-                            "name": name,
-                            "extension": os.path.splitext(name)[1],
-                            "size_bytes": size,
-                            "modified_at": modified,
-                            "last_accessed": last_accessed,
-                            "parent_directory": root,
-                            "depth": full_path.count(os.sep)
-                        }
+                if not self._running:
+                    self.finished.emit(total_indexed)
+                    return
 
+                current_dir = stack.pop()
 
+                try:
+                    with os.scandir(current_dir) as entries:
 
-                        self.file_manager._save_file_record(file_data, last_accessed)
+                        for entry in entries:
 
-                        total_indexed += 1
-                        batch_counter += 1
+                            if not self._running:
+                                self.finished.emit(total_indexed)
+                                return
 
-                        if batch_counter >= 500:
-                            self.progress.emit(total_indexed)
-                            batch_counter = 0
+                            try:
 
-                    except Exception:
-                        continue
+                                # -------------------------
+                                # DIRECTORY
+                                # -------------------------
+
+                                if entry.is_dir(follow_symlinks=False):
+
+                                    name_lower = entry.name.lower()
+
+                                    if (
+                                        entry.name in self.excluded_dirs
+                                        or name_lower.startswith(".")
+                                    ):
+                                        continue
+
+                                    stack.append(entry.path)
+
+                                # -------------------------
+                                # FILE
+                                # -------------------------
+
+                                elif entry.is_file(follow_symlinks=False):
+
+                                    stat = entry.stat()
+
+                                    size = stat.st_size
+                                    modified = datetime.fromtimestamp(
+                                        stat.st_mtime
+                                    ).isoformat()
+
+                                    last_accessed = datetime.fromtimestamp(
+                                        stat.st_atime
+                                    ).isoformat()
+
+                                    file_data = {
+
+                                        "id": str(uuid.uuid4()),
+                                        "absolute_path": entry.path,
+                                        "name": entry.name,
+                                        "extension": os.path.splitext(entry.name)[1],
+                                        "size_bytes": size,
+                                        "modified_at": modified,
+                                        "last_accessed": last_accessed,
+                                        "parent_directory": current_dir,
+                                        "depth": entry.path.count(os.sep)
+
+                                    }
+
+                                    self.file_manager._save_file_record(
+                                        file_data,
+                                        last_accessed
+                                    )
+
+                                    total_indexed += 1
+                                    batch_counter += 1
+
+                                    if batch_counter >= 500:
+                                        self.progress.emit(total_indexed)
+                                        batch_counter = 0
+
+                            except PermissionError:
+                                continue
+                            except FileNotFoundError:
+                                continue
+                            except Exception:
+                                continue
+
+                except PermissionError:
+                    continue
+                except FileNotFoundError:
+                    continue
 
         self.finished.emit(total_indexed)
+
+    # -------------------------
 
     def stop(self):
         self._running = False
 
+    # -------------------------
+
     def calculate_hash(self, file_path):
+
         hash_sha256 = hashlib.sha256()
+
         try:
             with open(file_path, "rb") as f:
                 for chunk in iter(lambda: f.read(8192), b""):
                     hash_sha256.update(chunk)
+
             return hash_sha256.hexdigest()
-        except:
+
+        except Exception:
             return None
