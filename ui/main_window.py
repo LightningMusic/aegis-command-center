@@ -7,23 +7,26 @@ from PyQt6.QtWidgets import (
 )
 
 from core.analytics import AnalyticsEngine
+from core.file_manager import FileManager
+
 from ui.sidebar import Sidebar
 from ui.dashboard_view import DashboardView
 from ui.tasks_view import TasksView
 from ui.file_view import FilesView
 from ui.analytics_view import AnalyticsView
 from ui.settings_view import SettingsView
-from core.file_manager import FileManager
-from ui.storage_dashboard import StorageDashboard
+
 
 class MainWindow(QMainWindow):
     def __init__(self, task_manager):
         super().__init__()
+
         self.task_manager = task_manager
         self.file_manager = FileManager()
-        self.dashboard = StorageDashboard(self.file_manager)
+
+        # ✅ CREATE ANALYTICS FIRST
         self.analytics = AnalyticsEngine(self.task_manager)
-        self.storage_dashboard = StorageDashboard(self.file_manager)
+
         self.setWindowTitle("Aegis")
         self.resize(1200, 800)
 
@@ -36,7 +39,6 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-
         central_widget.setLayout(main_layout)
 
         # Sidebar
@@ -47,24 +49,19 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         main_layout.addWidget(self.stack)
 
-        # Pages
+        # ✅ CREATE VIEWS (ONLY ONCE EACH)
         self.dashboard_view = DashboardView(self.task_manager, self.analytics)
         self.tasks_view = TasksView(self.task_manager)
-        self.storage_dashboard = StorageDashboard(self.file_manager)
+        self.file_view = FilesView(self.file_manager)
         self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView()
 
-        self.file_view = FilesView(
-            self.file_manager,
-            storage_dashboard=self.storage_dashboard
-        )
-
-        self.stack.addWidget(self.dashboard_view)
-        self.stack.addWidget(self.tasks_view)
-        self.stack.addWidget(self.storage_dashboard)
-        self.stack.addWidget(self.analytics_view)
-        self.stack.addWidget(self.settings_view)
-        self.stack.addWidget(self.dashboard)
+        # Add to stack (ORDER MATTERS)
+        self.stack.addWidget(self.dashboard_view)   # index 0
+        self.stack.addWidget(self.tasks_view)       # index 1
+        self.stack.addWidget(self.file_view)        # index 2
+        self.stack.addWidget(self.analytics_view)   # index 3
+        self.stack.addWidget(self.settings_view)    # index 4
 
         # Connect sidebar
         self.sidebar.page_changed.connect(self.switch_page)
@@ -85,4 +82,5 @@ class MainWindow(QMainWindow):
             "Settings"
         ]
 
-        self.status.showMessage(f"{page_names[index]} loaded")
+        if 0 <= index < len(page_names):
+            self.status.showMessage(f"{page_names[index]} loaded")

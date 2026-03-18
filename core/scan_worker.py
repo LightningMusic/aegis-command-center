@@ -33,6 +33,7 @@ class ScanWorker(QObject):
             "vmware",
             "virtualbox"
         ]
+        
 
     # -------------------------
 
@@ -43,9 +44,18 @@ class ScanWorker(QObject):
 
         for drive in self.drives:
 
+            # Ensure proper Windows path format
+            if not drive.endswith("\\"):
+                drive = drive + "\\"
+
             self.status.emit(f"Scanning {drive}")
 
+            # Skip invalid drives
+            if not os.path.exists(drive):
+                continue
+
             stack = [drive]
+            print(f"Starting scan of {drive}...")
 
             while stack:
 
@@ -85,8 +95,30 @@ class ScanWorker(QObject):
                                 # -------------------------
                                 # FILE
                                 # -------------------------
-
                                 elif entry.is_file(follow_symlinks=False):
+
+                                    name_lower = entry.name.lower()
+                                    ext = os.path.splitext(entry.name)[1].lower()
+
+                                    # Skip unwanted system / VM files
+                                    excluded_extensions = {
+                                        ".sys",
+                                        ".vmdk",
+                                        ".vdi",
+                                        ".log"
+                                    }
+
+                                    excluded_files = {
+                                        "pagefile.sys",
+                                        "hiberfil.sys",
+                                        "swapfile.sys"
+                                    }
+
+                                    if name_lower in excluded_files:
+                                        continue
+
+                                    if ext in excluded_extensions:
+                                        continue
 
                                     stat = entry.stat()
 
@@ -100,17 +132,15 @@ class ScanWorker(QObject):
                                     ).isoformat()
 
                                     file_data = {
-
                                         "id": str(uuid.uuid4()),
                                         "absolute_path": entry.path,
                                         "name": entry.name,
-                                        "extension": os.path.splitext(entry.name)[1],
+                                        "extension": ext,
                                         "size_bytes": size,
                                         "modified_at": modified,
                                         "last_accessed": last_accessed,
                                         "parent_directory": current_dir,
                                         "depth": entry.path.count(os.sep)
-
                                     }
 
                                     self.file_manager._save_file_record(
@@ -119,6 +149,8 @@ class ScanWorker(QObject):
                                     )
 
                                     total_indexed += 1
+                                    if total_indexed % 1000 == 0:
+                                        print(f"Indexed {total_indexed} files...")
                                     batch_counter += 1
 
                                     if batch_counter >= 500:
@@ -138,6 +170,7 @@ class ScanWorker(QObject):
                     continue
 
         self.finished.emit(total_indexed)
+
 
     # -------------------------
 
