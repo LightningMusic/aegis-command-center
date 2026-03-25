@@ -28,8 +28,7 @@ class ScanWorker(QObject):
 
         # directories we avoid indexing for cleanup suggestions
         self.protected_keywords = [
-            "program files",
-            "steamapps",
+            "programdata",
             "vmware",
             "virtualbox"
         ]
@@ -54,8 +53,19 @@ class ScanWorker(QObject):
             if not os.path.exists(drive):
                 continue
 
-            stack = [drive]
-            print(f"Starting scan of {drive}...")
+            # Start from safer, accessible directories
+            current_user = os.getlogin()
+            user_path = os.path.join(drive, "Users", current_user)
+
+            stack = []
+
+            # Start with user directory FIRST
+            if os.path.exists(user_path):
+                stack.append(user_path)
+
+            # Then scan rest of drive AFTER
+            stack.append(drive)
+            
 
             while stack:
 
@@ -82,6 +92,18 @@ class ScanWorker(QObject):
 
                                 if entry.is_dir(follow_symlinks=False):
 
+                                    try:
+                                        # Skip Windows junctions / reparse points
+                                        if entry.is_symlink():
+                                            continue
+
+                                        if hasattr(entry, "stat"):
+                                            if entry.stat(follow_symlinks=False).st_file_attributes & 0x400:
+                                                continue
+                                    except Exception as e:
+                                        print(f"Error occurred while processing directory {entry.path}: {e}")
+                                        continue
+
                                     name_lower = entry.name.lower()
 
                                     if (
@@ -95,6 +117,18 @@ class ScanWorker(QObject):
                                 # -------------------------
                                 # FILE
                                 # -------------------------
+                                path_lower = entry.path.lower()
+                                drive_letter = entry.path[:3] 
+
+                                # Skip protected system areas completely
+                                if any(keyword in path_lower for keyword in [
+                                    "windows\\",
+                                    "program files",
+                                    "programdata",
+                                    "appdata\\local\\temp",
+                                    "windows defender"
+                                ]):
+                                    continue
                                 elif entry.is_file(follow_symlinks=False):
 
                                     name_lower = entry.name.lower()
@@ -140,20 +174,18 @@ class ScanWorker(QObject):
                                         "modified_at": modified,
                                         "last_accessed": last_accessed,
                                         "parent_directory": current_dir,
-                                        "depth": entry.path.count(os.sep)
+                                        "depth": entry.path.count(os.sep),
+                                        "drive": drive_letter
                                     }
 
-                                    self.file_manager._save_file_record(
-                                        file_data,
-                                        last_accessed
-                                    )
+                                    self.file_manager._save_file_record(file_data)
 
                                     total_indexed += 1
                                     if total_indexed % 1000 == 0:
                                         print(f"Indexed {total_indexed} files...")
                                     batch_counter += 1
 
-                                    if batch_counter >= 500:
+                                    if batch_counter >= 100:
                                         self.progress.emit(total_indexed)
                                         batch_counter = 0
 
@@ -161,12 +193,20 @@ class ScanWorker(QObject):
                                 continue
                             except FileNotFoundError:
                                 continue
-                            except Exception:
+                            except Exception as e:
+                                print(f"File processing error: {entry.path} — {e}")
                                 continue
 
-                except PermissionError:
+                except PermissionError as e:
+                    print(f"PermissionError at {current_dir}: {e}")
                     continue
-                except FileNotFoundError:
+
+                except FileNotFoundError as e:
+                    print(f"FileNotFoundError at {current_dir}: {e}")
+                    continue
+
+                except Exception as e:
+                    print(f"Unexpected error at {current_dir}: {e}")
                     continue
 
         self.finished.emit(total_indexed)

@@ -24,6 +24,7 @@ class FilesView(QWidget):
 
         self.main_layout = QVBoxLayout()
         self.setLayout(self.main_layout)
+        
 
         # -------------------------
         # TITLE
@@ -81,23 +82,50 @@ class FilesView(QWidget):
             tab.setReadOnly(True)
             tab.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
 
-        self.tabs.addTab(self.overview_tab, "Overview")
-        self.tabs.addTab(self.folder_tab, "Folders")
-        self.tabs.addTab(self.duplicate_tab, "Duplicates")
-        self.tabs.addTab(self.steam_tab, "Steam")
-        self.tabs.addTab(self.cleanup_tab, "Cleanup")
+        self.drive_tabs = {}
+
+        drives = self.file_manager.get_available_drives()
+
+        for drive in drives:
+            inner_tabs = QTabWidget()
+
+            folders = QTextEdit()
+            duplicates = QTextEdit()
+            steam = QTextEdit()
+            cleanup = QTextEdit()
+
+            for t in [folders, duplicates, steam, cleanup]:
+                t.setReadOnly(True)
+
+            inner_tabs.addTab(folders, "Folders")
+            inner_tabs.addTab(duplicates, "Duplicates")
+            inner_tabs.addTab(steam, "Steam")
+            inner_tabs.addTab(cleanup, "Cleanup")
+
+            self.tabs.addTab(inner_tabs, drive)
+
+            self.drive_tabs[drive] = {
+                "folders": folders,
+                "duplicates": duplicates,
+                "steam": steam,
+                "cleanup": cleanup
+            }
 
         self.load_dashboard()
 
     # -------------------------
     # SCANNING
     # -------------------------
-
+    def update_status(self, text):
+        print(text)  # DEBUG
+        self.progress_bar.setFormat(text)
     def run_scan(self):
 
+        
         self.scan_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Starting scan...")
+        self.file_manager.remove_missing_files()
 
         option = self.drive_selector.currentText()
 
@@ -108,28 +136,34 @@ class FilesView(QWidget):
 
         self.scan_thread = QThread()
         self.worker = ScanWorker(self.file_manager, drives)
+        self.worker.setParent(self)  # Ensure the worker is a child of the view for proper cleanup
 
         self.worker.moveToThread(self.scan_thread)
 
         self.scan_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.update_progress)
-        self.worker.finished.connect(self.scan_finished)
+        self.worker.finished.connect(lambda total: self.on_scan_finished(total))
+        self.worker.status.connect(self.update_status)
 
         self.worker.finished.connect(self.scan_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.scan_thread.finished.connect(self.scan_thread.deleteLater)
 
         self.scan_thread.start()
+        print("Thread started")
 
     # -------------------------
 
     def update_progress(self, count):
 
         self.progress_bar.setFormat(f"Indexed {count} files")
+        self.progress_bar.setValue(min(count % 100, 100))
 
     # -------------------------
 
-    def scan_finished(self, total_files):
+    def on_scan_finished(self, total_files):
+
+        print(f"FINAL COUNT: {total_files}")  # DEBUG
 
         self.scan_button.setEnabled(True)
 
@@ -143,12 +177,43 @@ class FilesView(QWidget):
     # -------------------------
 
     def load_dashboard(self):
+        for drive, tabs in self.drive_tabs.items():
 
-        self.load_overview()
-        self.load_folders()
-        self.load_duplicates()
-        self.load_steam()
-        self.load_cleanup()
+            # FOLDERS
+            tabs["folders"].clear()
+            folders = self.file_manager.get_storage_by_folder(drive)
+            for folder, size in folders:
+                size_gb = round(size/(1024**3), 2)
+                tabs["folders"].append(f"{size_gb} GB — {folder}")
+
+            # DUPLICATES
+            tabs["duplicates"].clear()
+            duplicates = self.file_manager.get_duplicate_files(drive)
+            if duplicates:
+                for path, size in duplicates[:20]:
+                    size_mb = round(size/(1024**2), 2)
+                    tabs["duplicates"].append(f"{size_mb} MB — {path}")
+            else:
+                tabs["duplicates"].append("No duplicates found.")
+
+            # STEAM
+            tabs["steam"].clear()
+            games = self.file_manager.get_steam_games_usage(drive)
+            if games:
+                for game, size in games:
+                    size_gb = round(size/(1024**3), 2)
+                    tabs["steam"].append(f"{size_gb} GB — {game}")
+            else:
+                tabs["steam"].append("No Steam libraries detected.")
+
+            # CLEANUP
+            tabs["cleanup"].clear()
+            suggestions = self.file_manager.get_cleanup_suggestions(drive)
+            if suggestions:
+                for s in suggestions[:20]:
+                    tabs["cleanup"].append(s)
+            else:
+                tabs["cleanup"].append("No cleanup suggestions.")
 
     # -------------------------
 

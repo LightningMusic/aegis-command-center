@@ -76,3 +76,8 @@ class Database:
         if "last_accessed" not in columns:
             cur.execute("ALTER TABLE files ADD COLUMN last_accessed TEXT")
             self.conn.commit()
+
+        if "drive" not in columns:
+            cur.execute("ALTER TABLE files ADD COLUMN drive TEXT")
+            
+        self.conn.commit()

@@ -38,9 +38,11 @@ class FileManager:
                 modified_at,
                 parent_directory,
                 is_directory,
-                depth
+                depth,
+                drive,
+                last_accessed
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_data["id"],
             file_data["absolute_path"],
@@ -50,8 +52,24 @@ class FileManager:
             file_data["modified_at"],
             file_data["parent_directory"],
             0,
-            file_data["depth"]
+            file_data["depth"],
+            file_data["drive"],
+            file_data["last_accessed"]
         ))
+
+    def remove_missing_files(self):
+        records = self.db.fetchall("""
+            SELECT id, absolute_path FROM files
+        """)
+
+        removed = 0
+
+        for file_id, path in records:
+            if not os.path.exists(path):
+                self.db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+                removed += 1
+
+        print(f"Removed {removed} missing files")
 
     def get_available_drives(self):
         drives = []
@@ -137,42 +155,68 @@ class FileManager:
         total = result[0][0] if result and result[0][0] else 0
         return total
     
-    def get_duplicate_files(self):
+    def get_duplicate_files(self, drive):
         return self.db.fetchall("""
-            SELECT absolute_path, size_bytes, hash
+            SELECT absolute_path, size_bytes
             FROM files
-            WHERE hash IS NOT NULL
-            AND hash IN (
-                SELECT hash
+            WHERE drive = ?
+            AND size_bytes IN (
+                SELECT size_bytes
                 FROM files
-                WHERE hash IS NOT NULL
-                GROUP BY hash
+                WHERE drive = ?
+                GROUP BY size_bytes
                 HAVING COUNT(*) > 1
             )
-            ORDER BY hash
-        """)
+            ORDER BY size_bytes DESC
+            LIMIT 50
+        """, (drive, drive))
     
-    def get_storage_by_folder(self, limit=10):
+    def get_storage_by_folder(self, drive, limit=10):
         return self.db.fetchall("""
             SELECT parent_directory, SUM(size_bytes)
             FROM files
-            WHERE is_directory = 0
+            WHERE is_directory = 0 AND drive = ?
             GROUP BY parent_directory
             ORDER BY SUM(size_bytes) DESC
             LIMIT ?
-        """, (limit,))
+        """, (drive, limit))
 
 
-    def get_steam_games_usage(self):
-        return self.db.fetchall("""
-            SELECT parent_directory, SUM(size_bytes)
+    def get_steam_games_usage(self, drive):
+        results = self.db.fetchall("""
+            SELECT absolute_path, size_bytes
             FROM files
-            WHERE absolute_path LIKE '%Steam%steamapps%common%'
-            GROUP BY parent_directory
-            ORDER BY SUM(size_bytes) DESC
-        """)
+            WHERE absolute_path LIKE '%steamapps%common%'
+            AND drive = ?
+        """, (drive,))
+
+        games = {}
+
+        for path, size in results:
+            parts = path.lower().split("steamapps\\common\\")
+            
+            if len(parts) < 2:
+                continue
+
+            remainder = parts[1]
+            game_name = remainder.split("\\")[0].strip()
+            game_name = game_name.replace("_", " ").title()
+
+            if game_name not in games:
+                games[game_name] = 0
+
+            games[game_name] += size
+
+        # Convert to sorted list
+        sorted_games = sorted(
+            games.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        return sorted_games[:20]
     
-    def get_cleanup_suggestions(self):
+    def get_cleanup_suggestions(self, drive):
         suggestions = []
 
         two_years_ago = (datetime.now() - timedelta(days=730)).isoformat()
