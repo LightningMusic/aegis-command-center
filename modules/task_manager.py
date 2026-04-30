@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 from core.database import Database
 
@@ -7,10 +7,6 @@ from core.database import Database
 class TaskManager:
     def __init__(self, db: Database):
         self.db = db
-
-    # -------------------------
-    # CREATE
-    # -------------------------
 
     def create_task(
         self,
@@ -21,14 +17,13 @@ class TaskManager:
         estimated_minutes: Optional[int] = None,
         due_date: Optional[str] = None,
     ) -> int:
-
         if not title.strip():
             raise ValueError("Task title cannot be empty.")
 
         if importance < 1 or importance > 5:
             raise ValueError("Importance must be between 1 and 5.")
 
-        created_at = datetime.now().isoformat()
+        created_at = datetime.now().isoformat(timespec="seconds")
 
         cursor = self.db.execute(
             """
@@ -56,40 +51,44 @@ class TaskManager:
 
         return int(task_id)
 
-    # -------------------------
-    # READ
-    # -------------------------
+    def _row_to_task(self, row) -> Dict:
+        return {
+            "id": row[0],
+            "title": row[1],
+            "description": row[2],
+            "category": row[3],
+            "importance": row[4],
+            "estimated_minutes": row[5],
+            "due_date": row[6],
+            "created_at": row[7],
+            "completed": row[8],
+            "completed_at": row[9],
+        }
 
     def get_all_tasks(self, include_completed: bool = True) -> List[Dict]:
+        query = """
+            SELECT
+                id,
+                title,
+                description,
+                category,
+                importance,
+                estimated_minutes,
+                due_date,
+                created_at,
+                completed,
+                completed_at
+            FROM tasks
+        """
 
-        if include_completed:
-            rows = self.db.fetchall(
-                "SELECT id, title, due_date, completed FROM tasks"
-            )
-        else:
-            rows = self.db.fetchall(
-                "SELECT id, title, due_date, completed FROM tasks WHERE completed = 0"
-            )
+        if not include_completed:
+            query += " WHERE completed = 0"
 
-        tasks = []
-        for row in rows:
-            tasks.append({
-                "id": row[0],
-                "title": row[1],
-                "due_date": row[2],
-                "completed": row[3]
-            })
-
-        return tasks
-
-    # -------------------------
-    # COMPLETE
-    # -------------------------
+        rows = self.db.fetchall(query)
+        return [self._row_to_task(row) for row in rows]
 
     def mark_completed(self, task_id: int):
-
-        completed_at = datetime.now().isoformat()
-
+        completed_at = datetime.now().isoformat(timespec="seconds")
         self.db.execute(
             """
             UPDATE tasks
@@ -100,9 +99,16 @@ class TaskManager:
             (completed_at, task_id),
         )
 
-    # -------------------------
-    # UPDATE
-    # -------------------------
+    def mark_incomplete(self, task_id: int):
+        self.db.execute(
+            """
+            UPDATE tasks
+            SET completed = 0,
+                completed_at = NULL
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
 
     def update_task(
         self,
@@ -114,7 +120,6 @@ class TaskManager:
         estimated_minutes: Optional[int] = None,
         due_date: Optional[str] = None,
     ):
-
         if importance is not None and (importance < 1 or importance > 5):
             raise ValueError("Importance must be between 1 and 5.")
 
@@ -149,22 +154,12 @@ class TaskManager:
             return
 
         values.append(task_id)
-
         query = f"""
             UPDATE tasks
-            SET {', '.join(fields)}
+            SET {", ".join(fields)}
             WHERE id = ?
         """
-
         self.db.execute(query, values)
 
-    # -------------------------
-    # DELETE
-    # -------------------------
-
     def delete_task(self, task_id: int):
-
-        self.db.execute(
-            "DELETE FROM tasks WHERE id = ?",
-            (task_id,)
-        )
+        self.db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))

@@ -7,6 +7,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core.analytics import AnalyticsEngine
+from core.brightspace import BrightspaceClient
+from core.config import ConfigManager
 from core.file_manager import FileManager
 
 from ui.sidebar import Sidebar
@@ -23,8 +25,9 @@ class MainWindow(QMainWindow):
 
         self.task_manager = task_manager
         self.file_manager = FileManager()
+        self.config_manager = ConfigManager()
+        self.brightspace_client = BrightspaceClient(self.config_manager)
 
-        # ✅ CREATE ANALYTICS FIRST
         self.analytics = AnalyticsEngine(self.task_manager)
 
         self.setWindowTitle("Aegis")
@@ -41,38 +44,42 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
         central_widget.setLayout(main_layout)
 
-        # Sidebar
         self.sidebar = Sidebar()
         main_layout.addWidget(self.sidebar)
 
-        # Page Stack
         self.stack = QStackedWidget()
         main_layout.addWidget(self.stack)
 
-        # ✅ CREATE VIEWS (ONLY ONCE EACH)
-        self.dashboard_view = DashboardView(self.task_manager, self.analytics)
+        self.dashboard_view = DashboardView(
+            self.task_manager,
+            self.analytics,
+            self.brightspace_client,
+        )
         self.tasks_view = TasksView(self.task_manager)
         self.file_view = FilesView(self.file_manager)
         self.analytics_view = AnalyticsView(self.analytics)
-        self.settings_view = SettingsView()
+        self.settings_view = SettingsView(
+            self.config_manager,
+            self.brightspace_client,
+        )
+        self.settings_view.settings_saved.connect(self.dashboard_view.refresh)
 
-        # Add to stack (ORDER MATTERS)
-        self.stack.addWidget(self.dashboard_view)   # index 0
-        self.stack.addWidget(self.tasks_view)       # index 1
-        self.stack.addWidget(self.file_view)        # index 2
-        self.stack.addWidget(self.analytics_view)   # index 3
-        self.stack.addWidget(self.settings_view)    # index 4
+        self.stack.addWidget(self.dashboard_view)
+        self.stack.addWidget(self.tasks_view)
+        self.stack.addWidget(self.file_view)
+        self.stack.addWidget(self.analytics_view)
+        self.stack.addWidget(self.settings_view)
 
-        # Connect sidebar
         self.sidebar.page_changed.connect(self.switch_page)
 
-        # Status Bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("Ready")
 
     def switch_page(self, index: int):
         self.stack.setCurrentIndex(index)
+        if index == 0:
+            self.dashboard_view.refresh()
 
         page_names = [
             "Dashboard",

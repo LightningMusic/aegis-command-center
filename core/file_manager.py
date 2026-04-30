@@ -1,16 +1,13 @@
 import os
+import re
 import string
-from unittest import result
 import uuid
+from datetime import datetime
 
 from core.database import Database
-from datetime import datetime
 from core.drive_indexer import DriveIndexer
-from core.organization_engine import OrganizationEngine
-from datetime import datetime, timedelta
-
-
-
+from core.storage_analyzer import StorageAnalyzer
+from modules.duplicate_detector import DuplicateDetector
 
 
 class FileManager:
@@ -19,16 +16,12 @@ class FileManager:
         self.indexer = DriveIndexer()
         self.file_index = []
         self.organizer = None
-        self.protected_paths = [
-            "windows",
-            "program files",
-            "steamapps",
-            "vmware",
-            "virtualbox"
-        ]
-        
+        self.storage_analyzer = StorageAnalyzer()
+        self.duplicate_detector = DuplicateDetector()
+
     def _save_file_record(self, file_data):
-        self.db.execute("""
+        self.db.execute(
+            """
             INSERT OR REPLACE INTO files (
                 id,
                 absolute_path,
@@ -43,27 +36,67 @@ class FileManager:
                 last_accessed
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            file_data["id"],
-            file_data["absolute_path"],
-            file_data["name"],
-            file_data["extension"],
-            file_data["size_bytes"],
-            file_data["modified_at"],
-            file_data["parent_directory"],
-            0,
-            file_data["depth"],
-            file_data["drive"],
-            file_data["last_accessed"]
-        ))
+            """,
+            (
+                file_data["id"],
+                file_data["absolute_path"],
+                file_data["name"],
+                file_data["extension"],
+                file_data["size_bytes"],
+                file_data["modified_at"],
+                file_data["parent_directory"],
+                0,
+                file_data["depth"],
+                file_data["drive"],
+                file_data["last_accessed"],
+            ),
+        )
+
+    def _fetch_drive_records(self, drive):
+        rows = self.db.fetchall(
+            """
+            SELECT
+                absolute_path,
+                name,
+                extension,
+                size_bytes,
+                modified_at,
+                last_accessed,
+                parent_directory,
+                drive,
+                hash
+            FROM files
+            WHERE is_directory = 0
+            AND drive = ?
+            """,
+            (drive,),
+        )
+
+        records = []
+        for row in rows:
+            records.append(
+                {
+                    "absolute_path": row[0],
+                    "name": row[1],
+                    "extension": row[2] or "",
+                    "size_bytes": row[3] or 0,
+                    "modified_at": row[4],
+                    "last_accessed": row[5],
+                    "parent_directory": row[6],
+                    "drive": row[7],
+                    "hash": row[8],
+                }
+            )
+        return records
 
     def remove_missing_files(self):
-        records = self.db.fetchall("""
+        records = self.db.fetchall(
+            """
             SELECT id, absolute_path FROM files
-        """)
+            """
+        )
 
         removed = 0
-
         for file_id, path in records:
             if not os.path.exists(path):
                 self.db.execute("DELETE FROM files WHERE id = ?", (file_id,))
@@ -79,54 +112,49 @@ class FileManager:
                 drives.append(drive)
         return drives
 
-
     def full_scan(self, root_path):
-
         files_indexed = []
 
         for entry in os.scandir(root_path):
-
             try:
-
                 if entry.is_dir(follow_symlinks=False):
+                    files_indexed.extend(self.full_scan(entry.path))
+                    continue
 
-                    files_indexed += self.full_scan(entry.path)
+                stat = entry.stat()
+                file_data = {
+                    "id": str(uuid.uuid4()),
+                    "absolute_path": entry.path,
+                    "name": entry.name,
+                    "extension": os.path.splitext(entry.name)[1].lower(),
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "last_accessed": datetime.fromtimestamp(stat.st_atime).isoformat(),
+                    "parent_directory": os.path.dirname(entry.path),
+                    "depth": entry.path.count(os.sep),
+                    "drive": entry.path[:3],
+                }
 
-                else:
-
-                    stat = entry.stat()
-
-                    file_data = {
-                        "id": str(uuid.uuid4()),
-                        "absolute_path": entry.path,
-                        "name": entry.name,
-                        "extension": os.path.splitext(entry.name)[1],
-                        "size_bytes": stat.st_size,
-                        "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                        "last_accessed": stat.st_atime,
-                        "parent_directory": os.path.dirname(entry.path),
-                        "depth": entry.path.count(os.sep)
-                    }
-
-                    self._save_file_record(file_data)
-
-                    files_indexed.append(file_data)
-
+                self._save_file_record(file_data)
+                files_indexed.append(file_data)
             except PermissionError:
-                pass
-            except Exception as e:
-                print("Scan error:", e)
+                continue
+            except Exception as exc:
+                print("Scan error:", exc)
 
         return files_indexed
 
     def get_largest_files(self, limit=10):
-        return self.db.fetchall("""
+        return self.db.fetchall(
+            """
             SELECT absolute_path, size_bytes
             FROM files
             WHERE is_directory = 0
             ORDER BY size_bytes DESC
             LIMIT ?
-        """, (limit,))
+            """,
+            (limit,),
+        )
 
     def get_duplicates(self):
         if not self.organizer:
@@ -134,168 +162,171 @@ class FileManager:
         return self.organizer.find_duplicates()
 
     def get_extension_breakdown(self):
-        return self.db.fetchall("""
+        return self.db.fetchall(
+            """
             SELECT extension, COUNT(*), SUM(size_bytes)
             FROM files
             WHERE is_directory = 0
             GROUP BY extension
             ORDER BY COUNT(*) DESC
             LIMIT 15
-        """)
-    
+            """
+        )
+
     def get_indexed_file_count(self):
         result = self.db.fetchall("SELECT COUNT(*) FROM files")
         return result[0][0] if result else 0
 
     def get_total_storage_used(self):
-        result = self.db.fetchall("""
+        result = self.db.fetchall(
+            """
             SELECT SUM(size_bytes) FROM files
             WHERE is_directory = 0
-        """)
+            """
+        )
         total = result[0][0] if result and result[0][0] else 0
         return total
-    
-    def get_duplicate_files(self, drive):
-        return self.db.fetchall("""
-            SELECT absolute_path, size_bytes
+
+    def get_drive_overview(self, drive):
+        result = self.db.fetchall(
+            """
+            SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
             FROM files
-            WHERE drive = ?
-            AND size_bytes IN (
-                SELECT size_bytes
-                FROM files
-                WHERE drive = ?
-                GROUP BY size_bytes
-                HAVING COUNT(*) > 1
-            )
-            ORDER BY size_bytes DESC
-            LIMIT 50
-        """, (drive, drive))
-    
+            WHERE is_directory = 0
+            AND drive = ?
+            """,
+            (drive,),
+        )
+        file_count, total_size = result[0] if result else (0, 0)
+        duplicates = self.get_duplicate_files(drive)
+        cleanup = self.get_cleanup_suggestions(drive)
+
+        return {
+            "drive": drive,
+            "file_count": file_count,
+            "total_size_bytes": total_size,
+            "duplicate_groups": len(duplicates),
+            "duplicate_reclaimable_bytes": sum(group["reclaimable_bytes"] for group in duplicates),
+            "cleanup_candidates": len(cleanup),
+            "cleanup_candidate_bytes": sum(item["size_bytes"] for item in cleanup),
+        }
+
+    def get_duplicate_files(self, drive):
+        records = self._fetch_drive_records(drive)
+        return self.duplicate_detector.build_duplicate_groups(records, limit=20)
+
     def get_storage_by_folder(self, drive, limit=10):
-        return self.db.fetchall("""
+        return self.db.fetchall(
+            """
             SELECT parent_directory, SUM(size_bytes)
             FROM files
             WHERE is_directory = 0 AND drive = ?
             GROUP BY parent_directory
             ORDER BY SUM(size_bytes) DESC
             LIMIT ?
-        """, (drive, limit))
-
+            """,
+            (drive, limit),
+        )
 
     def get_steam_games_usage(self, drive):
-        results = self.db.fetchall("""
-            SELECT absolute_path, size_bytes
-            FROM files
-            WHERE absolute_path LIKE '%steamapps%common%'
+        steam_paths = self.db.fetchall(
+            """
+            SELECT absolute_path FROM files
+            WHERE name = 'libraryfolders.vdf'
             AND drive = ?
-        """, (drive,))
+            """,
+            (drive,),
+        )
 
         games = {}
 
-        for path, size in results:
-            parts = path.lower().split("steamapps\\common\\")
-            
-            if len(parts) < 2:
+        for (vdf_path,) in steam_paths:
+            try:
+                with open(vdf_path, "r", encoding="utf-8", errors="ignore") as file_handle:
+                    content = file_handle.read()
+                paths = re.findall(r'"path"\s+"([^"]+)"', content)
+
+                for path in paths:
+                    common_path = os.path.join(path, "steamapps", "common")
+                    if not os.path.exists(common_path):
+                        continue
+
+                    for game in os.listdir(common_path):
+                        game_path = os.path.join(common_path, game)
+                        total = 0
+                        for root, _, files in os.walk(game_path):
+                            for file_name in files:
+                                try:
+                                    total += os.path.getsize(os.path.join(root, file_name))
+                                except OSError:
+                                    continue
+
+                        games[game] = total
+            except OSError:
                 continue
 
-            remainder = parts[1]
-            game_name = remainder.split("\\")[0].strip()
-            game_name = game_name.replace("_", " ").title()
+        return sorted(games.items(), key=lambda item: item[1], reverse=True)
 
-            if game_name not in games:
-                games[game_name] = 0
-
-            games[game_name] += size
-
-        # Convert to sorted list
-        sorted_games = sorted(
-            games.items(),
-            key=lambda x: x[1],
-            reverse=True
+    def get_cleanup_suggestions(self, drive):
+        rows = self.db.fetchall(
+            """
+            SELECT
+                absolute_path,
+                name,
+                extension,
+                size_bytes,
+                modified_at,
+                last_accessed,
+                parent_directory,
+                drive,
+                hash
+            FROM files
+            WHERE is_directory = 0
+            AND drive = ?
+            AND size_bytes >= ?
+            ORDER BY size_bytes DESC
+            LIMIT 500
+            """,
+            (drive, 100 * 1024 * 1024),
         )
 
-        return sorted_games[:20]
-    
-    def get_cleanup_suggestions(self, drive):
-        suggestions = []
-
-        two_years_ago = (datetime.now() - timedelta(days=730)).isoformat()
-
-        candidates = self.db.fetchall("""
-            SELECT absolute_path, size_bytes, last_accessed
-            FROM files
-            WHERE is_directory = 0
-            AND size_bytes > ?
-            AND last_accessed < ?
-            ORDER BY size_bytes DESC
-            LIMIT 100
-        """, (300 * 1024 * 1024, two_years_ago))  # >300MB unused 2+ years
-
-        for path, size, last_accessed in candidates:
-            lower = path.lower()
-
-            # 🚫 Exclusions
-            if any(x in lower for x in [
-                "windows",
-                "program files",
-                "programdata",
-                "steamapps",
-                "$recycle.bin",
-                "system volume information",
-                "virtualbox",
-                "vmware"
-            ]):
-                continue
-
-            if lower.endswith((".sys", ".dll", ".exe", ".vmdk", ".vdi", ".iso")):
-                continue
-
-            # 🟢 Prefer user folders
-            if not any(x in lower for x in [
-                "downloads",
-                "desktop",
-                "documents",
-                "videos",
-                "pictures"
-            ]):
-                continue
-
-            size_gb = round(size / (1024**3), 2)
-            suggestions.append(
-                f"{size_gb} GB — Unused for 2+ years: {path}"
+        records = []
+        for row in rows:
+            records.append(
+                {
+                    "absolute_path": row[0],
+                    "name": row[1],
+                    "extension": row[2] or "",
+                    "size_bytes": row[3] or 0,
+                    "modified_at": row[4],
+                    "last_accessed": row[5],
+                    "parent_directory": row[6],
+                    "drive": row[7],
+                    "hash": row[8],
+                }
             )
 
-        return suggestions
-    
+        return self.storage_analyzer.build_cleanup_suggestions(records, limit=20)
+
     def get_top_folders(self):
-
-        return self.db.fetchall("""
-
+        return self.db.fetchall(
+            """
             SELECT parent_directory, SUM(size_bytes)
-
             FROM files
-
             GROUP BY parent_directory
-
             ORDER BY SUM(size_bytes) DESC
-
             LIMIT 20
+            """
+        )
 
-        """)
     def get_filetype_storage(self):
-
-        return self.db.fetchall("""
-
+        return self.db.fetchall(
+            """
             SELECT extension, COUNT(*), SUM(size_bytes)
-
             FROM files
-
             WHERE is_directory = 0
-
             GROUP BY extension
-
             ORDER BY SUM(size_bytes) DESC
-
             LIMIT 15
-
-        """)
+            """
+        )
