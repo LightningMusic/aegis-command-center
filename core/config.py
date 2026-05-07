@@ -15,7 +15,37 @@ DEFAULT_CONFIG = {
         "access_token": "",
         "last_sync_at": "",
         "last_sync_status": "Not connected",
-    }
+    },
+    "backup": {
+        "default_destination": "",
+        "backup_root_name": "Aegis_Backups",
+        "log_root_name": "Aegis_Backups\\logs",
+        "last_destination": "",
+        "last_mode": "mirror",
+        "last_run_at": "",
+        "last_status": "No backups run yet",
+    },
+    "google_workspace": {
+        "enabled": False,
+        "account_email": "",
+        "client_id": "",
+        "client_secret": "",
+        "refresh_token": "",
+        "access_token": "",
+        "last_sync_at": "",
+        "last_sync_status": "Not connected",
+    },
+    "outlook": {
+        "enabled": False,
+        "account_email": "",
+        "tenant_id": "",
+        "client_id": "",
+        "client_secret": "",
+        "refresh_token": "",
+        "access_token": "",
+        "last_sync_at": "",
+        "last_sync_status": "Not connected",
+    },
 }
 
 
@@ -52,6 +82,33 @@ class ConfigManager:
 
     def update_brightspace_settings(self, settings):
         current = self._config["brightspace"]
+        current.update(settings)
+        self.save()
+        return deepcopy(current)
+
+    def get_backup_settings(self):
+        return deepcopy(self._config["backup"])
+
+    def update_backup_settings(self, settings):
+        current = self._config["backup"]
+        current.update(settings)
+        self.save()
+        return deepcopy(current)
+
+    def get_google_workspace_settings(self):
+        return deepcopy(self._config["google_workspace"])
+
+    def update_google_workspace_settings(self, settings):
+        current = self._config["google_workspace"]
+        current.update(settings)
+        self.save()
+        return deepcopy(current)
+
+    def get_outlook_settings(self):
+        return deepcopy(self._config["outlook"])
+
+    def update_outlook_settings(self, settings):
+        current = self._config["outlook"]
         current.update(settings)
         self.save()
         return deepcopy(current)

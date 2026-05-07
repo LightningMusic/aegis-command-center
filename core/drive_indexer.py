@@ -2,6 +2,8 @@ import os
 import sys
 from typing import List, Dict
 
+from core.windows_drives import get_drive_map
+
 
 class DriveIndexer:
     def __init__(self):
@@ -23,6 +25,11 @@ class DriveIndexer:
         self.index.clear()
 
         print("Scanning drive...\n")
+
+        drive_details = get_drive_map().get(root if root.endswith("\\") else f"{root}\\")
+        if drive_details and not drive_details["is_scan_eligible"]:
+            print(f"Skipping {root} because it is not scan eligible.")
+            return self.index
 
         total_dirs = sum(len(dirs) for _, dirs, _ in os.walk(root))
         processed_dirs = 0

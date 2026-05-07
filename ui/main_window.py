@@ -24,8 +24,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.task_manager = task_manager
-        self.file_manager = FileManager()
         self.config_manager = ConfigManager()
+        self.file_manager = FileManager(self.config_manager)
         self.brightspace_client = BrightspaceClient(self.config_manager)
 
         self.analytics = AnalyticsEngine(self.task_manager)
@@ -56,7 +56,7 @@ class MainWindow(QMainWindow):
             self.brightspace_client,
         )
         self.tasks_view = TasksView(self.task_manager)
-        self.file_view = FilesView(self.file_manager)
+        self.file_view = FilesView(self.file_manager, self.config_manager)
         self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView(
             self.config_manager,

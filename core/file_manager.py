@@ -1,23 +1,25 @@
 import os
 import re
-import string
 import uuid
 from datetime import datetime
 
+from core.backup_manager import BackupManager
 from core.database import Database
 from core.drive_indexer import DriveIndexer
 from core.storage_analyzer import StorageAnalyzer
+from core.windows_drives import list_connected_drives
 from modules.duplicate_detector import DuplicateDetector
 
 
 class FileManager:
-    def __init__(self):
+    def __init__(self, config_manager=None):
         self.db = Database()
         self.indexer = DriveIndexer()
         self.file_index = []
         self.organizer = None
         self.storage_analyzer = StorageAnalyzer()
         self.duplicate_detector = DuplicateDetector()
+        self.backup_manager = BackupManager(config_manager) if config_manager else None
 
     def _save_file_record(self, file_data):
         self.db.execute(
@@ -105,12 +107,10 @@ class FileManager:
         print(f"Removed {removed} missing files")
 
     def get_available_drives(self):
-        drives = []
-        for letter in string.ascii_uppercase:
-            drive = f"{letter}:\\"
-            if os.path.exists(drive):
-                drives.append(drive)
-        return drives
+        return [item["root"] for item in self.get_drive_inventory() if item["is_scan_eligible"]]
+
+    def get_drive_inventory(self):
+        return list_connected_drives()
 
     def full_scan(self, root_path):
         files_indexed = []
