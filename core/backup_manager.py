@@ -42,9 +42,61 @@ class BackupManager:
         return settings.get("default_destination", "").strip()
 
     def set_default_destination(self, destination_root):
-        return self.config_manager.update_backup_settings(
-            {"default_destination": destination_root}
-        )
+        resolved = self.resolve_destination(destination_root)
+        return self.save_destination(resolved, set_default=True)
+
+    def get_saved_destinations(self):
+        settings = self.config_manager.get_backup_settings()
+        saved = settings.get("saved_destinations", [])
+        normalized = []
+        seen = set()
+        for item in saved:
+            resolved = self.resolve_destination(item)
+            if not resolved:
+                continue
+            key = resolved.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(resolved)
+        return normalized
+
+    def save_destination(self, destination_root, set_default=False):
+        resolved = self.resolve_destination(destination_root)
+        if not resolved:
+            raise RuntimeError("Choose a destination path first.")
+
+        current = self.config_manager.get_backup_settings()
+        saved = current.get("saved_destinations", [])
+        normalized = []
+        seen = set()
+        for item in [resolved, *saved]:
+            normalized_item = self.resolve_destination(item)
+            if not normalized_item:
+                continue
+            key = normalized_item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(normalized_item)
+
+        payload = {"saved_destinations": normalized}
+        if set_default:
+            payload["default_destination"] = resolved
+        return self.config_manager.update_backup_settings(payload)
+
+    def remove_saved_destination(self, destination_root):
+        resolved = self.resolve_destination(destination_root)
+        current = self.config_manager.get_backup_settings()
+        saved = [
+            item
+            for item in current.get("saved_destinations", [])
+            if self.resolve_destination(item).lower() != resolved.lower()
+        ]
+        payload = {"saved_destinations": saved}
+        if self.resolve_destination(current.get("default_destination", "")).lower() == resolved.lower():
+            payload["default_destination"] = saved[0] if saved else ""
+        return self.config_manager.update_backup_settings(payload)
 
     def get_destination_candidates(self):
         current_default = self.get_default_destination()
@@ -59,6 +111,22 @@ class BackupManager:
                 }
             )
         return candidates
+
+    def get_destination_choices(self):
+        saved = self.get_saved_destinations()
+        auto = [item["root"] for item in self.get_destination_candidates()]
+        choices = []
+        seen = set()
+        for item in [*saved, *auto]:
+            resolved = self.resolve_destination(item)
+            if not resolved:
+                continue
+            key = resolved.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            choices.append(resolved)
+        return choices
 
     def resolve_destination(self, destination_root=None):
         candidate = (destination_root or self.get_default_destination()).strip()
@@ -134,7 +202,13 @@ class BackupManager:
         log_root_name = settings.get("log_root_name", "Aegis_Backups\\logs")
 
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        backup_root = os.path.join(resolved_destination, backup_root_name, f"{mode}_{stamp}")
+        backup_root, reused_existing_set = self._resolve_backup_root(
+            resolved_destination,
+            backup_root_name,
+            mode,
+            filtered_drives,
+            stamp,
+        )
         log_root = os.path.join(resolved_destination, log_root_name)
         os.makedirs(backup_root, exist_ok=True)
         os.makedirs(log_root, exist_ok=True)
@@ -188,9 +262,11 @@ class BackupManager:
 
         manifest["completed_at"] = datetime.now().isoformat()
         manifest["free_space_after_bytes"] = shutil.disk_usage(resolved_destination).free
+        manifest["backup_manifest_file"] = str(Path(backup_root) / "backup_manifest.json")
 
         with open(log_file, "w", encoding="utf-8") as file_handle:
             json.dump(manifest, file_handle, indent=2)
+        self._write_backup_manifest(backup_root, manifest)
 
         self.config_manager.update_backup_settings(
             {
@@ -218,6 +294,184 @@ class BackupManager:
             "skipped_files": manifest["skipped_files"],
             "error_count": len(manifest["errors"]),
             "cancelled": False,
+            "reused_existing_set": reused_existing_set,
+        }
+
+    def list_backup_folders(self, destination_root):
+        resolved_destination = self.resolve_destination(destination_root)
+        if not resolved_destination:
+            return []
+
+        settings = self.config_manager.get_backup_settings()
+        backup_root_name = settings.get("backup_root_name", "Aegis_Backups")
+        backup_root = Path(resolved_destination) / backup_root_name
+        if not backup_root.exists():
+            return []
+
+        folders = []
+        for child in backup_root.iterdir():
+            if child.is_dir():
+                folders.append(child.name)
+        return sorted(folders, reverse=True)
+
+    def merge_backup_folders(self, destination_root, source_folder, target_folder):
+        if not source_folder or not target_folder:
+            raise RuntimeError("Select both a source and target backup folder.")
+        if source_folder == target_folder:
+            raise RuntimeError("Source and target backup folders must be different.")
+
+        resolved_destination = self.resolve_destination(destination_root)
+        settings = self.config_manager.get_backup_settings()
+        backup_root_name = settings.get("backup_root_name", "Aegis_Backups")
+        log_root_name = settings.get("log_root_name", "Aegis_Backups\\logs")
+
+        backup_root = Path(resolved_destination) / backup_root_name
+        source_path = backup_root / source_folder
+        target_path = backup_root / target_folder
+
+        if not source_path.exists():
+            raise RuntimeError("Source backup folder does not exist.")
+        if not target_path.exists():
+            raise RuntimeError("Target backup folder does not exist.")
+
+        merged_files = 0
+        skipped_files = 0
+        copied_bytes = 0
+
+        for current_root, _, files in os.walk(source_path):
+            current_path = Path(current_root)
+            relative_root = current_path.relative_to(source_path)
+            destination_dir = target_path / relative_root
+            os.makedirs(destination_dir, exist_ok=True)
+
+            for file_name in files:
+                source_file = current_path / file_name
+                target_file = destination_dir / file_name
+                try:
+                    if target_file.exists():
+                        source_stat = source_file.stat()
+                        target_stat = target_file.stat()
+                        if (
+                            target_stat.st_size == source_stat.st_size
+                            and int(target_stat.st_mtime) >= int(source_stat.st_mtime)
+                        ):
+                            skipped_files += 1
+                            continue
+                    shutil.copy2(source_file, target_file)
+                    merged_files += 1
+                    copied_bytes += source_file.stat().st_size
+                except OSError:
+                    skipped_files += 1
+
+        log_root = Path(resolved_destination) / log_root_name
+        os.makedirs(log_root, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_file = log_root / f"merge_{stamp}.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "source_folder": source_folder,
+                    "target_folder": target_folder,
+                    "merged_files": merged_files,
+                    "skipped_files": skipped_files,
+                    "copied_bytes": copied_bytes,
+                    "completed_at": datetime.now().isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        return {
+            "source_folder": source_folder,
+            "target_folder": target_folder,
+            "merged_files": merged_files,
+            "skipped_files": skipped_files,
+            "copied_bytes": copied_bytes,
+            "log_file": str(log_file),
+        }
+
+    def merge_folders(self, source_path, target_path):
+        if not source_path or not target_path:
+            raise RuntimeError("Choose both a source folder and a target folder.")
+
+        source = Path(source_path).resolve()
+        target = Path(target_path).resolve()
+
+        if not source.exists() or not source.is_dir():
+            raise RuntimeError("Source folder does not exist.")
+        if not target.exists() or not target.is_dir():
+            raise RuntimeError("Target folder does not exist.")
+        if source == target:
+            raise RuntimeError("Source and target folders must be different.")
+
+        try:
+            target.relative_to(source)
+            raise RuntimeError("Target folder cannot be inside the source folder.")
+        except ValueError:
+            pass
+
+        try:
+            source.relative_to(target)
+            raise RuntimeError("Source folder cannot be inside the target folder.")
+        except ValueError:
+            pass
+
+        merged_files = 0
+        skipped_files = 0
+        copied_bytes = 0
+
+        for current_root, _, files in os.walk(source):
+            current_path = Path(current_root)
+            relative_root = current_path.relative_to(source)
+            destination_dir = target / relative_root
+            os.makedirs(destination_dir, exist_ok=True)
+
+            for file_name in files:
+                source_file = current_path / file_name
+                target_file = destination_dir / file_name
+                try:
+                    if target_file.exists():
+                        source_stat = source_file.stat()
+                        target_stat = target_file.stat()
+                        if (
+                            target_stat.st_size == source_stat.st_size
+                            and int(target_stat.st_mtime) >= int(source_stat.st_mtime)
+                        ):
+                            skipped_files += 1
+                            continue
+                    shutil.copy2(source_file, target_file)
+                    merged_files += 1
+                    copied_bytes += source_file.stat().st_size
+                except OSError:
+                    skipped_files += 1
+
+        log_root = target / "_aegis_merge_logs"
+        os.makedirs(log_root, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_file = log_root / f"merge_{stamp}.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "source_folder": str(source),
+                    "target_folder": str(target),
+                    "merged_files": merged_files,
+                    "skipped_files": skipped_files,
+                    "copied_bytes": copied_bytes,
+                    "completed_at": datetime.now().isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        return {
+            "source_folder": str(source),
+            "target_folder": str(target),
+            "merged_files": merged_files,
+            "skipped_files": skipped_files,
+            "copied_bytes": copied_bytes,
+            "log_file": str(log_file),
         }
 
     def _iter_backup_sources(self, mode, drives, destination_root=None):
@@ -422,6 +676,50 @@ class BackupManager:
                 return f"{size:.2f} {unit}"
             size /= 1024
 
+    def _resolve_backup_root(self, destination_root, backup_root_name, mode, drives, stamp):
+        root = Path(destination_root) / backup_root_name
+        os.makedirs(root, exist_ok=True)
+
+        existing = self._find_existing_backup_root(root, mode, drives)
+        if existing:
+            return str(existing), True
+
+        return str(root / f"{mode}_{stamp}"), False
+
+    def _find_existing_backup_root(self, backup_root, mode, drives):
+        requested_drives = sorted(drive.lower() for drive in drives)
+        best_match = None
+        best_time = None
+
+        for child in backup_root.iterdir():
+            if not child.is_dir():
+                continue
+
+            manifest_path = child / "backup_manifest.json"
+            if not manifest_path.exists():
+                continue
+
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            manifest_mode = manifest.get("mode")
+            manifest_drives = sorted(drive.lower() for drive in manifest.get("drives", []))
+            if manifest_mode != mode or manifest_drives != requested_drives:
+                continue
+
+            completed_at = manifest.get("completed_at") or manifest.get("started_at") or ""
+            if best_match is None or completed_at > (best_time or ""):
+                best_match = child
+                best_time = completed_at
+
+        return best_match
+
+    def _write_backup_manifest(self, backup_root, manifest):
+        manifest_path = Path(backup_root) / "backup_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
     def _finish_cancelled_backup(self, manifest, resolved_destination, log_root, mode, stamp):
         manifest["completed_at"] = datetime.now().isoformat()
         manifest["cancelled"] = True
@@ -429,6 +727,7 @@ class BackupManager:
         log_file = os.path.join(log_root, f"backup_{mode}_{stamp}.log")
         with open(log_file, "w", encoding="utf-8") as file_handle:
             json.dump(manifest, file_handle, indent=2)
+        self._write_backup_manifest(manifest["backup_root"], manifest)
 
         self.config_manager.update_backup_settings(
             {

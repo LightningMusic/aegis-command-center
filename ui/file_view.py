@@ -2,6 +2,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -132,8 +133,15 @@ class FilesView(QWidget):
         backup_tab_layout.setSpacing(12)
         backup_tab.setLayout(backup_tab_layout)
 
+        merge_tab = QWidget()
+        merge_tab_layout = QVBoxLayout()
+        merge_tab_layout.setContentsMargins(8, 8, 8, 8)
+        merge_tab_layout.setSpacing(12)
+        merge_tab.setLayout(merge_tab_layout)
+
         self.tools_tabs.addTab(scan_tab, "Scanner")
         self.tools_tabs.addTab(backup_tab, "Backup Manager")
+        self.tools_tabs.addTab(merge_tab, "Merge Folders")
 
         scan_group = QGroupBox("Scanner")
         scan_layout = QVBoxLayout()
@@ -179,16 +187,28 @@ class FilesView(QWidget):
         backup_form.addRow("Backup Mode", self.backup_mode)
 
         self.backup_destination = QComboBox()
-        backup_form.addRow("Backup Drive", self.backup_destination)
+        self.backup_destination.currentIndexChanged.connect(self._destination_changed)
+        backup_form.addRow("Saved Location", self.backup_destination)
 
         self.custom_backup_path = QLineEdit()
-        self.custom_backup_path.setPlaceholderText("Optional custom folder, for example E:\\Aegis_Backups")
-        backup_form.addRow("Custom Path", self.custom_backup_path)
+        self.custom_backup_path.setPlaceholderText("Enter a drive or folder path, for example D:\\ or E:\\Archive\\Backups")
+        backup_form.addRow("Path", self.custom_backup_path)
 
         self.set_default_destination_box = QCheckBox("Save selected destination as default")
         backup_form.addRow(self.set_default_destination_box)
 
         backup_layout.addLayout(backup_form)
+
+        destination_buttons = QHBoxLayout()
+        self.save_location_button = QPushButton("Save Location")
+        self.save_location_button.clicked.connect(self.save_backup_location)
+        destination_buttons.addWidget(self.save_location_button)
+
+        self.remove_location_button = QPushButton("Remove Location")
+        self.remove_location_button.clicked.connect(self.remove_backup_location)
+        destination_buttons.addWidget(self.remove_location_button)
+        destination_buttons.addStretch()
+        backup_layout.addLayout(destination_buttons)
 
         drives_group = QGroupBox("Backup Source Drives")
         drives_layout = QVBoxLayout()
@@ -220,8 +240,99 @@ class FilesView(QWidget):
         self.backup_output.setMinimumHeight(180)
         backup_layout.addWidget(self.backup_output)
 
+        merge_group = QGroupBox("Saved Backup Folders")
+        merge_layout = QVBoxLayout()
+        merge_group.setLayout(merge_layout)
+
+        merge_help = QLabel("Merge one saved backup folder into another.")
+        merge_help.setWordWrap(True)
+        merge_help.setStyleSheet("color: #666;")
+        merge_layout.addWidget(merge_help)
+
+        merge_form = QFormLayout()
+        self.merge_source = QComboBox()
+        merge_form.addRow("Source Folder", self.merge_source)
+        self.merge_target = QComboBox()
+        merge_form.addRow("Target Folder", self.merge_target)
+        merge_layout.addLayout(merge_form)
+
+        merge_buttons = QHBoxLayout()
+        self.refresh_merge_button = QPushButton("Refresh Folders")
+        self.refresh_merge_button.clicked.connect(self.refresh_merge_folders)
+        merge_buttons.addWidget(self.refresh_merge_button)
+
+        self.merge_button = QPushButton("Merge Folders")
+        self.merge_button.clicked.connect(self.merge_backup_folders)
+        merge_buttons.addWidget(self.merge_button)
+        merge_buttons.addStretch()
+        merge_layout.addLayout(merge_buttons)
+
+        self.merge_status = QLabel("Choose a saved location to see backup folders.")
+        self.merge_status.setWordWrap(True)
+        merge_layout.addWidget(self.merge_status)
+
+        backup_layout.addWidget(merge_group)
+
         backup_tab_layout.addWidget(backup_group)
         backup_tab_layout.addStretch()
+
+        merge_manager_group = QGroupBox("Merge Folders")
+        merge_manager_layout = QVBoxLayout()
+        merge_manager_group.setLayout(merge_manager_layout)
+
+        merge_manager_help = QLabel("Pick any source and target folders, then merge newer or missing files into the target.")
+        merge_manager_help.setWordWrap(True)
+        merge_manager_help.setStyleSheet("color: #666;")
+        merge_manager_layout.addWidget(merge_manager_help)
+
+        merge_paths_form = QFormLayout()
+
+        source_row = QHBoxLayout()
+        self.merge_source_path = QLineEdit()
+        self.merge_source_path.setPlaceholderText("Source folder path")
+        source_row.addWidget(self.merge_source_path)
+        self.browse_merge_source_button = QPushButton("Browse")
+        self.browse_merge_source_button.clicked.connect(self.browse_merge_source)
+        source_row.addWidget(self.browse_merge_source_button)
+        merge_paths_form.addRow("Source Folder", source_row)
+
+        target_row = QHBoxLayout()
+        self.merge_target_path = QLineEdit()
+        self.merge_target_path.setPlaceholderText("Target folder path")
+        target_row.addWidget(self.merge_target_path)
+        self.browse_merge_target_button = QPushButton("Browse")
+        self.browse_merge_target_button.clicked.connect(self.browse_merge_target)
+        target_row.addWidget(self.browse_merge_target_button)
+        merge_paths_form.addRow("Target Folder", target_row)
+
+        merge_manager_layout.addLayout(merge_paths_form)
+
+        merge_manager_buttons = QHBoxLayout()
+        self.use_saved_source_button = QPushButton("Use Saved Source")
+        self.use_saved_source_button.clicked.connect(self.use_saved_merge_source)
+        merge_manager_buttons.addWidget(self.use_saved_source_button)
+
+        self.use_saved_target_button = QPushButton("Use Saved Target")
+        self.use_saved_target_button.clicked.connect(self.use_saved_merge_target)
+        merge_manager_buttons.addWidget(self.use_saved_target_button)
+
+        self.run_folder_merge_button = QPushButton("Merge Now")
+        self.run_folder_merge_button.clicked.connect(self.run_folder_merge)
+        merge_manager_buttons.addWidget(self.run_folder_merge_button)
+        merge_manager_buttons.addStretch()
+        merge_manager_layout.addLayout(merge_manager_buttons)
+
+        self.full_merge_status = QLabel("Choose folders to merge.")
+        self.full_merge_status.setWordWrap(True)
+        merge_manager_layout.addWidget(self.full_merge_status)
+
+        self.full_merge_output = QTextEdit()
+        self.full_merge_output.setReadOnly(True)
+        self.full_merge_output.setMinimumHeight(220)
+        merge_manager_layout.addWidget(self.full_merge_output)
+
+        merge_tab_layout.addWidget(merge_manager_group)
+        merge_tab_layout.addStretch()
 
         self.tabs = QTabWidget()
         self.tabs.setMinimumHeight(520)
@@ -238,27 +349,37 @@ class FilesView(QWidget):
         self._populate_backup_destinations(inventory)
         self._populate_drive_checks(inventory)
         self._rebuild_drive_tabs(inventory)
+        self.refresh_merge_folders()
 
     def _populate_backup_destinations(self, inventory):
+        current_path = self._selected_backup_destination()
         self.backup_destination.clear()
-        backup_settings = self.config_manager.get_backup_settings()
-        default_destination = backup_settings.get("default_destination", "")
+        if not self.file_manager.backup_manager:
+            return
 
-        for drive in inventory:
-            if not drive["is_backup_destination"]:
-                continue
-            label = (
-                f"{drive['root']} | {drive['type_name']} | "
-                f"Free { _format_gb(drive['free_bytes']) } | "
-                f"{'Writable' if drive['is_writable'] else 'Read-only'}"
-            )
-            self.backup_destination.addItem(label, drive["root"])
+        choices = self.file_manager.backup_manager.get_destination_choices()
+        inventory_map = {item["root"]: item for item in inventory}
+        default_destination = self.file_manager.backup_manager.get_default_destination()
 
-        if default_destination:
-            index = self.backup_destination.findData(default_destination)
+        for path in choices:
+            drive_root = f"{path[:2]}\\"
+            drive = inventory_map.get(drive_root)
+            if drive:
+                label = (
+                    f"{path} | {drive['type_name']} | "
+                    f"Free {_format_gb(drive['free_bytes'])}"
+                )
+            else:
+                label = path
+            self.backup_destination.addItem(label, path)
+
+        preferred = current_path or default_destination
+        if preferred:
+            index = self.backup_destination.findData(preferred)
             if index >= 0:
                 self.backup_destination.setCurrentIndex(index)
-                self.set_default_destination_box.setChecked(True)
+                self.custom_backup_path.setText(preferred)
+        self.set_default_destination_box.setChecked(bool(default_destination))
 
     def _populate_drive_checks(self, inventory):
         while self.drives_container.count():
@@ -379,6 +500,37 @@ class FilesView(QWidget):
         else:
             QMessageBox.warning(self, "Backup Destination", message + usage_message)
 
+    def save_backup_location(self):
+        if not self.file_manager.backup_manager:
+            return
+
+        destination = self._selected_backup_destination()
+        try:
+            self.file_manager.backup_manager.save_destination(
+                destination,
+                set_default=self.set_default_destination_box.isChecked(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Save Location", str(exc))
+            return
+
+        self.backup_status.setText(f"Saved backup location: {destination}")
+        self.refresh_drive_panels()
+
+    def remove_backup_location(self):
+        if not self.file_manager.backup_manager:
+            return
+
+        destination = self.backup_destination.currentData()
+        if not destination:
+            QMessageBox.warning(self, "Remove Location", "Select a saved location first.")
+            return
+
+        self.file_manager.backup_manager.remove_saved_destination(destination)
+        self.backup_status.setText(f"Removed saved location: {destination}")
+        self.custom_backup_path.clear()
+        self.refresh_drive_panels()
+
     def run_backup(self):
         if self.backup_thread is not None and self.backup_worker is not None:
             self.backup_worker.stop()
@@ -445,8 +597,10 @@ class FilesView(QWidget):
             )
         else:
             self.progress_bar.setFormat("Backup complete")
+            reuse_note = "Reused existing backup set." if result.get("reused_existing_set") else "Created new backup set."
             self.backup_status.setText(
                 f"Backup completed to {result['backup_root']}.\n"
+                f"{reuse_note}\n"
                 f"Copied {result['copied_files']} files totaling {_format_bytes(result['copied_bytes'])}.\n"
                 f"Log: {result['log_file']}"
             )
@@ -454,6 +608,7 @@ class FilesView(QWidget):
             "\n".join(
                 [
                     f"Status: {'Cancelled' if result.get('cancelled') else 'Completed'}",
+                    f"Backup set: {'Reused existing' if result.get('reused_existing_set') else 'Created new'}",
                     f"Destination root: {result['destination_root']}",
                     f"Backup folder: {result['backup_root']}",
                     f"Copied files: {result['copied_files']}",
@@ -474,11 +629,125 @@ class FilesView(QWidget):
         self.run_backup_button.setText("Start Backup")
         QMessageBox.warning(self, "Backup Failed", error_message)
 
+    def refresh_merge_folders(self):
+        self.merge_source.clear()
+        self.merge_target.clear()
+
+        if not self.file_manager.backup_manager:
+            return
+
+        destination = self._selected_backup_destination()
+        if not destination:
+            self.merge_status.setText("Choose a saved location to see backup folders.")
+            return
+
+        folders = self.file_manager.backup_manager.list_backup_folders(destination)
+        for folder in folders:
+            self.merge_source.addItem(folder, folder)
+            self.merge_target.addItem(folder, folder)
+
+        if folders:
+            if len(folders) > 1:
+                self.merge_target.setCurrentIndex(1)
+            self.merge_status.setText(f"Found {len(folders)} backup folders.")
+        else:
+            self.merge_status.setText("No backup folders found in this location yet.")
+
+    def merge_backup_folders(self):
+        if not self.file_manager.backup_manager:
+            return
+
+        destination = self._selected_backup_destination()
+        if not destination:
+            QMessageBox.warning(self, "Merge Folders", "Choose a saved backup location first.")
+            return
+
+        try:
+            result = self.file_manager.backup_manager.merge_backup_folders(
+                destination,
+                self.merge_source.currentData(),
+                self.merge_target.currentData(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Merge Folders", str(exc))
+            return
+
+        message = (
+            f"Merged into {result['target_folder']} from {result['source_folder']}.\n"
+            f"Files merged: {result['merged_files']}\n"
+            f"Files skipped: {result['skipped_files']}\n"
+            f"Data copied: {_format_bytes(result['copied_bytes'])}\n"
+            f"Log: {result['log_file']}"
+        )
+        self.merge_status.setText(message)
+        self.backup_output.setPlainText(message)
+        self.refresh_merge_folders()
+
+    def browse_merge_source(self):
+        selected = QFileDialog.getExistingDirectory(self, "Choose Source Folder")
+        if selected:
+            self.merge_source_path.setText(selected)
+
+    def browse_merge_target(self):
+        selected = QFileDialog.getExistingDirectory(self, "Choose Target Folder")
+        if selected:
+            self.merge_target_path.setText(selected)
+
+    def use_saved_merge_source(self):
+        destination = self._selected_backup_destination()
+        folder = self.merge_source.currentData()
+        if not destination or not folder:
+            QMessageBox.warning(self, "Use Saved Source", "Choose a saved backup location and source folder first.")
+            return
+
+        root_name = self.config_manager.get_backup_settings().get("backup_root_name", "Aegis_Backups")
+        self.merge_source_path.setText(f"{destination}\\{root_name}\\{folder}")
+
+    def use_saved_merge_target(self):
+        destination = self._selected_backup_destination()
+        folder = self.merge_target.currentData()
+        if not destination or not folder:
+            QMessageBox.warning(self, "Use Saved Target", "Choose a saved backup location and target folder first.")
+            return
+
+        root_name = self.config_manager.get_backup_settings().get("backup_root_name", "Aegis_Backups")
+        self.merge_target_path.setText(f"{destination}\\{root_name}\\{folder}")
+
+    def run_folder_merge(self):
+        if not self.file_manager.backup_manager:
+            return
+
+        source = self.merge_source_path.text().strip()
+        target = self.merge_target_path.text().strip()
+
+        try:
+            result = self.file_manager.backup_manager.merge_folders(source, target)
+        except Exception as exc:
+            QMessageBox.warning(self, "Merge Folders", str(exc))
+            return
+
+        message = (
+            f"Source: {result['source_folder']}\n"
+            f"Target: {result['target_folder']}\n"
+            f"Files merged: {result['merged_files']}\n"
+            f"Files skipped: {result['skipped_files']}\n"
+            f"Data copied: {_format_bytes(result['copied_bytes'])}\n"
+            f"Log: {result['log_file']}"
+        )
+        self.full_merge_status.setText("Folder merge completed.")
+        self.full_merge_output.setPlainText(message)
+
     def _selected_backup_destination(self):
         custom = self.custom_backup_path.text().strip()
         if custom:
             return custom
         return self.backup_destination.currentData() or ""
+
+    def _destination_changed(self):
+        selected = self.backup_destination.currentData()
+        if selected:
+            self.custom_backup_path.setText(selected)
+        self.refresh_merge_folders()
 
     def _selected_backup_drives(self):
         return [drive for drive, box in self.drive_checks.items() if box.isChecked()]

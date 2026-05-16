@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
     },
     "backup": {
         "default_destination": "",
+        "saved_destinations": [],
         "backup_root_name": "Aegis_Backups",
         "log_root_name": "Aegis_Backups\\logs",
         "last_destination": "",
