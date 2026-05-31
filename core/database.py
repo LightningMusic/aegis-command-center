@@ -117,6 +117,58 @@ class Database:
         self.conn.commit()
 
         self._ensure_task_columns()
+        self._ensure_device_tables()
+
+    def _ensure_device_tables(self):
+        """Create device-related tables for backup organization."""
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS devices (
+                id TEXT PRIMARY KEY,
+                device_id TEXT UNIQUE NOT NULL,
+                device_name TEXT NOT NULL,
+                device_type TEXT NOT NULL,
+                detected_name TEXT,
+                last_backup TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT,
+                metadata TEXT
+            )
+            """
+        )
+
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                drive_letter TEXT,
+                path TEXT,
+                is_phone INTEGER DEFAULT 0,
+                phone_os TEXT,
+                auto_detected INTEGER DEFAULT 1,
+                first_seen TEXT,
+                FOREIGN KEY (device_id) REFERENCES devices(device_id)
+            )
+            """
+        )
+
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_backup_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                backup_path TEXT,
+                backup_time TEXT,
+                file_count INTEGER,
+                size_bytes INTEGER,
+                status TEXT,
+                FOREIGN KEY (device_id) REFERENCES devices(device_id)
+            )
+            """
+        )
+
+        self.conn.commit()
 
     def _ensure_task_columns(self):
         cur = self.conn.cursor()

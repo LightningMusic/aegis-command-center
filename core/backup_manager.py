@@ -82,7 +82,7 @@ class BackupManager:
 
         payload = {"saved_destinations": normalized}
         if set_default:
-            payload["default_destination"] = resolved
+            payload["default_destination"] = resolved  # type: ignore
         return self.config_manager.update_backup_settings(payload)
 
     def remove_saved_destination(self, destination_root):
@@ -95,7 +95,7 @@ class BackupManager:
         ]
         payload = {"saved_destinations": saved}
         if self.resolve_destination(current.get("default_destination", "")).lower() == resolved.lower():
-            payload["default_destination"] = saved[0] if saved else ""
+            payload["default_destination"] = saved[0] if saved else ""  # type: ignore
         return self.config_manager.update_backup_settings(payload)
 
     def get_destination_candidates(self):
@@ -181,6 +181,8 @@ class BackupManager:
         destination_root=None,
         progress_callback=None,
         should_stop=None,
+        device_id=None,
+        device_name=None,
     ):
         drives = [drive if drive.endswith("\\") else f"{drive}\\" for drive in drives]
         resolved_destination = self.resolve_destination(destination_root)
@@ -202,13 +204,19 @@ class BackupManager:
         log_root_name = settings.get("log_root_name", "Aegis_Backups\\logs")
 
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        backup_root, reused_existing_set = self._resolve_backup_root(
-            resolved_destination,
-            backup_root_name,
-            mode,
-            filtered_drives,
-            stamp,
-        )
+        
+        if device_name:
+            backup_root = os.path.join(resolved_destination, backup_root_name, device_name, "latest")
+            reused_existing_set = True
+        else:
+            backup_root, reused_existing_set = self._resolve_backup_root(
+                resolved_destination,
+                backup_root_name,
+                mode,
+                filtered_drives,
+                stamp,
+            )
+        
         log_root = os.path.join(resolved_destination, log_root_name)
         os.makedirs(backup_root, exist_ok=True)
         os.makedirs(log_root, exist_ok=True)
@@ -313,6 +321,53 @@ class BackupManager:
             if child.is_dir():
                 folders.append(child.name)
         return sorted(folders, reverse=True)
+
+    def list_devices_with_backups(self, destination_root):
+        """
+        List all devices that have backups organized by device name.
+        
+        Returns:
+            List of device info dicts with name, last_backup, and backup_path
+        """
+        resolved_destination = self.resolve_destination(destination_root)
+        if not resolved_destination:
+            return []
+
+        settings = self.config_manager.get_backup_settings()
+        backup_root_name = settings.get("backup_root_name", "Aegis_Backups")
+        backup_root = Path(resolved_destination) / backup_root_name
+        if not backup_root.exists():
+            return []
+
+        devices = []
+        for device_folder in sorted(backup_root.iterdir()):
+            if not device_folder.is_dir():
+                continue
+
+            latest_backup = device_folder / "latest"
+            manifest_path = latest_backup / "backup_manifest.json"
+
+            device_info = {
+                "device_name": device_folder.name,
+                "backup_path": str(latest_backup),
+                "has_backup": latest_backup.exists(),
+                "last_backup": None,
+                "file_count": 0,
+                "total_size": 0,
+            }
+
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    device_info["last_backup"] = manifest.get("completed_at")
+                    device_info["file_count"] = manifest.get("copied_files", 0)
+                    device_info["total_size"] = manifest.get("copied_bytes", 0)
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            devices.append(device_info)
+
+        return sorted(devices, key=lambda x: x["device_name"])
 
     def merge_backup_folders(self, destination_root, source_folder, target_folder):
         if not source_folder or not target_folder:
