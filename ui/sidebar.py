@@ -22,6 +22,7 @@ class Sidebar(QWidget):
             "Dashboard",
             "Tasks",
             "File Organizer",
+            "Devices",
             "Analytics",
             "Settings"
         ]

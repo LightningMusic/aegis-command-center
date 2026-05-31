@@ -9,12 +9,14 @@ from PyQt6.QtWidgets import (
 from core.analytics import AnalyticsEngine
 from core.brightspace import BrightspaceClient
 from core.config import ConfigManager
+from core.device_manager import DeviceManager
 from core.file_manager import FileManager
 
 from ui.sidebar import Sidebar
 from ui.dashboard_view import DashboardView
 from ui.tasks_view import TasksView
 from ui.file_view import FilesView
+from ui.devices_view import DevicesView
 from ui.analytics_view import AnalyticsView
 from ui.settings_view import SettingsView
 
@@ -26,6 +28,7 @@ class MainWindow(QMainWindow):
         self.task_manager = task_manager
         self.config_manager = ConfigManager()
         self.file_manager = FileManager(self.config_manager)
+        self.device_manager = DeviceManager(self.task_manager.db)
         self.brightspace_client = BrightspaceClient(self.config_manager)
 
         self.analytics = AnalyticsEngine(self.task_manager)
@@ -57,6 +60,11 @@ class MainWindow(QMainWindow):
         )
         self.tasks_view = TasksView(self.task_manager)
         self.file_view = FilesView(self.file_manager, self.config_manager)
+        self.devices_view = DevicesView(
+            self.task_manager,
+            self.device_manager,
+            self.file_manager.backup_manager,
+        )
         self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView(
             self.config_manager,
@@ -67,6 +75,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.dashboard_view)
         self.stack.addWidget(self.tasks_view)
         self.stack.addWidget(self.file_view)
+        self.stack.addWidget(self.devices_view)
         self.stack.addWidget(self.analytics_view)
         self.stack.addWidget(self.settings_view)
 

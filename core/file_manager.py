@@ -330,3 +330,37 @@ class FileManager:
             LIMIT 15
             """
         )
+
+    def backup_phone(
+        self,
+        phone_mount_point: str,
+        device_name: str,
+        destination_root: str,
+        progress_callback=None,
+        should_stop=None,
+    ):
+        """
+        Backup a USB-connected phone with intelligent file organization.
+        
+        Args:
+            phone_mount_point: Mount point of the phone (e.g., "E:\\")
+            device_name: Human-readable device name (e.g., "iPhone_Elijah")
+            destination_root: Root backup destination
+            progress_callback: Optional callback(progress, message)
+            should_stop: Optional callable to check if should stop
+            
+        Returns:
+            Backup results dictionary
+        """
+        from core.phone_backup import PhoneBackup
+        
+        phone_backup = PhoneBackup()
+        return phone_backup.backup_phone(
+            phone_mount_point,
+            device_name,
+            destination_root,
+            organize=True,
+            progress_callback=progress_callback,
+            should_stop=should_stop,
+        )
+
