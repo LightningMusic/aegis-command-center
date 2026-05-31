@@ -386,21 +386,28 @@ class FilesView(QWidget):
     def _populate_drive_checks(self, inventory):
         while self.drives_container.count():
             item = self.drives_container.takeAt(0)
+            if item is None:
+                continue
+
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
 
         self.drive_checks = {}
+
         for drive in inventory:
             if not drive["is_scan_eligible"]:
                 continue
+
             box = QCheckBox(
                 f"{drive['root']} ({drive['type_name']}) - "
                 f"Free {_format_gb(drive['free_bytes'])} of {_format_gb(drive['total_bytes'])}"
             )
             box.setChecked(drive["root"] == "C:\\" or drive["type_name"] == "Fixed")
+
             self.drives_container.addWidget(box)
             self.drive_checks[drive["root"]] = box
+
 
     def _rebuild_drive_tabs(self, inventory):
         self.tabs.clear()

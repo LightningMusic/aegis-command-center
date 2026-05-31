@@ -103,8 +103,8 @@ class PhoneBackupView(QWidget):
         super().__init__()
         self.manager: PhoneBackupManager = phone_backup_manager
         self.detected: list[PhoneDevice] = []
-        self.thread:  Optional[QThread]  = None
-        self.worker:  Optional[PhoneBackupWorker] = None
+        self.backup_thread:  Optional[QThread]  = None
+        self.backup_worker:  Optional[PhoneBackupWorker] = None
 
         self._build_ui()
         self._refresh_history()
@@ -292,32 +292,34 @@ class PhoneBackupView(QWidget):
         # backup_btn enabled by _on_phone_selected
 
     def _on_phone_selected(self, row: int) -> None:
-        self.backup_btn.setEnabled(row >= 0 and self.thread is None)
+        self.backup_btn.setEnabled(row >= 0 and self.backup_thread is None)
 
     # ─────────────────────────────────────────────────────────────────────
     # Backup start / stop
     # ─────────────────────────────────────────────────────────────────────
 
     def _start_or_stop(self) -> None:
-        # If a backup is running → request stop
-        if self.thread is not None and self.worker is not None:
-            self.worker.stop()
+        # If a backup is running, request stop.
+        if self.backup_thread is not None and self.backup_worker is not None:
+            self.backup_worker.stop()
             self.backup_btn.setEnabled(False)
             self.progress_bar.setFormat("Stopping…")
             self.status_lbl.setText("Stopping — finishing the current file first…")
             return
 
-        if self.thread is not None:
-            return   # cleanup pending
+        if self.backup_thread is not None:
+            return  # cleanup pending
 
         item = self.phone_list.currentItem()
         if not item:
             return
-        device: Optional[PhoneDevice] = item.data(Qt.ItemDataRole.UserRole)
+
+        device = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(device, PhoneDevice):
             return
 
         self._start_backup(device)
+
 
     def _start_backup(self, device: PhoneDevice) -> None:
         self.log_box.clear()
@@ -327,24 +329,29 @@ class PhoneBackupView(QWidget):
         self.backup_btn.setText("Stop Backup")
         self.detect_btn.setEnabled(False)
 
-        self.thread = QThread()
-        self.worker = PhoneBackupWorker(self.manager, device)
-        self.worker.moveToThread(self.thread)
+        thread = QThread()
+        worker = PhoneBackupWorker(self.manager, device)
 
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.failed.connect(self._on_failed)
+        self.backup_thread = thread
+        self.backup_worker = worker
+
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
 
         # Cleanup chain
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker.failed.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self._cleanup_thread)
-        self.thread.finished.connect(self.thread.deleteLater)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(self._cleanup_backup_thread)
+        thread.finished.connect(thread.deleteLater)
 
-        self.thread.start()
+        thread.start()
+
 
     # ─────────────────────────────────────────────────────────────────────
     # Signals from worker
@@ -415,13 +422,16 @@ class PhoneBackupView(QWidget):
         self.log_box.append(f"\nERROR: {error_message}")
         QMessageBox.warning(self, "Backup Failed", error_message)
 
-    def _cleanup_thread(self) -> None:
-        self.thread = None
-        self.worker = None
+    def _cleanup_backup_thread(self) -> None:
+        self.backup_thread = None
+        self.backup_worker = None
+
         self.backup_btn.setText("Start Backup")
+
         row = self.phone_list.currentRow()
         self.backup_btn.setEnabled(row >= 0 and bool(self.detected))
         self.detect_btn.setEnabled(True)
+
 
     # ─────────────────────────────────────────────────────────────────────
     # History panel
@@ -475,9 +485,12 @@ class PhoneBackupView(QWidget):
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fmt_bytes(n: int) -> str:
+def _fmt_bytes(n: int | float) -> str:
+    size = float(n)
+
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} B"
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+    return f"{size:.1f} B"

@@ -544,17 +544,24 @@ class PhoneBackupManager:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
 
+            stdout = proc.stdout
+            if stdout is None:
+                result["errors"].append("Failed to capture PowerShell output.")
+                proc.terminate()
+                return result
+
             while True:
                 if should_stop and should_stop():
                     proc.terminate()
                     result["cancelled"] = True
                     break
 
-                line = proc.stdout.readline()
+                line = stdout.readline()
                 if not line:
                     if proc.poll() is not None:
                         break
                     continue
+
 
                 line = line.rstrip()
                 if not line:
