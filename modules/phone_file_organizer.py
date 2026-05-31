@@ -1,293 +1,450 @@
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
-PHONE_CATEGORY_RULES = {
+
+ProgressCallback = Callable[[int, str], None]
+StopCallback = Callable[[], bool]
+
+
+PHONE_CATEGORY_RULES: Dict[str, Dict[str, set[str]]] = {
+    "Private_Files": {
+        "extensions": {
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic",
+            ".mp4", ".mov", ".pdf", ".doc", ".docx", ".txt",
+        },
+        "folders": {
+            "SAFE", "VAULT", "SECURE", "SECUREFOLDER",
+            "PRIVATE", "PRIVATEFILES",
+        },
+    },
     "Photos": {
-        "extensions": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".raw"},
-        "folders": {"DCIM", "Pictures", "Camera", "Screenshots", "PHOTOS"},
+        "extensions": {
+            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
+            ".svg", ".tiff", ".raw", ".heic",
+        },
+        "folders": {
+            "DCIM", "CAMERA", "PICTURES", "PHOTOS",
+            "SCREENSHOT", "SCREENSHOTS",
+        },
     },
     "Videos": {
-        "extensions": {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v"},
-        "folders": {"DCIM", "Movies", "Videos", "Recordings"},
+        "extensions": {
+            ".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv",
+            ".webm", ".m4v", ".3gp", ".ts",
+        },
+        "folders": {
+            "VIDEOS", "MOVIES", "RECORDINGS", "DCIM", "CAMERA",
+        },
     },
     "Documents": {
-        "extensions": {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".odt", ".rtf"},
-        "folders": {"Documents", "Docs"},
+        "extensions": {
+            ".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx",
+            ".ppt", ".pptx", ".odt", ".rtf",
+        },
+        "folders": {
+            "DOCUMENTS", "DOCS",
+        },
     },
     "Downloads": {
-        "extensions": {".zip", ".rar", ".7z", ".tar", ".gz", ".exe", ".apk", ".ipa"},
-        "folders": {"Downloads", "Download"},
+        "extensions": {
+            ".zip", ".rar", ".7z", ".tar", ".gz",
+            ".exe", ".apk", ".ipa", ".bin",
+        },
+        "folders": {
+            "DOWNLOADS", "DOWNLOAD",
+        },
     },
     "Audio": {
-        "extensions": {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"},
-        "folders": {"Music", "Audio", "Sounds", "Podcasts", "Music"},
+        "extensions": {
+            ".mp3", ".wav", ".flac", ".aac", ".ogg",
+            ".wma", ".m4a", ".aiff", ".opus",
+        },
+        "folders": {
+            "MUSIC", "AUDIO", "SOUNDS", "PODCASTS",
+            "RINGTONES", "ALARMS", "NOTIFICATIONS",
+        },
     },
     "Messages": {
-        "extensions": {".txt", ".msg", ".eml"},
-        "folders": {"Messages", "SMS", "MMS", "Telegram", "WhatsApp"},
+        "extensions": {
+            ".msg", ".eml", ".vcf", ".vcard", ".json",
+        },
+        "folders": {
+            "MESSAGES", "SMS", "MMS", "TELEGRAM",
+            "WHATSAPP", "VIBER", "SKYPE",
+        },
     },
 }
 
 
+ORGANIZED_CATEGORY_NAMES = set(PHONE_CATEGORY_RULES.keys()) | {"Miscellaneous"}
+
+
 class PhoneFileOrganizer:
-    """Intelligently organizes phone backup files into categories."""
+    """
+    Organizes phone backups into category folders.
 
-    def __init__(self, backup_destination: str):
-        """
-        Initialize the organizer.
+    Final layout:
 
-        Args:
-            backup_destination: Root path where phone files are backed up
-        """
-        self.backup_destination = Path(backup_destination)
-        self.backup_destination.mkdir(parents=True, exist_ok=True)
+        backup_root/
+            Device_Name/
+                latest/
+                    Photos/
+                    Videos/
+                    Documents/
+                    Downloads/
+                    Audio/
+                    Messages/
+                    Private_Files/
+                    Miscellaneous/
+    """
+
+    def __init__(self, backup_root: str | Path, max_scan_depth: int = 25):
+        self.backup_root = Path(backup_root)
+        self.max_scan_depth = max_scan_depth
+        self.backup_root.mkdir(parents=True, exist_ok=True)
 
     def organize_phone_backup(
         self,
-        phone_source_path: str,
+        phone_source_path: str | Path,
         device_name: str,
-        progress_callback=None,
-        should_stop=None,
-    ) -> Dict:
+        progress_callback: Optional[ProgressCallback] = None,
+        should_stop: Optional[StopCallback] = None,
+    ) -> Dict[str, Any]:
         """
-        Organize a phone backup into categorized folders.
-
-        Args:
-            phone_source_path: Path to the phone storage
-            device_name: Name of the device (e.g., "iPhone_Elijah")
-            progress_callback: Optional callback for progress updates
-            should_stop: Optional callable to check if operation should stop
-
-        Returns:
-            Dictionary with organization results
+        Copy files from a phone/source path into the organized backup folder.
+        Source files are not deleted.
         """
-        device_backup_root = self.backup_destination / device_name / "latest"
-        device_backup_root.mkdir(parents=True, exist_ok=True)
+        source_root = Path(phone_source_path)
+        destination_root = self._device_latest_path(device_name)
 
-        phone_root = Path(phone_source_path)
-        if not phone_root.exists():
-            raise FileNotFoundError(f"Phone source path does not exist: {phone_source_path}")
+        if not source_root.exists():
+            raise FileNotFoundError(f"Phone source path does not exist: {source_root}")
 
-        results = {
-            "device_name": device_name,
-            "source_path": str(phone_root),
-            "destination_path": str(device_backup_root),
-            "files_organized": 0,
-            "files_failed": 0,
-            "categories": {},
-            "unorganized_files": [],
-        }
-
-        if should_stop and should_stop():
-            return results
-
-        all_files = self._collect_all_files(phone_root)
-        total_files = len(all_files)
-
-        for index, file_path in enumerate(all_files):
-            if should_stop and should_stop():
-                break
-
-            if progress_callback:
-                progress_callback(
-                    int((index / max(total_files, 1)) * 100),
-                    f"Organizing {file_path.name}",
-                )
-
-            try:
-                category = self._categorize_file(file_path)
-                if category:
-                    self._copy_file_to_category(
-                        file_path, device_backup_root, category
-                    )
-                    if category not in results["categories"]:
-                        results["categories"][category] = 0
-                    results["categories"][category] += 1
-                    results["files_organized"] += 1
-                else:
-                    self._copy_file_to_category(
-                        file_path, device_backup_root, "Miscellaneous"
-                    )
-                    results["unorganized_files"].append(str(file_path))
-                    if "Miscellaneous" not in results["categories"]:
-                        results["categories"]["Miscellaneous"] = 0
-                    results["categories"]["Miscellaneous"] += 1
-                    results["files_organized"] += 1
-
-            except OSError:
-                results["files_failed"] += 1
-
-        if progress_callback:
-            progress_callback(100, "Organization complete")
-
-        return results
-
-    def _collect_all_files(self, source_path: Path, max_depth: int = 10) -> List[Path]:
-        """Recursively collect all files from source directory."""
-        files = []
-        try:
-            for root, dirs, filenames in os.walk(str(source_path)):
-                if should_stop_recursion(root, source_path, max_depth):
-                    dirs.clear()
-                    continue
-
-                for filename in filenames:
-                    file_path = Path(root) / filename
-                    files.append(file_path)
-
-        except PermissionError:
-            pass
-
-        return files
-
-    def _categorize_file(self, file_path: Path) -> Optional[str]:
-        """
-        Determine the category for a file based on extension and location.
-
-        Returns:
-            Category name or None if uncategorized
-        """
-        extension = file_path.suffix.lower()
-        parent_folder = file_path.parent.name.upper()
-
-        for category, rules in PHONE_CATEGORY_RULES.items():
-            if extension in rules["extensions"]:
-                return category
-
-            if parent_folder in rules["folders"]:
-                return category
-
-        return None
-
-    def _copy_file_to_category(
-        self, file_path: Path, backup_root: Path, category: str
-    ) -> None:
-        """Copy file to the appropriate category folder."""
-        category_folder = backup_root / category
-        category_folder.mkdir(parents=True, exist_ok=True)
-
-        destination = category_folder / file_path.name
-
-        if destination.exists():
-            source_stat = file_path.stat()
-            dest_stat = destination.stat()
-
-            if (
-                dest_stat.st_size == source_stat.st_size
-                and int(dest_stat.st_mtime) >= int(source_stat.st_mtime)
-            ):
-                return
-
-        try:
-            shutil.copy2(file_path, destination)
-        except OSError:
-            raise
+        return self._organize(
+            source_root=source_root,
+            destination_root=destination_root,
+            device_name=device_name,
+            move_files=False,
+            progress_callback=progress_callback,
+            should_stop=should_stop,
+        )
 
     def organize_existing_backup(
         self,
-        backup_path: str,
+        backup_path: str | Path,
         device_name: str,
-        progress_callback=None,
-        should_stop=None,
-    ) -> Dict:
+        move_files: bool = False,
+        progress_callback: Optional[ProgressCallback] = None,
+        should_stop: Optional[StopCallback] = None,
+    ) -> Dict[str, Any]:
         """
-        Reorganize an existing phone backup that wasn't organized.
+        Organize an already-created backup.
 
-        Args:
-            backup_path: Path to the existing backup
-            device_name: Name of the device
-
-        Returns:
-            Organization results
+        If move_files=True, files are moved into category folders.
+        If move_files=False, files are copied.
         """
-        backup_root = Path(backup_path)
-        if not backup_root.exists():
-            raise FileNotFoundError(f"Backup path does not exist: {backup_path}")
+        source_root = Path(backup_path)
+        destination_root = self._device_latest_path(device_name)
 
-        device_backup_root = self.backup_destination / device_name / "latest"
+        if not source_root.exists():
+            raise FileNotFoundError(f"Backup path does not exist: {source_root}")
 
-        results = {
-            "device_name": device_name,
-            "source_path": backup_path,
-            "destination_path": str(device_backup_root),
-            "files_reorganized": 0,
-            "files_failed": 0,
-            "categories": {},
-        }
+        return self._organize(
+            source_root=source_root,
+            destination_root=destination_root,
+            device_name=device_name,
+            move_files=move_files,
+            progress_callback=progress_callback,
+            should_stop=should_stop,
+        )
 
-        if should_stop and should_stop():
-            return results
+    def get_organization_summary(self, device_name: str) -> Dict[str, Any]:
+        """Return file count and size totals for each organized category."""
+        destination_root = self._device_latest_path(device_name)
 
-        all_files = self._collect_all_files(backup_root)
-        total_files = len(all_files)
+        if not destination_root.exists():
+            return {
+                "device_name": device_name,
+                "exists": False,
+                "categories": {},
+            }
 
-        for index, file_path in enumerate(all_files):
-            if should_stop and should_stop():
-                break
+        categories: Dict[str, Dict[str, int]] = {}
 
-            if progress_callback:
-                progress_callback(
-                    int((index / max(total_files, 1)) * 100),
-                    f"Reorganizing {file_path.name}",
-                )
+        for category_dir in destination_root.iterdir():
+            if not category_dir.is_dir():
+                continue
 
-            try:
-                category = self._categorize_file(file_path)
-                if not category:
-                    category = "Miscellaneous"
+            file_count = 0
+            size_bytes = 0
 
-                self._copy_file_to_category(
-                    file_path, device_backup_root, category
-                )
+            for path in category_dir.rglob("*"):
+                if not path.is_file():
+                    continue
 
-                if category not in results["categories"]:
-                    results["categories"][category] = 0
-                results["categories"][category] += 1
-                results["files_reorganized"] += 1
+                try:
+                    file_count += 1
+                    size_bytes += path.stat().st_size
+                except OSError:
+                    continue
 
-            except OSError:
-                results["files_failed"] += 1
-
-        if progress_callback:
-            progress_callback(100, "Reorganization complete")
-
-        return results
-
-    def get_organization_summary(self, device_name: str) -> Dict:
-        """Get summary of how a device's backup is organized."""
-        device_backup_root = self.backup_destination / device_name / "latest"
-
-        if not device_backup_root.exists():
-            return {"device_name": device_name, "exists": False, "categories": {}}
-
-        categories = {}
-        for category_folder in device_backup_root.iterdir():
-            if category_folder.is_dir():
-                file_count = len(list(category_folder.rglob("*")))
-                total_size = sum(
-                    f.stat().st_size
-                    for f in category_folder.rglob("*")
-                    if f.is_file()
-                )
-                categories[category_folder.name] = {
-                    "file_count": file_count,
-                    "size_bytes": total_size,
-                }
+            categories[category_dir.name] = {
+                "file_count": file_count,
+                "size_bytes": size_bytes,
+            }
 
         return {
             "device_name": device_name,
             "exists": True,
-            "backup_path": str(device_backup_root),
+            "backup_path": str(destination_root),
             "categories": categories,
         }
 
+    def _organize(
+        self,
+        source_root: Path,
+        destination_root: Path,
+        device_name: str,
+        move_files: bool,
+        progress_callback: Optional[ProgressCallback],
+        should_stop: Optional[StopCallback],
+    ) -> Dict[str, Any]:
+        destination_root.mkdir(parents=True, exist_ok=True)
 
-def should_stop_recursion(current_path: str, source_path: Path, max_depth: int) -> bool:
-    """Check if we've exceeded max recursion depth."""
-    try:
-        depth = len(Path(current_path).relative_to(source_path).parts)
-        return depth > max_depth
-    except ValueError:
-        return False
+        results: Dict[str, Any] = {
+            "device_name": device_name,
+            "source_path": str(source_root),
+            "destination_path": str(destination_root),
+            "started_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "cancelled": False,
+            "files_organized": 0,
+            "files_skipped": 0,
+            "files_failed": 0,
+            "categories": {},
+            "errors": [],
+        }
+
+        if should_stop and should_stop():
+            results["cancelled"] = True
+            results["completed_at"] = datetime.now().isoformat()
+            return results
+
+        all_files = self._collect_files(source_root, destination_root)
+        total_files = len(all_files)
+
+        for index, file_path in enumerate(all_files):
+            if should_stop and should_stop():
+                results["cancelled"] = True
+                break
+
+            if progress_callback:
+                progress = int((index / max(total_files, 1)) * 100)
+                progress_callback(progress, f"Organizing {file_path.name}")
+
+            try:
+                category = self._categorize_file(file_path)
+                placed = self._place_file(
+                    file_path=file_path,
+                    destination_root=destination_root,
+                    category=category,
+                    move_file=move_files,
+                )
+
+                if placed:
+                    results["files_organized"] += 1
+                    results["categories"][category] = (
+                        results["categories"].get(category, 0) + 1
+                    )
+                else:
+                    results["files_skipped"] += 1
+
+            except Exception as exc:
+                results["files_failed"] += 1
+                results["errors"].append(
+                    {
+                        "file": str(file_path),
+                        "error": str(exc),
+                    }
+                )
+
+        if progress_callback:
+            progress_callback(100, "Organization complete")
+
+        results["completed_at"] = datetime.now().isoformat()
+        return results
+
+    def _collect_files(self, source_root: Path, destination_root: Path) -> List[Path]:
+        """Collect files safely, avoiding already-organized category folders."""
+        files: List[Path] = []
+
+        source_root = source_root.resolve()
+        destination_root = destination_root.resolve()
+
+        for root, dirs, filenames in os.walk(source_root):
+            current_root = Path(root)
+
+            if self._exceeds_max_depth(current_root, source_root):
+                dirs.clear()
+                continue
+
+            # If scanning the same folder we are organizing into, avoid reprocessing
+            # already categorized folders like Photos, Videos, Documents, etc.
+            if self._is_inside_destination(current_root, destination_root):
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in ORGANIZED_CATEGORY_NAMES
+                ]
+
+            for filename in filenames:
+                file_path = current_root / filename
+
+                try:
+                    if file_path.is_file():
+                        files.append(file_path)
+                except OSError:
+                    continue
+
+        return files
+
+    def _categorize_file(self, file_path: Path) -> str:
+        """
+        Categorize by private path first, then extension, then folder names.
+        """
+        extension = file_path.suffix.lower()
+
+        path_parts = {
+            self._normalize_name(part)
+            for part in file_path.parts
+        }
+
+        full_path_normalized = self._normalize_name(str(file_path))
+
+        private_keywords = {
+            "SAFE", "VAULT", "SECURE", "SECUREFOLDER",
+            "PRIVATE", "PRIVATEFILES",
+        }
+
+        if any(keyword in full_path_normalized for keyword in private_keywords):
+            return "Private_Files"
+
+        # Extension is usually the most reliable signal.
+        for category, rules in PHONE_CATEGORY_RULES.items():
+            if extension in rules["extensions"]:
+                return category
+
+        # Folder names are the fallback signal.
+        for category, rules in PHONE_CATEGORY_RULES.items():
+            normalized_folders = {
+                self._normalize_name(folder)
+                for folder in rules["folders"]
+            }
+
+            if path_parts & normalized_folders:
+                return category
+
+        return "Miscellaneous"
+
+    def _place_file(
+        self,
+        file_path: Path,
+        destination_root: Path,
+        category: str,
+        move_file: bool,
+    ) -> bool:
+        """
+        Copy or move the file into its category folder.
+
+        Returns False if an equivalent destination file already exists.
+        """
+        category_dir = destination_root / category
+        category_dir.mkdir(parents=True, exist_ok=True)
+
+        destination = category_dir / file_path.name
+
+        if destination.exists():
+            if self._same_or_newer_file(file_path, destination):
+                return False
+
+            destination = self._unique_destination_path(destination)
+
+        if move_file:
+            shutil.move(str(file_path), str(destination))
+        else:
+            shutil.copy2(str(file_path), str(destination))
+
+        return True
+
+    def _same_or_newer_file(self, source: Path, destination: Path) -> bool:
+        """
+        True when destination appears to already contain the same file.
+        """
+        try:
+            source_stat = source.stat()
+            destination_stat = destination.stat()
+
+            return (
+                destination_stat.st_size == source_stat.st_size
+                and int(destination_stat.st_mtime) >= int(source_stat.st_mtime)
+            )
+        except OSError:
+            return False
+
+    def _unique_destination_path(self, destination: Path) -> Path:
+        """
+        Avoid overwriting files with the same name but different contents.
+        Example:
+            IMG_001.jpg
+            IMG_001 (1).jpg
+            IMG_001 (2).jpg
+        """
+        parent = destination.parent
+        stem = destination.stem
+        suffix = destination.suffix
+
+        counter = 1
+        candidate = destination
+
+        while candidate.exists():
+            candidate = parent / f"{stem} ({counter}){suffix}"
+            counter += 1
+
+        return candidate
+
+    def _device_latest_path(self, device_name: str) -> Path:
+        safe_device_name = self._safe_folder_name(device_name)
+        return self.backup_root / safe_device_name / "latest"
+
+    def _exceeds_max_depth(self, current_path: Path, source_root: Path) -> bool:
+        try:
+            depth = len(current_path.resolve().relative_to(source_root).parts)
+            return depth > self.max_scan_depth
+        except ValueError:
+            return False
+
+    def _is_inside_destination(self, path: Path, destination_root: Path) -> bool:
+        try:
+            path.resolve().relative_to(destination_root)
+            return True
+        except ValueError:
+            return False
+
+    def _normalize_name(self, value: str) -> str:
+        return (
+            value.upper()
+            .replace(" ", "")
+            .replace("_", "")
+            .replace("-", "")
+        )
+
+    def _safe_folder_name(self, value: str) -> str:
+        cleaned = "".join(
+            char if char.isalnum() or char in {" ", "_", "-"} else "_"
+            for char in value.strip()
+        )
+
+        cleaned = cleaned.replace(" ", "_")
+        return cleaned or "Unknown_Device"

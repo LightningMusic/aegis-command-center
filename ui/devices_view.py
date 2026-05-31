@@ -64,8 +64,10 @@ class DevicesView(QWidget):
         self.devices_table.setHorizontalHeaderLabels(
             ["Device Name", "Type", "Last Backup", "Files", "Size", "Actions"]
         )
-        self.devices_table.horizontalHeader().setStretchLastSection(False)
-        layout.addWidget(self.devices_table)
+        devices_header = self.devices_table.horizontalHeader()
+        if devices_header is not None:
+            devices_header.setStretchLastSection(True)
+
 
         phones_section = QLabel("📱 Connected Phones")
         phones_section.setStyleSheet("font-weight: bold; margin-top: 15px;")
@@ -76,7 +78,10 @@ class DevicesView(QWidget):
         self.phones_table.setHorizontalHeaderLabels(
             ["Phone Name", "Mount Point", "Status", "Available Space", "Actions"]
         )
-        self.phones_table.horizontalHeader().setStretchLastSection(False)
+        phones_header = self.phones_table.horizontalHeader()
+        if phones_header is not None:
+            phones_header.setStretchLastSection(True)
+
         layout.addWidget(self.phones_table)
 
         self.setLayout(layout)
