@@ -20,6 +20,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core.scan_worker import ScanWorker
+from core.phone_backup_manager import PhoneBackupManager
+from ui.phone_backup_view import PhoneBackupView
 
 
 def _format_gb(size_bytes):
