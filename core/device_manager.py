@@ -212,45 +212,33 @@ class DeviceManager:
 
     def _detect_connected_phones(self) -> List[Dict]:
         """
-        Detect Android phones connected via USB.
-        
-        Note: This is a basic detection that checks for common Android paths.
-        For production use, consider using pyusb or pymtp libraries.
+        Detect Android phones connected via USB (MTP and removable drives).
         """
-        detected_phones = []
-
+        from core.phone_backup_manager import PhoneBackupManager
+        from core.config import ConfigManager
+        
+        config = ConfigManager()
+        backup_settings = config.get_backup_settings()
+        dest = backup_settings.get("default_destination") or "C:\\Aegis_Backups"
+        
         try:
-            import win32api
-
-            for drive_letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-                drive_path = f"{drive_letter}:\\"
-                if not os.path.exists(drive_path):
-                    continue
-
-                dcim_path = os.path.join(drive_path, "DCIM")
-                documents_path = os.path.join(drive_path, "Documents")
-                downloads_path = os.path.join(drive_path, "Downloads")
-
-                has_phone_structure = (
-                    os.path.exists(dcim_path)
-                    or os.path.exists(documents_path)
-                    or os.path.exists(downloads_path)
-                )
-
-                if has_phone_structure:
-                    detected_phones.append(
-                        {
-                            "drive_letter": drive_letter,
-                            "label": f"Phone_{drive_letter}",
-                            "device_type": "phone",
-                            "phone_os": "android",
-                            "path": drive_path,
-                            "auto_detected": True,
-                        }
-                    )
-        except ImportError:
-            pass
-
+            mgr = PhoneBackupManager(dest)
+            devices = mgr.detect_phones()
+        except Exception:
+            return []
+            
+        detected_phones = []
+        for d in devices:
+            detected_phones.append({
+                "drive_letter": d.drive_root[:1] if d.drive_root else "",
+                "label": d.display_name,
+                "device_type": "phone",
+                "phone_os": "android",
+                "path": d.shell_path or d.drive_root,
+                "auto_detected": True,
+            })
+            
+        detected_phones.sort(key=lambda p: p["label"].lower())
         return detected_phones
 
     def _row_to_device_dict(self, row: tuple) -> Dict:

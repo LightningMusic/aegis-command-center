@@ -90,6 +90,7 @@ class FilesView(QWidget):
         self.backup_worker = None
         self.drive_tabs = {}
         self.drive_checks = {}
+        self._drive_panels_loaded = False
 
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -120,7 +121,7 @@ class FilesView(QWidget):
         self.content_layout.addWidget(intro)
 
         self.tools_tabs = QTabWidget()
-        self.tools_tabs.setMinimumHeight(360)
+        self.tools_tabs.setMinimumHeight(220)
         self.content_layout.addWidget(self.tools_tabs)
 
         scan_tab = QWidget()
@@ -239,7 +240,7 @@ class FilesView(QWidget):
 
         self.backup_output = QTextEdit()
         self.backup_output.setReadOnly(True)
-        self.backup_output.setMinimumHeight(180)
+        self.backup_output.setMinimumHeight(100)
         backup_layout.addWidget(self.backup_output)
 
         merge_group = QGroupBox("Saved Backup Folders")
@@ -330,21 +331,31 @@ class FilesView(QWidget):
 
         self.full_merge_output = QTextEdit()
         self.full_merge_output.setReadOnly(True)
-        self.full_merge_output.setMinimumHeight(220)
+        self.full_merge_output.setMinimumHeight(120)
         merge_manager_layout.addWidget(self.full_merge_output)
 
         merge_tab_layout.addWidget(merge_manager_group)
         merge_tab_layout.addStretch()
 
         self.tabs = QTabWidget()
-        self.tabs.setMinimumHeight(520)
+        self.tabs.setMinimumHeight(260)
         self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.content_layout.addWidget(self.tabs)
         self.content_layout.setStretchFactor(self.tools_tabs, 1)
         self.content_layout.setStretchFactor(self.tabs, 3)
 
-        self.refresh_drive_panels()
-        self.load_dashboard()
+        self._show_drive_placeholder()
+
+    def _show_drive_placeholder(self):
+        self.tabs.clear()
+        placeholder = QTextEdit()
+        placeholder.setReadOnly(True)
+        placeholder.setPlainText("Drive inventory will load when File Organizer is opened.")
+        self.tabs.addTab(placeholder, "Drives")
+
+    def ensure_drive_panels_loaded(self):
+        if not self._drive_panels_loaded:
+            self.refresh_drive_panels()
 
     def refresh_drive_panels(self):
         inventory = self.file_manager.get_drive_inventory()
@@ -352,6 +363,8 @@ class FilesView(QWidget):
         self._populate_drive_checks(inventory)
         self._rebuild_drive_tabs(inventory)
         self.refresh_merge_folders()
+        self._drive_panels_loaded = True
+        self.load_dashboard()
 
     def _populate_backup_destinations(self, inventory):
         current_path = self._selected_backup_destination()

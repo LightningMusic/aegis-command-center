@@ -137,16 +137,18 @@ class PhoneBackupView(QWidget):
         splitter.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        splitter.setChildrenCollapsible(True)
         root.addWidget(splitter)
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([580, 380])
+        splitter.setSizes([520, 320])
 
     # ── Left panel ────────────────────────────────────────────────────────
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setMinimumWidth(0)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(10)
@@ -216,7 +218,7 @@ class PhoneBackupView(QWidget):
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(200)
+        self.log_box.setMinimumHeight(120)
         self.log_box.setStyleSheet("font-size: 12px; font-family: Consolas, monospace;")
         backup_layout.addWidget(self.log_box)
 
@@ -227,6 +229,7 @@ class PhoneBackupView(QWidget):
 
     def _build_right_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setMinimumWidth(0)
         layout = QVBoxLayout()
         layout.setContentsMargins(8, 0, 0, 0)
         layout.setSpacing(10)
@@ -416,6 +419,32 @@ class PhoneBackupView(QWidget):
         )
         self._refresh_history()
 
+        # Update last backup in database using device_manager
+        if not cancelled and hasattr(self, "device_manager") and self.device_manager:
+            try:
+                device_name = result.get("device")
+                device = self.device_manager.get_device_by_name(device_name)
+                if device:
+                    device_id = device.get("device_id")
+                    copied_files = copy_r.get("copied", 0)
+                    
+                    # Compute size of the latest backup directory
+                    latest_dir = Path(result.get("latest_dir"))
+                    total_bytes = 0
+                    if latest_dir.exists():
+                        for p in latest_dir.rglob("*"):
+                            if p.is_file():
+                                total_bytes += p.stat().st_size
+                                
+                    self.device_manager.update_last_backup(
+                        device_id,
+                        result.get("latest_dir"),
+                        copied_files,
+                        total_bytes
+                    )
+            except Exception as e:
+                print(f"Error updating device backup in database: {e}")
+
     def _on_failed(self, error_message: str) -> None:
         self.progress_bar.setFormat("Failed")
         self.status_lbl.setText(f"Error: {error_message}")
@@ -466,13 +495,14 @@ class PhoneBackupView(QWidget):
         dev = current.data(Qt.ItemDataRole.UserRole)
         if not isinstance(dev, dict):
             return
+        total_size = dev.get("total_size")
 
         lines = [
             f"Name      : {dev.get('name', '?')}",
             f"Folder    : {dev.get('folder', '?')}",
             f"Snapshots : {dev.get('snapshot_count', 0)}",
             f"Last backup: {dev.get('last_backup') or 'Unknown'}",
-            f"Total size: {_fmt_bytes(dev.get('total_size', 0))}",
+            f"Total size: {_fmt_bytes(total_size) if total_size is not None else 'Not calculated'}",
             f"Latest OK : {'Yes' if dev.get('has_latest') else 'No'}",
         ]
         if dev.get("latest_path"):

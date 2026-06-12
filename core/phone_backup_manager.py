@@ -142,27 +142,47 @@ $shell   = New-Object -ComObject Shell.Application
 $copied  = 0
 $skipped = 0
 $errors  = 0
+$visited = 0
 
-function CopyMTPFolder([string]$Src, [string]$Dst) {
+function EnsureFolder([string]$Path) {
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+    return $shell.Namespace($Path)
+}
+
+function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
     try {
-        $srcNs = $shell.Namespace($Src)
-        if ($null -eq $srcNs) { return }
-        Write-Host "FOLDER_ENTER:$Src"
+        if ($null -eq $Folder) {
+            $script:errors++
+            Write-Host "ERR:$Label`:Unable to open MTP folder"
+            [Console]::Out.Flush()
+            return
+        }
+
+        $script:visited++
+        Write-Host "FOLDER_ENTER:$Label"
         [Console]::Out.Flush()
 
-        if (-not (Test-Path $Dst)) {
-            New-Item -ItemType Directory -Path $Dst -Force | Out-Null
+        $dstNs = EnsureFolder $Dst
+        if ($null -eq $dstNs) {
+            $script:errors++
+            Write-Host "ERR:$Label`:Unable to open destination folder $Dst"
+            [Console]::Out.Flush()
+            return
         }
-        $dstNs = $shell.Namespace($Dst)
 
-        foreach ($item in $srcNs.Items()) {
+        foreach ($item in $Folder.Items()) {
+            $safeName = $item.Name -replace '[\\/:*?"<>|]', '_'
             if ($item.IsFolder) {
-                CopyMTPFolder $item.Path (Join-Path $Dst $item.Name)
+                $childFolder = $null
+                try { $childFolder = $item.GetFolder() } catch { $childFolder = $null }
+                CopyMTPFolderObject $childFolder "$Label\$safeName" (Join-Path $Dst $safeName)
             } else {
-                $destFile = Join-Path $Dst $item.Name
+                $destFile = Join-Path $Dst $safeName
                 if (Test-Path $destFile) {
                     $script:skipped++
-                    Write-Host "FILE_SKIP:$($item.Name)"
+                    Write-Host "FILE_SKIP:$safeName"
                     [Console]::Out.Flush()
                     continue
                 }
@@ -196,19 +216,31 @@ function CopyMTPFolder([string]$Src, [string]$Dst) {
                     Write-Host "FILE_OK:$destFile"
                 } else {
                     $script:errors++
-                    Write-Host "FILE_TIMEOUT:$($item.Name)"
+                    Write-Host "FILE_TIMEOUT:$safeName"
                 }
                 [Console]::Out.Flush()
             }
         }
     } catch {
         $script:errors++
-        Write-Host "ERR:$Src`:$_"
+        Write-Host "ERR:$Label`:$_"
         [Console]::Out.Flush()
     }
 }
 
-CopyMTPFolder $SourcePath $DestPath
+$srcNs = $shell.Namespace($SourcePath)
+if ($null -eq $srcNs) {
+    $errors++
+    Write-Host "ERR:$SourcePath`:Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
+} else {
+    CopyMTPFolderObject $srcNs $SourcePath $DestPath
+}
+
+if ($script:visited -gt 0 -and $script:copied -eq 0 -and $script:skipped -eq 0 -and $script:errors -eq 0) {
+    $script:errors++
+    Write-Host "ERR:$SourcePath`:No accessible files were found. Unlock the phone and confirm the USB mode is File Transfer / MTP."
+}
+
 Write-Host "DONE:$script:copied`:$script:skipped`:$script:errors"
 [Console]::Out.Flush()
 """
@@ -244,15 +276,13 @@ class PhoneBackupManager:
     def detect_phones(self) -> List[PhoneDevice]:
         """
         Return all detected phones, sorted alphabetically by display name.
-
-        Tries MTP (Windows Shell namespace) first, then removable drives
-        that look like phones.
+        Tries MTP portable devices first, then removable drives that look like phones.
         """
         devices: List[PhoneDevice] = []
         seen: set[str] = set()
 
         for d in (*self._detect_mtp_devices(), *self._detect_drive_phones()):
-            key = d.name.lower().strip()
+            key = (d.shell_path or d.drive_root or d.name).lower().strip()
             if key not in seen:
                 seen.add(key)
                 devices.append(d)
@@ -280,15 +310,13 @@ class PhoneBackupManager:
             path = item.get("Path", "")
             if not path:
                 continue
-
-            # Find the actual storage root (e.g. "Internal storage") inside
-            # the device namespace so we copy files, not just the device node.
-            storage_path = self._find_storage_root(path) or path
+            if re.match(r"^[a-zA-Z]:\\", path):
+                continue
 
             devices.append(PhoneDevice(
                 name=name,
                 access_type="mtp",
-                shell_path=storage_path,
+                shell_path=path,
                 friendly_name=name,
             ))
 
@@ -671,7 +699,7 @@ class PhoneBackupManager:
 
     # ── History & listing ─────────────────────────────────────────────────
 
-    def list_all_backed_up_devices(self) -> List[Dict[str, Any]]:
+    def list_all_backed_up_devices(self, include_total_size: bool = False) -> List[Dict[str, Any]]:
         """
         Return every device that has at least one snapshot, sorted A→Z.
         """
@@ -689,7 +717,7 @@ class PhoneBackupManager:
                 "snapshot_count": len(snapshots),
                 "has_latest":     (d / "latest").exists(),
                 "latest_path":    str(d / "latest") if (d / "latest").exists() else None,
-                "total_size":     _dir_size(d),
+                "total_size":     _dir_size(d) if include_total_size else None,
                 "last_backup":    snapshots[0] if snapshots else None,
             })
         return out

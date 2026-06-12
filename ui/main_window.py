@@ -34,7 +34,7 @@ class MainWindow(QMainWindow):
         self.analytics = AnalyticsEngine(self.task_manager)
 
         self.setWindowTitle("Aegis")
-        self.resize(1200, 800)
+        self.resize(1000, 700)
 
         self._init_ui()
 
@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
             self.device_manager,
             self.file_manager.backup_manager,
         )
+        self.devices_view.backup_requested.connect(self.run_device_backup)
         self.analytics_view = AnalyticsView(self.analytics)
         self.settings_view = SettingsView(
             self.config_manager,
@@ -89,14 +90,46 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
         if index == 0:
             self.dashboard_view.refresh()
+        elif index == 2:
+            self.file_view.ensure_drive_panels_loaded()
+        elif index == 3:
+            self.devices_view.refresh_device_list()
 
         page_names = [
             "Dashboard",
             "Tasks",
             "File Organizer",
+            "Devices",
             "Analytics",
             "Settings"
         ]
 
         if 0 <= index < len(page_names):
             self.status.showMessage(f"{page_names[index]} loaded")
+
+    def run_device_backup(self, device_name, device_type):
+        """Find the drive letter for the registered device and start its backup in File Organizer."""
+        device = self.device_manager.get_device_by_name(device_name)
+        if not device:
+            return
+
+        # Query drive letter mapping for this device
+        mappings = self.device_manager.db.fetchall(
+            "SELECT drive_letter FROM device_mappings WHERE device_id = ?",
+            (device.get("device_id"),)
+        )
+        if mappings and mappings[0][0]:
+            drive_letter = mappings[0][0]
+            drive_root = f"{drive_letter}:\\"
+            
+            # Switch to File Organizer (index 2)
+            self.switch_page(2)
+            # Select Backup Manager tab (index 1)
+            self.file_view.tools_tabs.setCurrentIndex(1)
+            
+            # Check only this drive in the checkbox list
+            for root, check in self.file_view.drive_checks.items():
+                check.setChecked(root == drive_root)
+                
+            # Trigger drive backup
+            self.file_view.run_backup()
