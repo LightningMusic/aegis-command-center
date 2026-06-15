@@ -46,6 +46,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import queue
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -452,7 +454,11 @@ class PhoneBackupManager:
 
         # ── Stage 1: Copy ──────────────────────────────────────────────────
         def _half_progress(p: int, m: str) -> None:
-            if progress_callback:
+            if not progress_callback:
+                return
+            if p < 0:
+                progress_callback(-1, m)
+            else:
                 progress_callback(min(int(p * 0.50), 49), m)
 
         if progress_callback:
@@ -578,22 +584,43 @@ class PhoneBackupManager:
                 proc.terminate()
                 return result
 
+            line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+            def _reader():
+                try:
+                    for raw_line in stdout:
+                        line_queue.put(raw_line)
+                except (ValueError, OSError):
+                    pass
+                finally:
+                    line_queue.put(None)  # sentinel: stream closed
+
+            threading.Thread(target=_reader, daemon=True).start()
+
+            stream_closed = False
             while True:
                 if should_stop and should_stop():
-                    proc.terminate()
+                    proc.kill()
                     result["cancelled"] = True
                     break
 
-                line = stdout.readline()
-                if not line:
+                try:
+                    line = line_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if proc.poll() is not None and stream_closed:
+                        break
+                    continue
+
+                if line is None:
+                    stream_closed = True
                     if proc.poll() is not None:
                         break
                     continue
 
-
                 line = line.rstrip()
                 if not line:
                     continue
+
 
                 if line.startswith("FILE_OK:"):
                     result["copied"] += 1
