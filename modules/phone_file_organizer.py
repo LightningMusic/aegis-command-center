@@ -355,11 +355,6 @@ class PhoneFileOrganizer:
         category: str,
         move_file: bool,
     ) -> bool:
-        """
-        Copy or move the file into its category folder.
-
-        Returns False if an equivalent destination file already exists.
-        """
         category_dir = destination_root / category
         category_dir.mkdir(parents=True, exist_ok=True)
 
@@ -367,6 +362,14 @@ class PhoneFileOrganizer:
 
         if destination.exists():
             if self._same_or_newer_file(file_path, destination):
+                if move_file:
+                    # Already have an equivalent file in latest/ — drop the
+                    # duplicate sitting in _incoming/ so it doesn't linger
+                    # and get rescanned on every future run.
+                    try:
+                        file_path.unlink()
+                    except OSError:
+                        pass
                 return False
 
             destination = self._unique_destination_path(destination)

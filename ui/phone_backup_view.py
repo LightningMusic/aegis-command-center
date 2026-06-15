@@ -28,7 +28,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
-
+import time
+from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
@@ -48,7 +49,6 @@ from PyQt6.QtWidgets import (
 )
 
 from core.phone_backup_manager import PhoneBackupManager, PhoneDevice
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Background worker
@@ -105,9 +105,32 @@ class PhoneBackupView(QWidget):
         self.detected: list[PhoneDevice] = []
         self.backup_thread:  Optional[QThread]  = None
         self.backup_worker:  Optional[PhoneBackupWorker] = None
+        self._backup_started_at: Optional[float] = None
+        self._last_activity_at: Optional[float] = None
+
+        self.activity_timer = QTimer(self)
+        self.activity_timer.setInterval(1000)
+        self.activity_timer.timeout.connect(self._tick_activity)
 
         self._build_ui()
         self._refresh_history()
+
+
+    def _tick_activity(self) -> None:
+        if self._backup_started_at is None:
+            return
+        now = time.monotonic()
+        elapsed = int(now - self._backup_started_at)
+        since_activity = int(now - (self._last_activity_at or self._backup_started_at))
+
+        elapsed_txt = f"{elapsed // 60}m {elapsed % 60:02d}s"
+        if since_activity < 10:
+            activity_txt = "active now"
+        else:
+            activity_txt = f"last update {since_activity}s ago"
+
+        self.activity_lbl.setText(f"Elapsed: {elapsed_txt} · {activity_txt}")
+
 
     # ─────────────────────────────────────────────────────────────────────
     # UI construction
@@ -205,6 +228,11 @@ class PhoneBackupView(QWidget):
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet("font-size: 13px; color: #AAA;")
         backup_layout.addWidget(self.status_lbl)
+
+        self.activity_lbl = QLabel("")
+        self.activity_lbl.setStyleSheet("font-size: 12px; color: #777;")
+        backup_layout.addWidget(self.activity_lbl)
+
 
         # Divider
         line = QFrame()
@@ -329,9 +357,13 @@ class PhoneBackupView(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Starting…")
         self.status_lbl.setText(f"Backing up {device.display_name}…")
+        self.activity_lbl.setText("")
         self.backup_btn.setText("Stop Backup")
         self.detect_btn.setEnabled(False)
 
+        self._backup_started_at = time.monotonic()
+        self._last_activity_at = self._backup_started_at
+        self.activity_timer.start()
         thread = QThread()
         worker = PhoneBackupWorker(self.manager, device)
 
@@ -361,20 +393,31 @@ class PhoneBackupView(QWidget):
     # ─────────────────────────────────────────────────────────────────────
 
     def _on_progress(self, percent: int, message: str) -> None:
+        self._last_activity_at = time.monotonic()
+
+        if percent == -2:
+            # Status-only update (heartbeat) — don't spam the log.
+            self.status_lbl.setText(message)
+            return
+
         if percent >= 0:
             self.progress_bar.setValue(percent)
-            # Keep format in sync with percent
             self.progress_bar.setFormat(f"{percent}%")
         self.log_box.append(message)
-        # Auto-scroll
         sb = self.log_box.verticalScrollBar()
         if sb:
             sb.setValue(sb.maximum())
 
     def _on_finished(self, result: dict) -> None:
         cancelled = result.get("cancelled", False)
-        self.progress_bar.setValue(100 if not cancelled else self.progress_bar.value())
-        self.progress_bar.setFormat("Cancelled" if cancelled else "Complete ✓")
+        stalled = result.get("stalled", False)
+        self.progress_bar.setValue(100)
+        if stalled:
+            self.progress_bar.setFormat("Paused — phone stopped responding")
+        elif cancelled:
+            self.progress_bar.setFormat("Stopped")
+        else:
+            self.progress_bar.setFormat("Complete ✓")
 
         copy_r  = result.get("copy_result")   or {}
         org_r   = result.get("organize_result") or {}
@@ -383,13 +426,13 @@ class PhoneBackupView(QWidget):
         lines = [
             "─" * 48,
             f"Device  : {result.get('device', '?')}",
-            f"Status  : {'Cancelled' if cancelled else 'Completed'}",
+            f"Status  : {'Paused (no response from phone)' if stalled else ('Stopped' if cancelled else 'Completed')}",
             f"Started : {result.get('started_at', '?')}",
             f"Finished: {result.get('completed_at', '?')}",
             "",
-            f"Files copied    : {copy_r.get('copied', 0)}",
-            f"Files skipped   : {copy_r.get('skipped', 0)}",
-            f"Files organised : {org_r.get('files_organized', 0)}",
+            f"Files copied this run : {copy_r.get('copied', 0)}",
+            f"Files skipped (already had) : {copy_r.get('skipped', 0)}",
+            f"Files organised this run : {org_r.get('files_organized', 0)}",
             "",
             "── Categories ──────────────────────────",
         ]
@@ -404,19 +447,26 @@ class PhoneBackupView(QWidget):
 
         lines += [
             "",
-            f"Snapshot : {result.get('snapshot_dir', '?')}",
-            f"Latest   : {result.get('latest_dir',  '?')}",
+            f"Folder : {result.get('device_folder', '?')}",
+            f"Latest : {result.get('latest_dir',  '?')}",
             "─" * 48,
         ]
+
+        if stalled:
+            lines.append("Run backup again to continue — already-copied files won't be re-transferred.")
 
         self.log_box.append("\n".join(lines))
         sb = self.log_box.verticalScrollBar()
         if sb:
             sb.setValue(sb.maximum())
 
-        self.status_lbl.setText(
-            "Backup complete." if not cancelled else "Backup stopped."
-        )
+        if stalled:
+            self.status_lbl.setText("Paused — phone stopped responding. Run again to continue.")
+        elif cancelled:
+            self.status_lbl.setText("Backup stopped — progress saved.")
+        else:
+            self.status_lbl.setText("Backup complete.")
+
         self._refresh_history()
 
         # Update last backup in database using device_manager
@@ -427,7 +477,7 @@ class PhoneBackupView(QWidget):
                 if device:
                     device_id = device.get("device_id")
                     copied_files = copy_r.get("copied", 0)
-                    
+                    self._last_activity_at = time.monotonic()
                     # Compute size of the latest backup directory
                     latest_dir = Path(result.get("latest_dir"))
                     total_bytes = 0
@@ -435,7 +485,7 @@ class PhoneBackupView(QWidget):
                         for p in latest_dir.rglob("*"):
                             if p.is_file():
                                 total_bytes += p.stat().st_size
-                                
+                                self._last_activity_at = time.monotonic()
                     self.device_manager.update_last_backup(
                         device_id,
                         result.get("latest_dir"),
@@ -454,6 +504,8 @@ class PhoneBackupView(QWidget):
     def _cleanup_backup_thread(self) -> None:
         self.backup_thread = None
         self.backup_worker = None
+        self.activity_timer.stop()
+        self._backup_started_at = None
 
         self.backup_btn.setText("Start Backup")
 
