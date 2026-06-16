@@ -12,6 +12,7 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.create_tables()
         self._ensure_columns()
+        pass
 
     def create_tables(self):
         self.conn.execute(

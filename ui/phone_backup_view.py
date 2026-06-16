@@ -29,6 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import time
+from unittest import result
 from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -48,7 +49,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+
 from core.phone_backup_manager import PhoneBackupManager, PhoneDevice
+from core.device_manager import DeviceManager
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Background worker
@@ -102,6 +105,7 @@ class PhoneBackupView(QWidget):
     def __init__(self, phone_backup_manager: PhoneBackupManager) -> None:
         super().__init__()
         self.manager: PhoneBackupManager = phone_backup_manager
+        self.device_manager: Optional[DeviceManager] = None
         self.detected: list[PhoneDevice] = []
         self.backup_thread:  Optional[QThread]  = None
         self.backup_worker:  Optional[PhoneBackupWorker] = None
@@ -473,22 +477,32 @@ class PhoneBackupView(QWidget):
         if not cancelled and hasattr(self, "device_manager") and self.device_manager:
             try:
                 device_name = result.get("device")
+                if not device_name:
+                    return
                 device = self.device_manager.get_device_by_name(device_name)
                 if device:
                     device_id = device.get("device_id")
+                    if not device_id:
+                        return
                     copied_files = copy_r.get("copied", 0)
                     self._last_activity_at = time.monotonic()
                     # Compute size of the latest backup directory
-                    latest_dir = Path(result.get("latest_dir"))
+                    latest_dir_str = result.get("latest_dir")
+                    if not latest_dir_str:
+                        return
+
                     total_bytes = 0
-                    if latest_dir.exists():
-                        for p in latest_dir.rglob("*"):
-                            if p.is_file():
-                                total_bytes += p.stat().st_size
-                                self._last_activity_at = time.monotonic()
+
+                    if latest_dir_str:
+                        backup_path = Path(latest_dir_str)
+
+                        if backup_path.exists():
+                            for p in backup_path.rglob("*"):
+                                if p.is_file():
+                                    total_bytes += p.stat().st_size
                     self.device_manager.update_last_backup(
                         device_id,
-                        result.get("latest_dir"),
+                        latest_dir_str,
                         copied_files,
                         total_bytes
                     )

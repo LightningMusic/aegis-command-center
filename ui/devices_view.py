@@ -386,6 +386,11 @@ class DevicesView(QWidget):
         matched = False
         for i in range(self.phone_backup_view.phone_list.count()):
             item = self.phone_backup_view.phone_list.item(i)
+            
+            # Guard clause: Ensure item is not None before processing
+            if item is None:
+                continue
+                
             device = item.data(Qt.ItemDataRole.UserRole)
             if device:
                 dev_path = device.shell_path or device.drive_root
@@ -403,7 +408,6 @@ class DevicesView(QWidget):
                 "Backup Error",
                 f"Could not find connected phone '{phone_name}' at path '{phone_path}'."
             )
-
     def show_add_device_dialog(self):
         """Show dialog to manually add a device."""
         dialog = QDialog(self)
