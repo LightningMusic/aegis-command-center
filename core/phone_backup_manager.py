@@ -1,20 +1,22 @@
 """
 core/phone_backup_manager.py
 ============================
-Detects phones connected via USB (MTP / file-transfer mode or USB mass-storage)
-and backs up every accessible file, organizing it into category folders via
-PhoneFileOrganizer.
+Detects phones connected via USB (MTP / file-transfer mode or USB mass-storage),
+backs up every accessible file, and organizes it into category folders via
+PhoneFileOrganizer — all tracked by a persistent per-device manifest so repeat
+backups are fast, incremental, and resumable without supervision.
 
 Folder layout produced
 ──────────────────────
 {backup_root}/
   Phones/
     Galaxy_S24/
-      _incoming/          ← persistent staging area for the MTP/drive copy stage.
-                             Files land here, then get moved into category folders
-                             below. Anything left here after a run means it still
-                             needs organizing (or the run was interrupted) — the
-                             next run picks up right where it left off.
+      _incoming/            ← persistent staging area for the MTP/drive copy
+                               stage. Files land here, then get moved into
+                               category folders below. Anything left here
+                               after a run means it still needs organizing
+                               (or the run was interrupted) — the next run
+                               picks up right where it left off.
       latest/
         Photos/
         Videos/
@@ -24,13 +26,24 @@ Folder layout produced
         Messages/
         Private_Files/
         Miscellaneous/
-      backup_log.json     ← small JSON history of each run (timestamps, counts, errors)
+      backup_manifest.json  ← per-file record: size, modified date, category,
+                               dest path, status, failure count. Consulted
+                               BEFORE the MTP copy step so unchanged files are
+                               never re-transferred, and updated AFTER the
+                               organize step once a file's final resting
+                               place is known.
+      backup_log.json       ← small history of each run (timestamps, counts)
     Pixel_8_Pro/
       …
 
-This layout is incremental and resumable: a run that's cancelled or stalls
-partway through still organizes whatever made it into _incoming/, so progress
-is never lost, and nothing is ever copied twice into latest/.
+Self-reliance
+──────────────
+backup_phone_until_complete() wraps a single backup_phone() attempt in an
+automatic retry loop: if the phone stops responding mid-copy, it waits,
+re-detects the device (in case Windows reassigned it a new MTP shell path
+after a brief disconnect), and tries again on its own — no need to come
+back and click "Start Backup" a second time. This is meant to be left
+running unattended (e.g. overnight).
 
 Detection strategy (tried in order)
 ────────────────────────────────────
@@ -41,7 +54,7 @@ Usage
 ─────
     mgr = PhoneBackupManager("D:\\Aegis_Backups")
     phones = mgr.detect_phones()
-    result = mgr.backup_phone(phones[0], progress_callback=…, should_stop=…)
+    result = mgr.backup_phone_until_complete(phones[0], progress_callback=…, should_stop=…)
 """
 
 from __future__ import annotations
@@ -70,8 +83,16 @@ StopCallback = Callable[[], bool]
 MTP_FILE_TIMEOUT_SECONDS = 60
 
 # If the whole MTP copy process produces no output at all for this long,
-# assume the phone has stopped responding and give up gracefully.
+# assume the phone has stopped responding and give up on this attempt.
 MTP_STALL_TIMEOUT_SECONDS = 120
+
+# A file that fails this many cumulative times gets marked "skip" in the
+# manifest so future attempts stop wasting time retrying a dead file.
+MAX_FILE_FAIL_ATTEMPTS = 3
+
+# Defaults for the unattended retry loop.
+DEFAULT_MAX_RETRY_ATTEMPTS = 12
+DEFAULT_MAX_TOTAL_RUNTIME_SECONDS = 8 * 60 * 60  # 8 hours — safe for overnight
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +120,6 @@ class PhoneDevice:
 # PowerShell scripts (written to temp .ps1 files at runtime)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# List portable/MTP devices visible in "This PC" shell namespace.
 _PS_DETECT_MTP = r"""
 $shell = New-Object -ComObject Shell.Application
 $ns    = $shell.Namespace(17)        # 17 = CSIDL_DRIVES ("This PC")
@@ -107,7 +127,6 @@ $out   = @()
 foreach ($item in $ns.Items()) {
     if (-not $item.IsFolder) { continue }
     $t = $item.Type.ToLower()
-    # Skip ordinary drive types
     if ($t -like '*local disk*' -or $t -like '*removable disk*' -or
         $t -like '*cd drive*'   -or $t -like '*network drive*') { continue }
     $out += [PSCustomObject]@{
@@ -120,23 +139,27 @@ if ($out.Count -eq 0) { Write-Output '[]' }
 else { $out | ConvertTo-Json -Compress -Depth 2 }
 """
 
-# Recursively copy all files from an MTP shell-namespace path to a real
-# local folder.  Emits structured lines on stdout so Python can parse them.
+# Recursively copy files from an MTP shell-namespace path to a real local
+# folder, consulting a manifest lookup so unchanged files are skipped
+# without ever being copied.
 #
 # Output protocol:
 #   FILE_OK:<local_dest_path>
-#   FILE_SKIP:<filename>
-#   FILE_TIMEOUT:<filename>
+#   FILE_SKIP:<filename>                  (already in _incoming this run)
+#   FILE_SKIP_MANIFEST:<relkey>            (manifest says unchanged/permanently-skip)
+#   FILE_TIMEOUT:<relkey>
+#   FILE_ERR:<relkey>:<message>
 #   FOLDER_ENTER:<shell_path>
 #   FOLDER_SKIP:<shell_path>
-#   STATS:<copied>:<skipped>:<errors>          (heartbeat, every ~5s)
-#   ERR:<shell_path>:<message>
+#   STATS:<copied>:<skipped>:<errors>      (heartbeat, every ~5s)
+#   ERR:<shell_path>:<message>             (folder/source-level, not file-specific)
 #   DONE:<copied>:<skipped>:<errors>
 _PS_COPY_MTP = r"""
 param(
     [string]$SourcePath,
     [string]$DestPath,
-    [int]$TimeoutSec = 60
+    [int]$TimeoutSec = 60,
+    [string]$ManifestPath = ""
 )
 
 $shell     = New-Object -ComObject Shell.Application
@@ -151,8 +174,25 @@ $lastBeat  = Get-Date
 # an invisible dialog and the whole script hangs forever.
 $copyFlags = 1556
 
-# Folders that are always junk / not worth backing up.
 $ALWAYS_SKIP = @('.thumbnails', '.trashed', '.cache', '.thumbcache', 'lost.dir')
+
+# Load the manifest lookup (relative path -> {size, skip}) if provided.
+$manifestLookup = @{}
+if ($ManifestPath -and (Test-Path $ManifestPath)) {
+    try {
+        $raw = Get-Content $ManifestPath -Raw -ErrorAction Stop
+        if ($raw) {
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed) {
+                foreach ($prop in $parsed.PSObject.Properties) {
+                    $manifestLookup[$prop.Name] = $prop.Value
+                }
+            }
+        }
+    } catch {
+        $manifestLookup = @{}
+    }
+}
 
 function ShouldSkipItem([string]$ParentLabel, [string]$Name) {
     $lower = $Name.ToLower()
@@ -181,7 +221,7 @@ function EnsureFolder([string]$Path) {
     return $shell.Namespace($Path)
 }
 
-function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
+function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string]$Dst) {
     try {
         if ($null -eq $Folder) {
             $script:errors++
@@ -205,6 +245,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
         foreach ($item in $Folder.Items()) {
             Heartbeat
             $safeName = $item.Name -replace '[\\/:*?"<>|]', '_'
+            $relKey = if ($RelLabel) { "$RelLabel\$safeName" } else { $safeName }
 
             if ($item.IsFolder) {
                 if (ShouldSkipItem $Label $item.Name) {
@@ -214,8 +255,35 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
                 }
                 $childFolder = $null
                 try { $childFolder = $item.GetFolder() } catch { $childFolder = $null }
-                CopyMTPFolderObject $childFolder "$Label\$safeName" (Join-Path $Dst $safeName)
+                CopyMTPFolderObject $childFolder "$Label\$safeName" $relKey (Join-Path $Dst $safeName)
                 continue
+            }
+
+            # Consult the manifest BEFORE touching the USB/MTP layer at all —
+            # this is what makes repeat backups fast.
+            if ($manifestLookup.ContainsKey($relKey)) {
+                $entry = $manifestLookup[$relKey]
+                $isPermSkip = $false
+                try { $isPermSkip = [bool]$entry.skip } catch { $isPermSkip = $false }
+
+                if ($isPermSkip) {
+                    $script:skipped++
+                    Write-Host "FILE_SKIP_MANIFEST:$relKey"
+                    [Console]::Out.Flush()
+                    continue
+                }
+
+                $knownSize = $null
+                try { $knownSize = [int64]$entry.size } catch { $knownSize = $null }
+                $liveSize = $null
+                try { $liveSize = $item.Size } catch { $liveSize = $null }
+
+                if ($null -ne $knownSize -and $null -ne $liveSize -and $liveSize -eq $knownSize) {
+                    $script:skipped++
+                    Write-Host "FILE_SKIP_MANIFEST:$relKey"
+                    [Console]::Out.Flush()
+                    continue
+                }
             }
 
             $destFile = Join-Path $Dst $safeName
@@ -230,7 +298,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
                 $dstNs.CopyHere($item, $copyFlags)
             } catch {
                 $script:errors++
-                Write-Host "ERR:$($Label)\$($safeName):CopyHere failed: $_"
+                Write-Host "FILE_ERR:$($relKey):CopyHere failed: $_"
                 [Console]::Out.Flush()
                 continue
             }
@@ -244,7 +312,6 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
             }
 
             if (Test-Path $destFile) {
-                # Give large files a brief moment to finish writing.
                 try {
                     $size = (Get-Item $destFile).Length
                     if ($size -gt 5MB) {
@@ -260,10 +327,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
                 } catch {}
 
                 # Best-effort: preserve the phone's "date modified" so files
-                # sort by when they were actually taken, not when they were
-                # backed up. Column 3 is "Date modified" in most shell views;
-                # if it's wrong/unavailable for this folder type, we just
-                # leave the copy's own timestamp alone.
+                # sort by when they were actually taken, not when backed up.
                 try {
                     $dateStr = $Folder.GetDetailsOf($item, 3)
                     if ($dateStr) {
@@ -278,7 +342,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$Dst) {
                 Write-Host "FILE_OK:$destFile"
             } else {
                 $script:errors++
-                Write-Host "FILE_TIMEOUT:$safeName"
+                Write-Host "FILE_TIMEOUT:$relKey"
             }
             [Console]::Out.Flush()
         }
@@ -294,7 +358,7 @@ if ($null -eq $srcNs) {
     $errors++
     Write-Host "ERR:$($SourcePath):Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
 } else {
-    CopyMTPFolderObject $srcNs $SourcePath $DestPath
+    CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
 }
 
 if ($script:visited -gt 0 -and $script:copied -eq 0 -and $script:skipped -eq 0 -and $script:errors -eq 0) {
@@ -435,7 +499,7 @@ class PhoneBackupManager:
         except Exception:
             return None
 
-    # ── Backup ────────────────────────────────────────────────────────────
+    # ── Backup (single attempt) ─────────────────────────────────────────────
 
     def backup_phone(
         self,
@@ -444,17 +508,23 @@ class PhoneBackupManager:
         should_stop: Optional[StopCallback] = None,
     ) -> Dict[str, Any]:
         """
-        Incremental backup of *device*.
+        One incremental backup attempt for *device*.
 
-        Stage 1: copy phone files into ``Phones/<Device>/_incoming/`` (skips
-                 anything already sitting there from a previous interrupted run).
+        Stage 1: copy phone files into ``Phones/<Device>/_incoming/``, consulting
+                 the manifest so unchanged files are never re-transferred.
         Stage 2: PhoneFileOrganizer moves everything from _incoming/ into
-                 ``Phones/<Device>/latest/{Photos, Videos, …}``.
+                 ``Phones/<Device>/latest/{Photos, Videos, …}``, and the
+                 manifest is updated with each file's final size, modified
+                 date, and category.
 
-        Stage 2 always runs, even if stage 1 was cancelled or the phone
-        stopped responding — so whatever made it across is organized and
-        nothing already-copied is lost. _incoming/ stays empty between
-        clean runs and only holds "work in progress" if a run was interrupted.
+        Stage 2 always runs, even if stage 1 stalled or was cancelled — so
+        whatever made it across is organized and recorded, nothing already
+        copied is lost, and the manifest reflects reality even after a
+        partial run.
+
+        For the full unattended/overnight experience, use
+        backup_phone_until_complete() instead, which wraps this in an
+        automatic retry loop.
         """
         device_dir   = self._device_dir(device)
         incoming_dir = device_dir / "_incoming"
@@ -462,6 +532,9 @@ class PhoneBackupManager:
 
         device_dir.mkdir(parents=True, exist_ok=True)
         incoming_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest = self._load_manifest(device_dir, device.display_name)
+        manifest_lookup = self._build_manifest_lookup(manifest)
 
         result: Dict[str, Any] = {
             "device":          device.display_name,
@@ -482,14 +555,14 @@ class PhoneBackupManager:
             self._record_run(device_dir, result)
             return result
 
-        # ── Stage 1: Copy ──────────────────────────────────────────────────
         if progress_callback:
-            progress_callback(0, f"Connecting to {device.display_name}…")
+            progress_callback(-3, f"Connecting to {device.display_name}…")
 
         if device.access_type == "mtp":
             copy_result = self._copy_mtp(
                 shell_path=device.shell_path,
                 dest=str(incoming_dir),
+                manifest_lookup=manifest_lookup,
                 progress_callback=progress_callback,
                 should_stop=should_stop,
             )
@@ -497,6 +570,7 @@ class PhoneBackupManager:
             copy_result = self._copy_drive(
                 source=device.drive_root,
                 dest=str(incoming_dir),
+                manifest_lookup=manifest_lookup,
                 progress_callback=progress_callback,
                 should_stop=should_stop,
             )
@@ -507,12 +581,14 @@ class PhoneBackupManager:
         if copy_result.get("stalled"):
             result["stalled"] = True
 
+        self._record_failures(manifest, copy_result.get("failed_keys", []))
+
         copy_stopped = bool(copy_result.get("cancelled")) or bool(should_stop and should_stop())
 
-        # ── Stage 2: Organize (runs even if stage 1 was cut short) ──────────
+        # ── Organize (runs even if the copy stage was cut short) ───────────
         result["stage"] = "organize"
         if progress_callback:
-            progress_callback(-1, "Organizing files into categories…")
+            progress_callback(-3, "Organizing files into categories…")
 
         organizer = PhoneFileOrganizer(backup_root=str(self._phones_dir))
         org_result = organizer.organize_existing_backup(
@@ -527,19 +603,21 @@ class PhoneBackupManager:
         for err in org_result.get("errors", []):
             result["errors"].append(f"{err['file']}: {err['error']}")
 
+        self._record_successes(manifest, org_result.get("manifest_entries", []))
+        self._save_manifest(device_dir, manifest)
+        result["manifest_summary"] = self._summarize_manifest(manifest)
+
         _prune_empty_dirs(incoming_dir)
 
         if copy_stopped or org_result.get("cancelled"):
-            result.update(
-                cancelled=True,
-                completed_at=datetime.now().isoformat(),
-            )
+            result.update(cancelled=True, completed_at=datetime.now().isoformat())
             self._record_run(device_dir, result)
             if progress_callback:
-                if result["stalled"]:
-                    progress_callback(100, "Phone stopped responding — progress saved, run backup again to continue.")
-                else:
-                    progress_callback(100, "Backup stopped — progress saved.")
+                progress_callback(
+                    -3,
+                    "Phone stopped responding — progress saved." if result["stalled"]
+                    else "Backup stopped — progress saved.",
+                )
             return result
 
         result.update(stage="complete", completed_at=datetime.now().isoformat())
@@ -549,30 +627,190 @@ class PhoneBackupManager:
 
         return result
 
+    # ── Backup (self-reliant, retries automatically) ────────────────────────
+
+    def backup_phone_until_complete(
+        self,
+        device: PhoneDevice,
+        progress_callback: Optional[ProgressCallback] = None,
+        should_stop: Optional[StopCallback] = None,
+        max_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
+        max_total_seconds: int = DEFAULT_MAX_TOTAL_RUNTIME_SECONDS,
+    ) -> Dict[str, Any]:
+        """
+        Run backup_phone() in an automatic retry loop so a single call can be
+        left unattended overnight. If a run stalls because the phone stopped
+        responding, this waits, re-detects the device (Windows can reassign a
+        new MTP shell path after a brief disconnect), and tries again on its
+        own — no need to come back and click "Start Backup" a second time.
+
+        Stops retrying when:
+          - a run completes without stalling (success, or a genuine user cancel), or
+          - max_attempts is reached, or
+          - max_total_seconds of wall-clock time has elapsed.
+        """
+        start_time = time.monotonic()
+        last_result: Dict[str, Any] = {}
+        current_device = device
+
+        for attempt in range(1, max_attempts + 1):
+            if should_stop and should_stop():
+                break
+
+            if progress_callback and attempt > 1:
+                progress_callback(-3, f"Retry attempt {attempt} of {max_attempts}…")
+
+            last_result = self.backup_phone(
+                current_device,
+                progress_callback=progress_callback,
+                should_stop=should_stop,
+            )
+            last_result["attempt"] = attempt
+
+            if not last_result.get("stalled"):
+                # Either succeeded outright or was a genuine user cancel —
+                # either way, don't auto-retry.
+                break
+
+            if should_stop and should_stop():
+                break
+
+            if time.monotonic() - start_time > max_total_seconds:
+                last_result.setdefault("errors", []).append(
+                    "Stopped auto-retrying after reaching the maximum unattended run time."
+                )
+                break
+
+            wait_seconds = min(15 * attempt, 120)
+            if progress_callback:
+                progress_callback(-3, f"Phone unresponsive — waiting {wait_seconds}s before retrying…")
+            for _ in range(wait_seconds):
+                if should_stop and should_stop():
+                    break
+                time.sleep(1)
+
+            refreshed = self._reacquire_device(current_device)
+            if refreshed:
+                current_device = refreshed
+
+        last_result["attempts_used"] = last_result.get("attempt", 1)
+        return last_result
+
+    def _reacquire_device(self, device: PhoneDevice) -> Optional[PhoneDevice]:
+        """
+        Try to find the same phone again after a brief disconnect, in case
+        Windows assigned it a different shell path on reconnect.
+        """
+        try:
+            candidates = self.detect_phones()
+        except Exception:
+            return None
+
+        for candidate in candidates:
+            if candidate.access_type != device.access_type:
+                continue
+            if candidate.display_name.lower() == device.display_name.lower():
+                return candidate
+
+        return None
+
+    # ── Manifest ─────────────────────────────────────────────────────────
+
+    def _manifest_path(self, device_dir: Path) -> Path:
+        return device_dir / "backup_manifest.json"
+
+    def _load_manifest(self, device_dir: Path, device_name: str) -> Dict[str, Any]:
+        path = self._manifest_path(device_dir)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("files"), dict):
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {"device_name": device_name, "last_updated": None, "files": {}}
+
+    def _save_manifest(self, device_dir: Path, manifest: Dict[str, Any]) -> None:
+        manifest["last_updated"] = datetime.now().isoformat()
+        path = self._manifest_path(device_dir)
+        try:
+            path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _build_manifest_lookup(self, manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """{relative_path: {"size": int, "skip": bool}} for the copy stage to consult."""
+        lookup: Dict[str, Dict[str, Any]] = {}
+        for relkey, entry in manifest.get("files", {}).items():
+            if entry.get("skip"):
+                lookup[relkey] = {"size": entry.get("size", 0), "skip": True}
+            elif entry.get("status") == "ok":
+                lookup[relkey] = {"size": entry.get("size", 0), "skip": False}
+        return lookup
+
+    def _record_failures(self, manifest: Dict[str, Any], failed_keys: List[str]) -> None:
+        files = manifest.setdefault("files", {})
+        for relkey in failed_keys:
+            entry = files.get(relkey, {})
+            entry["status"] = "failed"
+            entry["fail_count"] = entry.get("fail_count", 0) + 1
+            entry["last_attempt"] = datetime.now().isoformat()
+            if entry["fail_count"] >= MAX_FILE_FAIL_ATTEMPTS:
+                entry["skip"] = True
+            files[relkey] = entry
+
+    def _record_successes(self, manifest: Dict[str, Any], manifest_entries: List[Dict[str, Any]]) -> None:
+        files = manifest.setdefault("files", {})
+        now = datetime.now().isoformat()
+        for entry in manifest_entries:
+            files[entry["source_relative"]] = {
+                "size": entry.get("size", 0),
+                "modified": entry.get("modified"),
+                "category": entry.get("category"),
+                "dest_path": entry.get("dest_relative"),
+                "status": "ok",
+                "copied_at": now,
+                "fail_count": 0,
+            }
+
+    def _summarize_manifest(self, manifest: Dict[str, Any]) -> Dict[str, int]:
+        ok = 0
+        failed_pending = 0
+        skipped_permanent = 0
+        for entry in manifest.get("files", {}).values():
+            if entry.get("skip"):
+                skipped_permanent += 1
+            elif entry.get("status") == "ok":
+                ok += 1
+            elif entry.get("status") == "failed":
+                failed_pending += 1
+        return {
+            "confirmed_files": ok,
+            "pending_retry_files": failed_pending,
+            "permanently_skipped_files": skipped_permanent,
+        }
+
     # ── Copy helpers ──────────────────────────────────────────────────────
 
     def _copy_mtp(
         self,
         shell_path: str,
         dest: str,
+        manifest_lookup: Dict[str, Dict[str, Any]],
         progress_callback: Optional[ProgressCallback],
         should_stop: Optional[StopCallback],
     ) -> Dict[str, Any]:
-        """
-        Copy all files from an MTP shell-namespace path to a local folder
-        using a PowerShell script. Files already present in *dest* (from a
-        previous interrupted run) are skipped, which is what makes backups
-        resumable.
-        """
         result: Dict[str, Any] = {
-            "copied": 0, "skipped": 0,
-            "errors": [], "cancelled": False, "stalled": False,
+            "copied": 0, "skipped": 0, "skipped_manifest": 0,
+            "errors": [], "failed_keys": [],
+            "cancelled": False, "stalled": False,
         }
 
         if os.name != "nt":
             result["errors"].append("MTP copy is only supported on Windows.")
             return result
 
+        manifest_path = _write_temp_manifest_lookup(manifest_lookup)
         ps_path = _write_temp_script(_PS_COPY_MTP)
         try:
             cmd = [
@@ -581,6 +819,7 @@ class PhoneBackupManager:
                 "-SourcePath", shell_path,
                 "-DestPath",   dest,
                 "-TimeoutSec", str(MTP_FILE_TIMEOUT_SECONDS),
+                "-ManifestPath", manifest_path,
             ]
             proc = subprocess.Popen(
                 cmd,
@@ -629,9 +868,8 @@ class PhoneBackupManager:
                         result["stalled"] = True
                         result["cancelled"] = True
                         result["errors"].append(
-                            f"Phone stopped responding after {result['copied']} file(s) copied "
-                            f"this run. Files already copied have been organized — run the "
-                            f"backup again to continue with the rest."
+                            f"Phone stopped responding after {result['copied']} file(s) "
+                            f"copied this attempt. Already-copied files have been organized."
                         )
                         break
                     continue
@@ -653,11 +891,23 @@ class PhoneBackupManager:
                     if progress_callback:
                         progress_callback(-1, f"Copied: {fname}")
 
+                elif line.startswith("FILE_SKIP_MANIFEST:"):
+                    result["skipped"] += 1
+                    result["skipped_manifest"] += 1
+
                 elif line.startswith("FILE_SKIP:"):
                     result["skipped"] += 1
 
                 elif line.startswith("FILE_TIMEOUT:"):
-                    result["errors"].append(f"Timed out: {line[13:]}")
+                    relkey = line[13:]
+                    result["errors"].append(f"Timed out: {relkey}")
+                    result["failed_keys"].append(relkey)
+
+                elif line.startswith("FILE_ERR:"):
+                    remainder = line[9:]
+                    relkey, _, message = remainder.partition(":")
+                    result["errors"].append(f"{relkey}: {message}")
+                    result["failed_keys"].append(relkey)
 
                 elif line.startswith("FOLDER_ENTER:"):
                     folder = line[13:].split("\\")[-1]
@@ -692,14 +942,16 @@ class PhoneBackupManager:
                         result["copied"]  = int(parts[0])
                         result["skipped"] = int(parts[1])
                         err_count = int(parts[2])
-                        if err_count:
-                            result["errors"].append(
-                                f"{err_count} file(s) failed to copy."
-                            )
+                        if err_count and not result["failed_keys"]:
+                            result["errors"].append(f"{err_count} file(s) failed to copy.")
 
         finally:
             try:
                 os.unlink(ps_path)
+            except OSError:
+                pass
+            try:
+                os.unlink(manifest_path)
             except OSError:
                 pass
 
@@ -709,19 +961,19 @@ class PhoneBackupManager:
         self,
         source: str,
         dest: str,
+        manifest_lookup: Dict[str, Dict[str, Any]],
         progress_callback: Optional[ProgressCallback],
         should_stop: Optional[StopCallback],
     ) -> Dict[str, Any]:
         """
         Copy all files from a real drive path (USB mass-storage phones) using
-        shutil. Skips Windows system directories and Android's restricted
-        per-app folders. Files that already exist at the destination are only
-        skipped if they're the same size and at least as new — so updated
-        files on the phone get re-copied.
+        shutil, consulting the same manifest as the MTP path so unchanged
+        files are skipped without even being statted twice.
         """
         result: Dict[str, Any] = {
-            "copied": 0, "skipped": 0,
-            "errors": [], "cancelled": False, "stalled": False,
+            "copied": 0, "skipped": 0, "skipped_manifest": 0,
+            "errors": [], "failed_keys": [],
+            "cancelled": False, "stalled": False,
         }
 
         _SKIP_DIRS = {
@@ -760,13 +1012,28 @@ class PhoneBackupManager:
                 result["cancelled"] = True
                 break
 
+            rel_key = str(src_file.relative_to(source))
+
             if progress_callback:
                 pct = int(idx / total * 100)
                 progress_callback(pct, f"Copying: {src_file.name}")
 
+            manifest_entry = manifest_lookup.get(rel_key)
+            if manifest_entry:
+                if manifest_entry.get("skip"):
+                    result["skipped"] += 1
+                    result["skipped_manifest"] += 1
+                    continue
+                try:
+                    if manifest_entry.get("size") == src_file.stat().st_size:
+                        result["skipped"] += 1
+                        result["skipped_manifest"] += 1
+                        continue
+                except OSError:
+                    pass
+
             try:
-                rel      = src_file.relative_to(source)
-                dst_file = dest_path / rel
+                dst_file = dest_path / rel_key
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
 
                 if dst_file.exists():
@@ -785,7 +1052,8 @@ class PhoneBackupManager:
             except PermissionError:
                 pass   # skip locked files silently
             except Exception as exc:
-                result["errors"].append(f"{src_file.name}: {exc}")
+                result["errors"].append(f"{rel_key}: {exc}")
+                result["failed_keys"].append(rel_key)
 
         return result
 
@@ -808,14 +1076,17 @@ class PhoneBackupManager:
         org_r  = result.get("organize_result") or {}
 
         history.append({
-            "started_at":     result.get("started_at"),
-            "completed_at":   result.get("completed_at"),
-            "cancelled":      result.get("cancelled", False),
-            "stalled":        result.get("stalled", False),
-            "files_copied":   copy_r.get("copied", 0),
-            "files_skipped":  copy_r.get("skipped", 0),
+            "started_at":      result.get("started_at"),
+            "completed_at":    result.get("completed_at"),
+            "cancelled":       result.get("cancelled", False),
+            "stalled":         result.get("stalled", False),
+            "attempt":         result.get("attempt"),
+            "files_copied":    copy_r.get("copied", 0),
+            "files_skipped":   copy_r.get("skipped", 0),
+            "files_skipped_manifest": copy_r.get("skipped_manifest", 0),
             "files_organized": org_r.get("files_organized", 0),
-            "error_count":    len(result.get("errors") or []),
+            "error_count":     len(result.get("errors") or []),
+            "manifest_summary": result.get("manifest_summary"),
         })
         history = history[-50:]
 
@@ -835,9 +1106,7 @@ class PhoneBackupManager:
             return []
 
     def list_all_backed_up_devices(self, include_total_size: bool = False) -> List[Dict[str, Any]]:
-        """
-        Return every device that has at least one recorded run, sorted A→Z.
-        """
+        """Return every device that has at least one recorded run, sorted A→Z."""
         if not self._phones_dir.exists():
             return []
 
@@ -849,6 +1118,8 @@ class PhoneBackupManager:
             history = self._read_log(d)
             latest_dir = d / "latest"
             incoming_dir = d / "_incoming"
+            manifest = self._load_manifest(d, d.name.replace("_", " "))
+            manifest_summary = self._summarize_manifest(manifest)
 
             out.append({
                 "name":           d.name.replace("_", " "),
@@ -859,6 +1130,8 @@ class PhoneBackupManager:
                 "total_size":     _dir_size(latest_dir) if include_total_size else None,
                 "last_backup":    history[-1].get("completed_at") if history else None,
                 "pending_files":  _count_files(incoming_dir),
+                "confirmed_files": manifest_summary["confirmed_files"],
+                "permanently_skipped_files": manifest_summary["permanently_skipped_files"],
             })
         return out
 
@@ -872,13 +1145,9 @@ class PhoneBackupManager:
     def find_legacy_snapshot_dirs(self) -> List[Path]:
         """
         Locate old-style per-run snapshot folders (e.g. '2026-05-30_143022')
-        left over from the previous backup layout. These were full copies of
-        every file and are no longer used — 'latest/' holds the organized
-        files and 'backup_log.json' holds history.
-
-        This does NOT delete anything; it just returns the list so you can
-        review it and delete folders yourself once you've confirmed 'latest/'
-        for that device looks complete.
+        left over from a previous backup layout. These were full copies of
+        every file and are no longer used. Returns the list without deleting
+        anything — review and delete manually once 'latest/' looks complete.
         """
         pattern = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}$")
         found: List[Path] = []
@@ -922,6 +1191,15 @@ def _write_temp_script(body: str) -> str:
         mode="w", suffix=".ps1", delete=False, encoding="utf-8"
     ) as f:
         f.write(body)
+        return f.name
+
+
+def _write_temp_manifest_lookup(lookup: Dict[str, Dict[str, Any]]) -> str:
+    """Write the manifest lookup to a temp .json file for the PS script to read."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as f:
+        json.dump(lookup, f)
         return f.name
 
 

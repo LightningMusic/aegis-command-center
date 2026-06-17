@@ -226,6 +226,7 @@ class PhoneFileOrganizer:
             "files_failed": 0,
             "categories": {},
             "errors": [],
+            "manifest_entries": [],
         }
 
         if should_stop and should_stop():
@@ -247,12 +248,20 @@ class PhoneFileOrganizer:
 
             try:
                 category = self._categorize_file(file_path)
-                placed = self._place_file(
+                source_relative = str(file_path.relative_to(source_root))
+
+                placed, manifest_info = self._place_file(
                     file_path=file_path,
                     destination_root=destination_root,
                     category=category,
                     move_file=move_files,
                 )
+
+                if manifest_info:
+                    results["manifest_entries"].append({
+                        "source_relative": source_relative,
+                        **manifest_info,
+                    })
 
                 if placed:
                     results["files_organized"] += 1
@@ -354,7 +363,17 @@ class PhoneFileOrganizer:
         destination_root: Path,
         category: str,
         move_file: bool,
-    ) -> bool:
+    ) -> tuple[bool, Optional[dict]]:
+        """
+        Copy or move the file into its category folder.
+
+        Returns (placed, manifest_info). placed is False when an equivalent
+        file already existed at the destination. manifest_info describes the
+        file's final resting place either way (size, modified date, category,
+        dest path) — even on the "already existed" branch, since that still
+        tells the caller where this logical file now lives, which is exactly
+        what lets the manifest learn about files that predate it.
+        """
         category_dir = destination_root / category
         category_dir.mkdir(parents=True, exist_ok=True)
 
@@ -370,7 +389,9 @@ class PhoneFileOrganizer:
                         file_path.unlink()
                     except OSError:
                         pass
-                return False
+
+                manifest_info = self._build_manifest_info(destination, destination_root, category)
+                return False, manifest_info
 
             destination = self._unique_destination_path(destination)
 
@@ -379,7 +400,21 @@ class PhoneFileOrganizer:
         else:
             shutil.copy2(str(file_path), str(destination))
 
-        return True
+        manifest_info = self._build_manifest_info(destination, destination_root, category)
+        return True, manifest_info
+
+    def _build_manifest_info(self, destination: Path, destination_root: Path, category: str) -> Optional[dict]:
+        try:
+            stat = destination.stat()
+        except OSError:
+            return None
+
+        return {
+            "category": category,
+            "dest_relative": str(destination.relative_to(destination_root)),
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        }
 
     def _same_or_newer_file(self, source: Path, destination: Path) -> bool:
         """

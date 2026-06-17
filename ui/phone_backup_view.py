@@ -60,7 +60,7 @@ from core.device_manager import DeviceManager
 class PhoneBackupWorker(QObject):
     """Runs the backup in a QThread and emits progress / completion signals."""
 
-    progress  = pyqtSignal(int, str)    # (percent, message)  – percent=-1 → append only
+    progress  = pyqtSignal(int, str)
     finished  = pyqtSignal(dict)
     failed    = pyqtSignal(str)
 
@@ -72,7 +72,7 @@ class PhoneBackupWorker(QObject):
 
     def run(self) -> None:
         try:
-            result = self.manager.backup_phone(
+            result = self.manager.backup_phone_until_complete(
                 self.device,
                 progress_callback=self._emit_progress,
                 should_stop=lambda: self._stop,
@@ -400,8 +400,17 @@ class PhoneBackupView(QWidget):
         self._last_activity_at = time.monotonic()
 
         if percent == -2:
-            # Status-only update (heartbeat) — don't spam the log.
+            # Heartbeat-only update — keep the status line fresh, skip the log.
             self.status_lbl.setText(message)
+            return
+
+        if percent == -3:
+            # A meaningful phase change or retry milestone — worth logging.
+            self.status_lbl.setText(message)
+            self.log_box.append(f"\n— {message} —")
+            sb = self.log_box.verticalScrollBar()
+            if sb:
+                sb.setValue(sb.maximum())
             return
 
         if percent >= 0:
@@ -415,7 +424,10 @@ class PhoneBackupView(QWidget):
     def _on_finished(self, result: dict) -> None:
         cancelled = result.get("cancelled", False)
         stalled = result.get("stalled", False)
+        attempts = result.get("attempts_used", 1)
+
         self.progress_bar.setValue(100)
+
         if stalled:
             self.progress_bar.setFormat("Paused — phone stopped responding")
         elif cancelled:
@@ -423,23 +435,31 @@ class PhoneBackupView(QWidget):
         else:
             self.progress_bar.setFormat("Complete ✓")
 
-        copy_r  = result.get("copy_result")   or {}
-        org_r   = result.get("organize_result") or {}
-        cats    = org_r.get("categories")     or {}
+        copy_r = result.get("copy_result") or {}
+        org_r = result.get("organize_result") or {}
+        cats = org_r.get("categories") or {}
+        manifest_summary = result.get("manifest_summary") or {}
 
         lines = [
             "─" * 48,
-            f"Device  : {result.get('device', '?')}",
-            f"Status  : {'Paused (no response from phone)' if stalled else ('Stopped' if cancelled else 'Completed')}",
-            f"Started : {result.get('started_at', '?')}",
-            f"Finished: {result.get('completed_at', '?')}",
+            f"Device   : {result.get('device', '?')}",
+            f"Status   : {'Paused (no response after retries)' if stalled else ('Stopped' if cancelled else 'Completed')}",
+            f"Attempts : {attempts}",
+            f"Started  : {result.get('started_at', '?')}",
+            f"Finished : {result.get('completed_at', '?')}",
             "",
-            f"Files copied this run : {copy_r.get('copied', 0)}",
-            f"Files skipped (already had) : {copy_r.get('skipped', 0)}",
+            f"Files copied this run    : {copy_r.get('copied', 0)}",
+            f"Files unchanged (skipped): {copy_r.get('skipped', 0)} "
+            f"(of which {copy_r.get('skipped_manifest', 0)} known-unchanged from manifest)",
             f"Files organised this run : {org_r.get('files_organized', 0)}",
             "",
-            "── Categories ──────────────────────────",
+            f"Confirmed backed up (all time)          : {manifest_summary.get('confirmed_files', '?')}",
+            f"Pending retry                           : {manifest_summary.get('pending_retry_files', 0)}",
+            f"Permanently skipped (repeated failures) : {manifest_summary.get('permanently_skipped_files', 0)}",
+            "",
+            "── Categories this run ─────────────────",
         ]
+
         for cat, count in sorted(cats.items()):
             lines.append(f"  {cat:<20} {count:>5} file(s)")
 
@@ -452,20 +472,27 @@ class PhoneBackupView(QWidget):
         lines += [
             "",
             f"Folder : {result.get('device_folder', '?')}",
-            f"Latest : {result.get('latest_dir',  '?')}",
+            f"Latest : {result.get('latest_dir', '?')}",
             "─" * 48,
         ]
 
         if stalled:
-            lines.append("Run backup again to continue — already-copied files won't be re-transferred.")
+            lines.append(
+                "The phone stopped responding and automatic retries were exhausted. "
+                "Reconnect it and click Start Backup to keep going — already-copied "
+                "files won't be re-transferred."
+            )
 
         self.log_box.append("\n".join(lines))
+
         sb = self.log_box.verticalScrollBar()
         if sb:
             sb.setValue(sb.maximum())
 
         if stalled:
-            self.status_lbl.setText("Paused — phone stopped responding. Run again to continue.")
+            self.status_lbl.setText(
+                "Paused after several automatic retries — reconnect and run again."
+            )
         elif cancelled:
             self.status_lbl.setText("Backup stopped — progress saved.")
         else:
@@ -479,33 +506,36 @@ class PhoneBackupView(QWidget):
                 device_name = result.get("device")
                 if not device_name:
                     return
+
                 device = self.device_manager.get_device_by_name(device_name)
                 if device:
                     device_id = device.get("device_id")
                     if not device_id:
                         return
+
                     copied_files = copy_r.get("copied", 0)
+
                     self._last_activity_at = time.monotonic()
-                    # Compute size of the latest backup directory
+
                     latest_dir_str = result.get("latest_dir")
                     if not latest_dir_str:
                         return
 
                     total_bytes = 0
+                    backup_path = Path(latest_dir_str)
 
-                    if latest_dir_str:
-                        backup_path = Path(latest_dir_str)
+                    if backup_path.exists():
+                        for p in backup_path.rglob("*"):
+                            if p.is_file():
+                                total_bytes += p.stat().st_size
 
-                        if backup_path.exists():
-                            for p in backup_path.rglob("*"):
-                                if p.is_file():
-                                    total_bytes += p.stat().st_size
                     self.device_manager.update_last_backup(
                         device_id,
                         latest_dir_str,
                         copied_files,
-                        total_bytes
+                        total_bytes,
                     )
+
             except Exception as e:
                 print(f"Error updating device backup in database: {e}")
 
@@ -537,6 +567,7 @@ class PhoneBackupView(QWidget):
         self.detail_box.clear()
 
         devices = self.manager.list_all_backed_up_devices()
+
         if not devices:
             item = QListWidgetItem("No backups yet.")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
@@ -544,11 +575,14 @@ class PhoneBackupView(QWidget):
             return
 
         for dev in devices:
-            snaps = dev["snapshot_count"]
-            label = f"{dev['name']}  ({snaps} snapshot{'s' if snaps != 1 else ''})"
-            item  = QListWidgetItem(label)
+            runs = dev["snapshot_count"]
+            label = f"{dev['name']}  ({runs} run{'s' if runs != 1 else ''})"
+
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, dev)
+
             self.history_list.addItem(item)
+
 
     def _on_history_selected(
         self,
@@ -556,21 +590,33 @@ class PhoneBackupView(QWidget):
         _previous: Optional[QListWidgetItem],
     ) -> None:
         self.detail_box.clear()
+
         if not current:
             return
+
         dev = current.data(Qt.ItemDataRole.UserRole)
+
         if not isinstance(dev, dict):
             return
+
         total_size = dev.get("total_size")
 
         lines = [
-            f"Name      : {dev.get('name', '?')}",
-            f"Folder    : {dev.get('folder', '?')}",
-            f"Snapshots : {dev.get('snapshot_count', 0)}",
+            f"Name       : {dev.get('name', '?')}",
+            f"Folder     : {dev.get('folder', '?')}",
+            f"Runs       : {dev.get('snapshot_count', 0)}",
             f"Last backup: {dev.get('last_backup') or 'Unknown'}",
-            f"Total size: {_fmt_bytes(total_size) if total_size is not None else 'Not calculated'}",
-            f"Latest OK : {'Yes' if dev.get('has_latest') else 'No'}",
+            f"Total size : {_fmt_bytes(total_size) if total_size is not None else 'Not calculated'}",
+            f"Latest OK  : {'Yes' if dev.get('has_latest') else 'No'}",
+            f"Confirmed files     : {dev.get('confirmed_files', '?')}",
+            f"Permanently skipped : {dev.get('permanently_skipped_files', 0)}",
         ]
+
+        if dev.get("pending_files"):
+            lines.append(
+                f"Pending (not yet organized): {dev['pending_files']}"
+            )
+
         if dev.get("latest_path"):
             lines.append(f"Latest at : {dev['latest_path']}")
 
