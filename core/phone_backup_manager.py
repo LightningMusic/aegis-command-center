@@ -73,6 +73,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from unittest import result
 
 from modules.phone_file_organizer import PhoneFileOrganizer
 
@@ -91,9 +92,10 @@ MTP_STALL_TIMEOUT_SECONDS = 120
 MAX_FILE_FAIL_ATTEMPTS = 3
 
 # Defaults for the unattended retry loop.
-DEFAULT_MAX_RETRY_ATTEMPTS = 12
+DEFAULT_MAX_RETRY_ATTEMPTS = 200
 DEFAULT_MAX_TOTAL_RUNTIME_SECONDS = 8 * 60 * 60  # 8 hours — safe for overnight
 
+_DUPLICATE_SUFFIX_RE = re.compile(r"^(?P<base>.*) \((?P<num>\d+)\)$")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -169,14 +171,10 @@ $errors    = 0
 $visited   = 0
 $lastBeat  = Get-Date
 
-# FOF_SILENT(4) + FOF_NOCONFIRMATION(16) + FOF_NOCONFIRMMKDIR(512) + FOF_NOERRORUI(1024)
-# NOERRORUI is the important one — without it, a single permission error pops
-# an invisible dialog and the whole script hangs forever.
 $copyFlags = 1556
 
 $ALWAYS_SKIP = @('.thumbnails', '.trashed', '.cache', '.thumbcache', 'lost.dir')
 
-# Load the manifest lookup (relative path -> {size, skip}) if provided.
 $manifestLookup = @{}
 if ($ManifestPath -and (Test-Path $ManifestPath)) {
     try {
@@ -194,11 +192,28 @@ if ($ManifestPath -and (Test-Path $ManifestPath)) {
     }
 }
 
+function Get-ItemSizeBestEffort($Item) {
+    # WPD/MTP shell namespace extensions are notoriously inconsistent about
+    # exposing .Size — for many Android phones it's always $null. Try the
+    # extended-property path first (goes through IPropertyStore, which MTP
+    # providers implement far more reliably than the legacy .Size getter),
+    # then fall back to .Size. Returns $null if genuinely unavailable —
+    # callers must treat that as "unknown", never as "changed".
+    try {
+        $extSize = $Item.ExtendedProperty("System.Size")
+        if ($null -ne $extSize -and $extSize -gt 0) { return [int64]$extSize }
+    } catch {}
+
+    try {
+        if ($Item.Size -and $Item.Size -gt 0) { return [int64]$Item.Size }
+    } catch {}
+
+    return $null
+}
+
 function ShouldSkipItem([string]$ParentLabel, [string]$Name) {
     $lower = $Name.ToLower()
     if ($ALWAYS_SKIP -contains $lower) { return $true }
-    # Android 10+ blocks MTP access to Android/data and Android/obb for
-    # everything except the owning app. Walking into these reliably hangs.
     if (($lower -eq 'data' -or $lower -eq 'obb') -and $ParentLabel -match '\\Android$') {
         return $true
     }
@@ -259,8 +274,12 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 continue
             }
 
-            # Consult the manifest BEFORE touching the USB/MTP layer at all —
-            # this is what makes repeat backups fast.
+            # Consult the manifest BEFORE touching the USB/MTP layer at all.
+            # Safe-by-default: only re-copy if we have POSITIVE evidence the
+            # file changed (both sizes known and they differ). If size info
+            # isn't available — which is the common case for this device's
+            # MTP provider — trust the manifest instead of re-downloading
+            # the whole phone every single run.
             if ($manifestLookup.ContainsKey($relKey)) {
                 $entry = $manifestLookup[$relKey]
                 $isPermSkip = $false
@@ -275,15 +294,15 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
                 $knownSize = $null
                 try { $knownSize = [int64]$entry.size } catch { $knownSize = $null }
-                $liveSize = $null
-                try { $liveSize = $item.Size } catch { $liveSize = $null }
+                $liveSize = Get-ItemSizeBestEffort $item
 
-                if ($null -ne $knownSize -and $null -ne $liveSize -and $liveSize -eq $knownSize) {
+                if ($null -eq $liveSize -or $null -eq $knownSize -or $liveSize -eq $knownSize) {
                     $script:skipped++
                     Write-Host "FILE_SKIP_MANIFEST:$relKey"
                     [Console]::Out.Flush()
                     continue
                 }
+                # else: size genuinely differs on both sides — fall through and re-copy.
             }
 
             $destFile = Join-Path $Dst $safeName
@@ -326,8 +345,6 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                     }
                 } catch {}
 
-                # Best-effort: preserve the phone's "date modified" so files
-                # sort by when they were actually taken, not when backed up.
                 try {
                     $dateStr = $Folder.GetDetailsOf($item, 3)
                     if ($dateStr) {
@@ -356,14 +373,14 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 $srcNs = $shell.Namespace($SourcePath)
 if ($null -eq $srcNs) {
     $errors++
-    Write-Host "ERR:$($SourcePath):Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
+    Write-Host "CONNECT_FAILED:Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
 } else {
     CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
 }
 
 if ($script:visited -gt 0 -and $script:copied -eq 0 -and $script:skipped -eq 0 -and $script:errors -eq 0) {
     $script:errors++
-    Write-Host "ERR:$($SourcePath):No accessible files were found. Unlock the phone and confirm the USB mode is File Transfer / MTP."
+    Write-Host "CONNECT_FAILED:No accessible files were found. Unlock the phone and confirm the USB mode is File Transfer / MTP."
 }
 
 Write-Host "DONE:$($script:copied):$($script:skipped):$($script:errors)"
@@ -580,12 +597,13 @@ class PhoneBackupManager:
             result["errors"].extend(copy_result["errors"])
         if copy_result.get("stalled"):
             result["stalled"] = True
+        if copy_result.get("connection_failed"):
+            result["connection_failed"] = True
 
         self._record_failures(manifest, copy_result.get("failed_keys", []))
 
         copy_stopped = bool(copy_result.get("cancelled")) or bool(should_stop and should_stop())
 
-        # ── Organize (runs even if the copy stage was cut short) ───────────
         result["stage"] = "organize"
         if progress_callback:
             progress_callback(-3, "Organizing files into categories…")
@@ -609,15 +627,18 @@ class PhoneBackupManager:
 
         _prune_empty_dirs(incoming_dir)
 
-        if copy_stopped or org_result.get("cancelled"):
+        needs_retry = result["stalled"] or result["connection_failed"]
+
+        if copy_stopped or org_result.get("cancelled") or needs_retry:
             result.update(cancelled=True, completed_at=datetime.now().isoformat())
             self._record_run(device_dir, result)
             if progress_callback:
-                progress_callback(
-                    -3,
-                    "Phone stopped responding — progress saved." if result["stalled"]
-                    else "Backup stopped — progress saved.",
-                )
+                if result["connection_failed"]:
+                    progress_callback(-3, "Could not reach the phone — progress saved.")
+                elif result["stalled"]:
+                    progress_callback(-3, "Phone stopped responding — progress saved.")
+                else:
+                    progress_callback(-3, "Backup stopped — progress saved.")
             return result
 
         result.update(stage="complete", completed_at=datetime.now().isoformat())
@@ -629,6 +650,9 @@ class PhoneBackupManager:
 
     # ── Backup (self-reliant, retries automatically) ────────────────────────
 
+    MAX_RETRY_BACKOFF_SECONDS = 120
+    DEVICE_POLL_INTERVAL_SECONDS = 5
+
     def backup_phone_until_complete(
         self,
         device: PhoneDevice,
@@ -639,26 +663,25 @@ class PhoneBackupManager:
     ) -> Dict[str, Any]:
         """
         Run backup_phone() in an automatic retry loop so a single call can be
-        left unattended overnight. If a run stalls because the phone stopped
-        responding, this waits, re-detects the device (Windows can reassign a
-        new MTP shell path after a brief disconnect), and tries again on its
-        own — no need to come back and click "Start Backup" a second time.
+        left unattended overnight. Retries on BOTH kinds of interruption:
+        a mid-transfer stall (phone goes quiet for a while) and a connection
+        failure (the MTP source won't even open — USB drop, driver hiccup).
+        Treating only the first kind as retry-worthy was the bug that made a
+        genuinely-unreachable phone get reported as "Completed".
 
-        Stops retrying when:
-          - a run completes without stalling (success, or a genuine user cancel), or
-          - max_attempts is reached, or
-          - max_total_seconds of wall-clock time has elapsed.
+        During the wait between attempts, polls for the device every few
+        seconds rather than sleeping blindly for the whole backoff window, so
+        it resumes as soon as the phone is detected again instead of always
+        waiting out the full delay.
         """
         start_time = time.monotonic()
         last_result: Dict[str, Any] = {}
         current_device = device
+        interruption_count = 0
 
         for attempt in range(1, max_attempts + 1):
             if should_stop and should_stop():
                 break
-
-            if progress_callback and attempt > 1:
-                progress_callback(-3, f"Retry attempt {attempt} of {max_attempts}…")
 
             last_result = self.backup_phone(
                 current_device,
@@ -667,9 +690,11 @@ class PhoneBackupManager:
             )
             last_result["attempt"] = attempt
 
-            if not last_result.get("stalled"):
-                # Either succeeded outright or was a genuine user cancel —
-                # either way, don't auto-retry.
+            needs_retry = bool(last_result.get("stalled") or last_result.get("connection_failed"))
+            if needs_retry:
+                interruption_count += 1
+
+            if not needs_retry:
                 break
 
             if should_stop and should_stop():
@@ -681,19 +706,37 @@ class PhoneBackupManager:
                 )
                 break
 
-            wait_seconds = min(15 * attempt, 120)
+            reason = (
+                "lost the USB/MTP connection" if last_result.get("connection_failed")
+                else "stopped responding"
+            )
+            wait_seconds = min(15 * attempt, self.MAX_RETRY_BACKOFF_SECONDS)
             if progress_callback:
-                progress_callback(-3, f"Phone unresponsive — waiting {wait_seconds}s before retrying…")
-            for _ in range(wait_seconds):
+                progress_callback(
+                    -3,
+                    f"Phone {reason} — waiting up to {wait_seconds}s before retry "
+                    f"{attempt + 1} of {max_attempts}…",
+                )
+
+            deadline = time.monotonic() + wait_seconds
+            refreshed = None
+            while time.monotonic() < deadline:
                 if should_stop and should_stop():
                     break
-                time.sleep(1)
+                refreshed = self._reacquire_device(current_device)
+                if refreshed:
+                    break
+                time.sleep(self.DEVICE_POLL_INTERVAL_SECONDS)
 
-            refreshed = self._reacquire_device(current_device)
             if refreshed:
                 current_device = refreshed
+                if progress_callback:
+                    progress_callback(-3, "Phone detected again — resuming…")
+            elif progress_callback:
+                progress_callback(-3, "Phone still not detected — trying the existing connection anyway…")
 
         last_result["attempts_used"] = last_result.get("attempt", 1)
+        last_result["interruption_count"] = interruption_count
         return last_result
 
     def _reacquire_device(self, device: PhoneDevice) -> Optional[PhoneDevice]:
@@ -803,7 +846,7 @@ class PhoneBackupManager:
         result: Dict[str, Any] = {
             "copied": 0, "skipped": 0, "skipped_manifest": 0,
             "errors": [], "failed_keys": [],
-            "cancelled": False, "stalled": False,
+            "cancelled": False, "stalled": False, "connection_failed": False,
         }
 
         if os.name != "nt":
@@ -936,6 +979,11 @@ class PhoneBackupManager:
                 elif line.startswith("ERR:"):
                     result["errors"].append(line[4:])
 
+                elif line.startswith("CONNECT_FAILED:"):
+                    message = line[15:]
+                    result["connection_failed"] = True
+                    result["errors"].append(message)
+
                 elif line.startswith("DONE:"):
                     parts = line[5:].split(":")
                     if len(parts) >= 3:
@@ -981,6 +1029,18 @@ class PhoneBackupManager:
             "program files", "program files (x86)", "programdata",
             ".thumbnails", ".trashed", ".cache", "lost.dir",
         }
+
+
+        result: Dict[str, Any] = {
+            "copied": 0, "skipped": 0, "skipped_manifest": 0,
+            "errors": [], "failed_keys": [],
+            "cancelled": False, "stalled": False, "connection_failed": False,
+        }
+
+        if not Path(source).exists():
+            result["connection_failed"] = True
+            result["errors"].append(f"Source path no longer exists: {source}")
+            return result
 
         dest_path = Path(dest)
         dest_path.mkdir(parents=True, exist_ok=True)
@@ -1163,6 +1223,109 @@ class PhoneBackupManager:
                     found.append(child)
 
         return found
+
+    def find_duplicate_groups_in_latest_dir(self, device_dir: str | Path) -> List[Dict[str, Any]]:
+        latest_dir = Path(device_dir) / "latest"
+        if not latest_dir.exists():
+            return []
+
+        by_folder: Dict[Path, Dict[str, List[Path]]] = {}
+        for path in latest_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            match = _DUPLICATE_SUFFIX_RE.match(path.stem)
+            if not match:
+                continue
+            base_name = f"{match.group('base')}{path.suffix}"
+            by_folder.setdefault(path.parent, {}).setdefault(base_name, []).append(path)
+
+        groups = []
+        for folder, suffix_map in by_folder.items():
+            for base_name, suffixed_paths in suffix_map.items():
+                original = folder / base_name
+                if not original.exists():
+                    continue
+                try:
+                    original_size = original.stat().st_size
+                except OSError:
+                    continue
+
+                matching = []
+                for p in suffixed_paths:
+                    try:
+                        if p.stat().st_size == original_size:
+                            matching.append(p)
+                    except OSError:
+                        continue
+
+                if matching:
+                    groups.append({
+                        "original": str(original),
+                        "duplicates": [str(p) for p in matching],
+                        "size_bytes": original_size,
+                        "reclaimable_bytes": original_size * len(matching),
+                    })
+
+        return groups
+
+    def merge_duplicate_groups_in_latest_dir(self, device_dir: str | Path) -> Dict[str, Any]:
+        device_dir = Path(device_dir)
+        groups = self.find_duplicate_groups_in_latest_dir(device_dir)
+
+        if not groups:
+            return {"removed_files": 0, "reclaimed_bytes": 0, "groups_merged": 0}
+
+        latest_dir = device_dir / "latest"
+        manifest = self._load_manifest(device_dir, device_dir.name.replace("_", " "))
+        path_translation: Dict[str, str] = {}
+
+        removed_files = 0
+        reclaimed_bytes = 0
+
+        for group in groups:
+            original_rel = str(Path(group["original"]).relative_to(latest_dir))
+            for dup_path_str in group["duplicates"]:
+                dup_path = Path(dup_path_str)
+                dup_rel = str(dup_path.relative_to(latest_dir))
+                try:
+                    size = dup_path.stat().st_size
+                    dup_path.unlink()
+                    removed_files += 1
+                    reclaimed_bytes += size
+                    path_translation[dup_rel] = original_rel
+                except OSError:
+                    continue
+
+        if path_translation:
+            for entry in manifest.get("files", {}).values():
+                dest = entry.get("dest_path")
+                if dest in path_translation:
+                    entry["dest_path"] = path_translation[dest]
+            self._save_manifest(device_dir, manifest)
+
+        return {
+            "removed_files": removed_files,
+            "reclaimed_bytes": reclaimed_bytes,
+            "groups_merged": len(groups),
+        }
+
+    def find_duplicate_groups_in_latest(self, device: PhoneDevice) -> List[Dict[str, Any]]:
+        return self.find_duplicate_groups_in_latest_dir(self._device_dir(device))
+
+    def merge_duplicate_groups_in_latest(self, device: PhoneDevice) -> Dict[str, Any]:
+        return self.merge_duplicate_groups_in_latest_dir(self._device_dir(device))
+
+    def clear_manifest_dir(self, device_dir: str | Path) -> None:
+        path = self._manifest_path(Path(device_dir))
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    def clear_manifest(self, device: PhoneDevice) -> None:
+        self.clear_manifest_dir(self._device_dir(device))
+
 
     # ── PowerShell helpers ────────────────────────────────────────────────
 

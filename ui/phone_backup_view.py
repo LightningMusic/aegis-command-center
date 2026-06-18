@@ -181,7 +181,6 @@ class PhoneBackupView(QWidget):
         layout.setSpacing(10)
         panel.setLayout(layout)
 
-        # Connected devices group
         detect_group = QGroupBox("Connected Devices")
         detect_layout = QVBoxLayout()
         detect_group.setLayout(detect_layout)
@@ -209,7 +208,6 @@ class PhoneBackupView(QWidget):
 
         layout.addWidget(detect_group)
 
-        # Backup group
         backup_group = QGroupBox("Backup")
         backup_layout = QVBoxLayout()
         backup_group.setLayout(backup_layout)
@@ -220,6 +218,12 @@ class PhoneBackupView(QWidget):
         self.backup_btn.setEnabled(False)
         self.backup_btn.clicked.connect(self._start_or_stop)
         backup_btns.addWidget(self.backup_btn)
+
+        self.cleanup_btn = QPushButton("Clean Up Duplicates")
+        self.cleanup_btn.setMinimumHeight(34)
+        self.cleanup_btn.clicked.connect(self._cleanup_duplicates)
+        backup_btns.addWidget(self.cleanup_btn)
+
         backup_btns.addStretch()
         backup_layout.addLayout(backup_btns)
 
@@ -237,8 +241,6 @@ class PhoneBackupView(QWidget):
         self.activity_lbl.setStyleSheet("font-size: 12px; color: #777;")
         backup_layout.addWidget(self.activity_lbl)
 
-
-        # Divider
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet("color: #333;")
@@ -424,42 +426,45 @@ class PhoneBackupView(QWidget):
     def _on_finished(self, result: dict) -> None:
         cancelled = result.get("cancelled", False)
         stalled = result.get("stalled", False)
+        connection_failed = result.get("connection_failed", False)
+        unreachable = stalled or connection_failed
         attempts = result.get("attempts_used", 1)
+        interruptions = result.get("interruption_count", 0)
 
         self.progress_bar.setValue(100)
-
-        if stalled:
-            self.progress_bar.setFormat("Paused — phone stopped responding")
+        if unreachable:
+            self.progress_bar.setFormat("Paused — phone unreachable")
         elif cancelled:
             self.progress_bar.setFormat("Stopped")
         else:
             self.progress_bar.setFormat("Complete ✓")
 
-        copy_r = result.get("copy_result") or {}
-        org_r = result.get("organize_result") or {}
-        cats = org_r.get("categories") or {}
+        copy_r  = result.get("copy_result")   or {}
+        org_r   = result.get("organize_result") or {}
+        cats    = org_r.get("categories")     or {}
         manifest_summary = result.get("manifest_summary") or {}
 
         lines = [
             "─" * 48,
-            f"Device   : {result.get('device', '?')}",
-            f"Status   : {'Paused (no response after retries)' if stalled else ('Stopped' if cancelled else 'Completed')}",
-            f"Attempts : {attempts}",
-            f"Started  : {result.get('started_at', '?')}",
-            f"Finished : {result.get('completed_at', '?')}",
+            f"Device       : {result.get('device', '?')}",
+            f"Status       : {'Paused (phone unreachable after retries)' if unreachable else ('Stopped' if cancelled else 'Completed')}",
+            f"Attempts     : {attempts}",
+            f"Interruptions: {interruptions}",
+            f"Started      : {result.get('started_at', '?')}",
+            f"Finished     : {result.get('completed_at', '?')}",
             "",
             f"Files copied this run    : {copy_r.get('copied', 0)}",
             f"Files unchanged (skipped): {copy_r.get('skipped', 0)} "
             f"(of which {copy_r.get('skipped_manifest', 0)} known-unchanged from manifest)",
             f"Files organised this run : {org_r.get('files_organized', 0)}",
             "",
-            f"Confirmed backed up (all time)          : {manifest_summary.get('confirmed_files', '?')}",
+            f"Confirmed backed up (all time)          : {manifest_summary.get('confirmed_files', '?')} "
+            f"files, {_fmt_bytes(manifest_summary.get('confirmed_bytes', 0))}",
             f"Pending retry                           : {manifest_summary.get('pending_retry_files', 0)}",
             f"Permanently skipped (repeated failures) : {manifest_summary.get('permanently_skipped_files', 0)}",
             "",
             "── Categories this run ─────────────────",
         ]
-
         for cat, count in sorted(cats.items()):
             lines.append(f"  {cat:<20} {count:>5} file(s)")
 
@@ -472,27 +477,24 @@ class PhoneBackupView(QWidget):
         lines += [
             "",
             f"Folder : {result.get('device_folder', '?')}",
-            f"Latest : {result.get('latest_dir', '?')}",
+            f"Latest : {result.get('latest_dir',  '?')}",
             "─" * 48,
         ]
 
-        if stalled:
+        if unreachable:
             lines.append(
-                "The phone stopped responding and automatic retries were exhausted. "
-                "Reconnect it and click Start Backup to keep going — already-copied "
-                "files won't be re-transferred."
+                "The phone stopped responding or lost its USB/MTP connection, and "
+                "automatic retries were exhausted. Reconnect it and click Start "
+                "Backup to keep going — already-copied files won't be re-transferred."
             )
 
         self.log_box.append("\n".join(lines))
-
         sb = self.log_box.verticalScrollBar()
         if sb:
             sb.setValue(sb.maximum())
 
-        if stalled:
-            self.status_lbl.setText(
-                "Paused after several automatic retries — reconnect and run again."
-            )
+        if unreachable:
+            self.status_lbl.setText("Paused — phone unreachable after several retries. Reconnect and run again.")
         elif cancelled:
             self.status_lbl.setText("Backup stopped — progress saved.")
         else:
@@ -506,36 +508,29 @@ class PhoneBackupView(QWidget):
                 device_name = result.get("device")
                 if not device_name:
                     return
-
                 device = self.device_manager.get_device_by_name(device_name)
                 if device:
                     device_id = device.get("device_id")
                     if not device_id:
                         return
-
                     copied_files = copy_r.get("copied", 0)
-
                     self._last_activity_at = time.monotonic()
-
                     latest_dir_str = result.get("latest_dir")
                     if not latest_dir_str:
                         return
 
                     total_bytes = 0
                     backup_path = Path(latest_dir_str)
-
                     if backup_path.exists():
                         for p in backup_path.rglob("*"):
                             if p.is_file():
                                 total_bytes += p.stat().st_size
-
                     self.device_manager.update_last_backup(
                         device_id,
                         latest_dir_str,
                         copied_files,
-                        total_bytes,
+                        total_bytes
                     )
-
             except Exception as e:
                 print(f"Error updating device backup in database: {e}")
 
@@ -557,7 +552,38 @@ class PhoneBackupView(QWidget):
         self.backup_btn.setEnabled(row >= 0 and bool(self.detected))
         self.detect_btn.setEnabled(True)
 
+    def _cleanup_duplicates(self) -> None:
+        device_dir = None
+        display_name = None
 
+        item = self.phone_list.currentItem()
+        device = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(device, PhoneDevice):
+            device_dir = self.manager._device_dir(device)
+            display_name = device.display_name
+        else:
+            hist_item = self.history_list.currentItem()
+            dev_info = hist_item.data(Qt.ItemDataRole.UserRole) if hist_item else None
+            if isinstance(dev_info, dict) and dev_info.get("folder"):
+                device_dir = Path(dev_info["folder"])
+                display_name = dev_info.get("name")
+
+        if not device_dir:
+            QMessageBox.warning(
+                self, "Clean Up Duplicates",
+                "Select a phone above, or a device in the history list on the right, first."
+            )
+            return
+
+        result = self.manager.merge_duplicate_groups_in_latest_dir(device_dir)
+        QMessageBox.information(
+            self,
+            "Clean Up Duplicates",
+            f"{display_name or device_dir.name}: removed {result['removed_files']} duplicate "
+            f"file(s) across {result['groups_merged']} group(s), reclaiming "
+            f"{_fmt_bytes(result['reclaimed_bytes'])}.",
+        )
+        self._refresh_history()
     # ─────────────────────────────────────────────────────────────────────
     # History panel
     # ─────────────────────────────────────────────────────────────────────

@@ -419,15 +419,16 @@ class PhoneFileOrganizer:
     def _same_or_newer_file(self, source: Path, destination: Path) -> bool:
         """
         True when destination appears to already contain the same file.
+
+        Matches on size alone. We intentionally do NOT also require the
+        destination's modified time to be >= the source's: timestamps from
+        MTP transfers aren't reliably trustworthy (see PhoneBackupManager's
+        MTP copy stage), and requiring mtime ordering on top of a size match
+        was causing re-copied files to be treated as "different" and saved
+        again under a "(1)" suffix instead of being recognized as duplicates.
         """
         try:
-            source_stat = source.stat()
-            destination_stat = destination.stat()
-
-            return (
-                destination_stat.st_size == source_stat.st_size
-                and int(destination_stat.st_mtime) >= int(source_stat.st_mtime)
-            )
+            return source.stat().st_size == destination.stat().st_size
         except OSError:
             return False
 
