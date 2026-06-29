@@ -26,6 +26,12 @@ class DuplicateDetector:
             return None
 
     def _is_protected(self, path):
+        try:
+            from core.file_manager import is_unmergeable_program_file
+            if is_unmergeable_program_file(path):
+                return True
+        except ImportError:
+            pass
         lower = path.lower().replace("/", "\\")
         return any(keyword in lower for keyword in self.PROTECTED_KEYWORDS)
 
@@ -46,6 +52,15 @@ class DuplicateDetector:
         keep = files[0]
         duplicates = files[1:]
         reclaimable = sum(file_record["size_bytes"] for file_record in duplicates)
+        duplicate_items = [
+            {
+                "path": file_record["absolute_path"],
+                "protected": self._is_protected(file_record["absolute_path"]),
+                "modified_at": file_record.get("modified_at"),
+                "last_accessed": file_record.get("last_accessed"),
+            }
+            for file_record in duplicates
+        ]
 
         return {
             "match_type": signature_type,
@@ -54,7 +69,10 @@ class DuplicateDetector:
             "size_bytes": keep["size_bytes"],
             "reclaimable_bytes": reclaimable,
             "keep_path": keep["absolute_path"],
+            "keep_protected": self._is_protected(keep["absolute_path"]),
+            "keep_modified_at": keep.get("modified_at"),
             "duplicate_paths": [file_record["absolute_path"] for file_record in duplicates],
+            "duplicate_items": duplicate_items,
             "drives": sorted({file_record["drive"] for file_record in files if file_record.get("drive")}),
             "risk": "high" if any(self._is_protected(file_record["absolute_path"]) for file_record in files) else "review",
         }

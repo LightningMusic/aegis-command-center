@@ -1,4 +1,5 @@
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+import os
+from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -15,6 +16,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QTabWidget,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -76,6 +79,231 @@ class BackupWorker(QObject):
 
     def should_stop(self):
         return self._stop_requested
+
+class DuplicateGroupsWidget(QWidget):
+    def __init__(self, file_manager, drive, parent_view):
+        super().__init__()
+        self.file_manager = file_manager
+        self.drive = drive
+        self.parent_view = parent_view
+        self.duplicates = []
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+        self.setLayout(layout)
+
+        # Header instructions
+        self.desc_label = QLabel(
+            "Select duplicates to delete. The original file (Keep) and protected system/program files cannot be selected."
+        )
+        self.desc_label.setWordWrap(True)
+        self.desc_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.desc_label)
+
+        # Control buttons
+        btn_layout = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select All Safe Duplicates")
+        self.select_all_btn.clicked.connect(self.select_all_safe)
+        btn_layout.addWidget(self.select_all_btn)
+
+        self.deselect_all_btn = QPushButton("Deselect All")
+        self.deselect_all_btn.clicked.connect(self.deselect_all)
+        btn_layout.addWidget(self.deselect_all_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        # Tree Widget
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["File Name / Path", "Size", "Date Modified", "Risk / Status"])
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderHidden(False)
+        self.tree.itemChanged.connect(self.on_item_changed)
+        layout.addWidget(self.tree)
+
+        # Bottom Actions
+        bottom_layout = QHBoxLayout()
+        self.status_label = QLabel("Selected: 0 files (0 B)")
+        bottom_layout.addWidget(self.status_label)
+        bottom_layout.addStretch()
+
+        self.merge_btn = QPushButton("Merge Selected (Delete Copies)")
+        self.merge_btn.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 6px 12px;")
+        self.merge_btn.clicked.connect(self.merge_selected)
+        self.merge_btn.setEnabled(False)
+        bottom_layout.addWidget(self.merge_btn)
+        layout.addLayout(bottom_layout)
+
+    def set_duplicates(self, duplicates):
+        self.duplicates = duplicates
+        self.tree.blockSignals(True)
+        self.tree.clear()
+
+        if not duplicates:
+            # Add a placeholder
+            item = QTreeWidgetItem(self.tree)
+            item.setText(0, "No duplicate groups found yet.")
+            self.tree.blockSignals(False)
+            self.update_status()
+            return
+
+        for group_idx, group in enumerate(duplicates):
+            reclaim_gb = _format_bytes(group["reclaimable_bytes"])
+            group_size = _format_bytes(group["size_bytes"])
+            keep_path = group["keep_path"]
+            dup_items = group.get("duplicate_items") or [
+                {"path": path, "protected": False, "modified_at": None}
+                for path in group.get("duplicate_paths", [])
+            ]
+
+            group_header = f"Group {group_idx + 1}: {os.path.basename(keep_path)} ({len(dup_items) + 1} files | Reclaimable: {reclaim_gb})"
+            
+            group_item = QTreeWidgetItem(self.tree)
+            group_item.setText(0, group_header)
+            group_item.setFirstColumnSpanned(True)
+            group_item.setExpanded(True)
+
+            # 1. Add "Keep" file
+            keep_item = QTreeWidgetItem(group_item)
+            keep_item.setText(0, keep_path)
+            keep_item.setText(1, group_size)
+            keep_item.setText(2, group.get("keep_modified_at") or "")
+            keep_item.setText(3, "Original (Keep)")
+            keep_item.setFlags(keep_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            keep_item.setCheckState(0, Qt.CheckState.Unchecked)
+            keep_item.setForeground(0, Qt.GlobalColor.darkGreen)
+
+            # 2. Add "Duplicate" copies
+            for dup in dup_items:
+                path = dup["path"]
+                dup_item = QTreeWidgetItem(group_item)
+                dup_item.setText(0, path)
+                dup_item.setText(1, group_size)
+                dup_item.setText(2, dup.get("modified_at") or "")
+                
+                # Check protection status
+                protected = dup.get("protected", False)
+                if protected:
+                    dup_item.setText(3, "Protected Program File")
+                    dup_item.setFlags(dup_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                    dup_item.setCheckState(0, Qt.CheckState.Unchecked)
+                    dup_item.setForeground(0, Qt.GlobalColor.gray)
+                    dup_item.setForeground(3, Qt.GlobalColor.red)
+                else:
+                    dup_item.setText(3, "Safe to Delete")
+                    dup_item.setFlags(dup_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    dup_item.setCheckState(0, Qt.CheckState.Checked)
+
+        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(1)
+        self.tree.resizeColumnToContents(2)
+        self.tree.resizeColumnToContents(3)
+        
+        self.tree.blockSignals(False)
+        self.update_status()
+
+    def select_all_safe(self):
+        self.tree.blockSignals(True)
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            for j in range(group.childCount()):
+                child = group.child(j)
+                if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    child.setCheckState(0, Qt.CheckState.Checked)
+        self.tree.blockSignals(False)
+        self.update_status()
+
+    def deselect_all(self):
+        self.tree.blockSignals(True)
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            for j in range(group.childCount()):
+                child = group.child(j)
+                if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    child.setCheckState(0, Qt.CheckState.Unchecked)
+        self.tree.blockSignals(False)
+        self.update_status()
+
+    def on_item_changed(self, item, column):
+        self.update_status()
+
+    def get_selected_paths(self):
+        selected_paths = []
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            for j in range(group.childCount()):
+                child = group.child(j)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    selected_paths.append(child.text(0))
+        return selected_paths
+
+    def update_status(self):
+        selected_paths = self.get_selected_paths()
+        count = len(selected_paths)
+        
+        total_bytes = 0
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            group = root.child(i)
+            for j in range(group.childCount()):
+                child = group.child(j)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    try:
+                        group_idx = i
+                        if group_idx < len(self.duplicates):
+                            total_bytes += self.duplicates[group_idx]["size_bytes"]
+                    except Exception:
+                        pass
+                        
+        size_str = _format_bytes(total_bytes)
+        self.status_label.setText(f"Selected: {count} files ({size_str})")
+        self.merge_btn.setEnabled(count > 0)
+
+    def merge_selected(self):
+        selected_paths = self.get_selected_paths()
+        if not selected_paths:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Deletion",
+            f"Are you sure you want to delete these {len(selected_paths)} duplicate files to reclaim space?\n\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted_count = 0
+        failed_list = []
+
+        for path in selected_paths:
+            success, message = self.file_manager.delete_file(path)
+            if success:
+                deleted_count += 1
+            else:
+                failed_list.append(message)
+
+        if failed_list:
+            QMessageBox.warning(
+                self,
+                "Merge Partially Completed",
+                f"Successfully deleted {deleted_count} files.\nFailed to delete {len(failed_list)} files.\n\nErrors:\n" + "\n".join(failed_list[:5])
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Merge Completed",
+                f"Successfully deleted {deleted_count} duplicate files and reclaimed space!"
+            )
+
+        if self.parent_view:
+            self.parent_view.refresh_drive_panels()
 
 
 class FilesView(QWidget):
@@ -433,9 +661,12 @@ class FilesView(QWidget):
             sections = {}
 
             for tab_name in ("Overview", "Folders", "Duplicates", "Steam", "Cleanup"):
-                widget = QTextEdit()
-                widget.setReadOnly(True)
-                widget.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+                if tab_name == "Duplicates":
+                    widget = DuplicateGroupsWidget(self.file_manager, drive["root"], self)
+                else:
+                    widget = QTextEdit()
+                    widget.setReadOnly(True)
+                    widget.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
                 inner_tabs.addTab(widget, tab_name)
                 sections[tab_name.lower()] = widget
 
@@ -812,9 +1043,13 @@ class FilesView(QWidget):
             widget.append(f"{_format_gb(size)} - {folder}")
 
     def _render_duplicates(self, widget, drive):
-        widget.clear()
         duplicates = self.file_manager.get_duplicate_files(drive)
 
+        if isinstance(widget, DuplicateGroupsWidget):
+            widget.set_duplicates(duplicates)
+            return
+
+        widget.clear()
         if not duplicates:
             widget.append("No duplicate groups found yet.")
             return

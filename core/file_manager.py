@@ -11,6 +11,36 @@ from core.windows_drives import list_connected_drives
 from modules.duplicate_detector import DuplicateDetector
 
 
+def is_unmergeable_program_file(path: str) -> bool:
+    if not path:
+        return False
+    path_lower = path.lower().replace("/", "\\")
+    
+    # 1. Check critical folders (windows, program files, programdata, appdata, etc.)
+    protected_dirs = [
+        "\\windows\\",
+        "\\program files\\",
+        "\\program files (x86)\\",
+        "\\programdata\\",
+        "\\appdata\\",
+        "\\steamapps\\",
+        "\\epic games\\",
+        "\\system volume information\\",
+        "\\$recycle.bin\\",
+        "\\perflogs\\"
+    ]
+    if any(p_dir in f"\\{path_lower}\\" or p_dir in path_lower for p_dir in protected_dirs):
+        return True
+        
+    # 2. Check critical extensions
+    critical_extensions = {".dll", ".exe", ".sys", ".drv", ".ocx", ".msi", ".msp", ".cab", ".com"}
+    _, ext = os.path.splitext(path_lower)
+    if ext in critical_extensions:
+        return True
+        
+    return False
+
+
 class FileManager:
     def __init__(self, config_manager=None):
         self.db = Database()
@@ -24,7 +54,7 @@ class FileManager:
     def _save_file_record(self, file_data):
         self.db.execute(
             """
-            INSERT OR REPLACE INTO files (
+            INSERT INTO files (
                 id,
                 absolute_path,
                 name,
@@ -38,6 +68,22 @@ class FileManager:
                 last_accessed
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(absolute_path) DO UPDATE SET
+                name = excluded.name,
+                extension = excluded.extension,
+                size_bytes = excluded.size_bytes,
+                modified_at = excluded.modified_at,
+                parent_directory = excluded.parent_directory,
+                is_directory = excluded.is_directory,
+                depth = excluded.depth,
+                drive = excluded.drive,
+                last_accessed = excluded.last_accessed,
+                hash = CASE
+                    WHEN files.size_bytes = excluded.size_bytes
+                    AND files.modified_at = excluded.modified_at
+                    THEN files.hash
+                    ELSE NULL
+                END
             """,
             (
                 file_data["id"],
@@ -53,6 +99,57 @@ class FileManager:
                 file_data["last_accessed"],
             ),
         )
+
+    def _save_file_records_batch(self, files_data):
+        query = """
+        INSERT INTO files (
+            id,
+            absolute_path,
+            name,
+            extension,
+            size_bytes,
+            modified_at,
+            parent_directory,
+            is_directory,
+            depth,
+            drive,
+            last_accessed
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(absolute_path) DO UPDATE SET
+            name = excluded.name,
+            extension = excluded.extension,
+            size_bytes = excluded.size_bytes,
+            modified_at = excluded.modified_at,
+            parent_directory = excluded.parent_directory,
+            is_directory = excluded.is_directory,
+            depth = excluded.depth,
+            drive = excluded.drive,
+            last_accessed = excluded.last_accessed,
+            hash = CASE
+                WHEN files.size_bytes = excluded.size_bytes
+                AND files.modified_at = excluded.modified_at
+                THEN files.hash
+                ELSE NULL
+            END
+        """
+        params = [
+            (
+                f["id"],
+                f["absolute_path"],
+                f["name"],
+                f["extension"],
+                f["size_bytes"],
+                f["modified_at"],
+                f["parent_directory"],
+                0,
+                f["depth"],
+                f["drive"],
+                f["last_accessed"],
+            )
+            for f in files_data
+        ]
+        self.db.execute_many(query, params)
 
     def _fetch_drive_records(self, drive):
         rows = self.db.fetchall(
@@ -105,6 +202,23 @@ class FileManager:
                 removed += 1
 
         print(f"Removed {removed} missing files")
+
+    def delete_file(self, path):
+        """Safely delete a file from disk and database, verifying it is not protected."""
+        if not os.path.exists(path):
+            # If it's already gone, just ensure it's removed from DB
+            self.db.execute("DELETE FROM files WHERE absolute_path = ?", (path,))
+            return True, "File already deleted."
+            
+        if is_unmergeable_program_file(path):
+            return False, f"Permission Denied: '{path}' is a protected program or system file."
+            
+        try:
+            os.remove(path)
+            self.db.execute("DELETE FROM files WHERE absolute_path = ?", (path,))
+            return True, "Success"
+        except Exception as exc:
+            return False, f"Failed to delete '{path}': {str(exc)}"
 
     def get_available_drives(self):
         return [item["root"] for item in self.get_drive_inventory() if item["is_scan_eligible"]]
@@ -363,4 +477,3 @@ class FileManager:
             progress_callback=progress_callback,
             should_stop=should_stop,
         )
-

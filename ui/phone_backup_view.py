@@ -440,33 +440,12 @@ class PhoneBackupView(QWidget):
             self.progress_bar.setFormat("Complete ✓")
 
         copy_r  = result.get("copy_result")   or {}
-        org_r   = result.get("organize_result") or {}
-        cats    = org_r.get("categories")     or {}
+        index_r = result.get("index_result") or {}
         manifest_summary = result.get("manifest_summary") or {}
 
         lines = [
-            "─" * 48,
-            f"Device       : {result.get('device', '?')}",
-            f"Status       : {'Paused (phone unreachable after retries)' if unreachable else ('Stopped' if cancelled else 'Completed')}",
-            f"Attempts     : {attempts}",
-            f"Interruptions: {interruptions}",
-            f"Started      : {result.get('started_at', '?')}",
-            f"Finished     : {result.get('completed_at', '?')}",
-            "",
-            f"Files copied this run    : {copy_r.get('copied', 0)}",
-            f"Files unchanged (skipped): {copy_r.get('skipped', 0)} "
-            f"(of which {copy_r.get('skipped_manifest', 0)} known-unchanged from manifest)",
-            f"Files organised this run : {org_r.get('files_organized', 0)}",
-            "",
-            f"Confirmed backed up (all time)          : {manifest_summary.get('confirmed_files', '?')} "
-            f"files, {_fmt_bytes(manifest_summary.get('confirmed_bytes', 0))}",
-            f"Pending retry                           : {manifest_summary.get('pending_retry_files', 0)}",
-            f"Permanently skipped (repeated failures) : {manifest_summary.get('permanently_skipped_files', 0)}",
-            "",
-            "── Categories this run ─────────────────",
+            "Preserved folder structure in latest/",
         ]
-        for cat, count in sorted(cats.items()):
-            lines.append(f"  {cat:<20} {count:>5} file(s)")
 
         errors = result.get("errors") or []
         if errors:
@@ -640,7 +619,7 @@ class PhoneBackupView(QWidget):
 
         if dev.get("pending_files"):
             lines.append(
-                f"Pending (not yet organized): {dev['pending_files']}"
+                f"Legacy staging files: {dev['pending_files']}"
             )
 
         if dev.get("latest_path"):

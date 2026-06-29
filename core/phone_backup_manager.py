@@ -2,42 +2,30 @@
 core/phone_backup_manager.py
 ============================
 Detects phones connected via USB (MTP / file-transfer mode or USB mass-storage),
-backs up every accessible file, and organizes it into category folders via
-PhoneFileOrganizer — all tracked by a persistent per-device manifest so repeat
+backs up every accessible file into one persistent per-device latest/ tree while
+preserving the phone folder structure. A manifest tracks known files so repeat
 backups are fast, incremental, and resumable without supervision.
 
 Folder layout produced
-──────────────────────
+----------------------
 {backup_root}/
   Phones/
     Galaxy_S24/
-      _incoming/            ← persistent staging area for the MTP/drive copy
-                               stage. Files land here, then get moved into
-                               category folders below. Anything left here
-                               after a run means it still needs organizing
-                               (or the run was interrupted) — the next run
-                               picks up right where it left off.
       latest/
-        Photos/
-        Videos/
-        Documents/
-        Downloads/
-        Audio/
-        Messages/
-        Private_Files/
-        Miscellaneous/
-      backup_manifest.json  ← per-file record: size, modified date, category,
-                               dest path, status, failure count. Consulted
-                               BEFORE the MTP copy step so unchanged files are
-                               never re-transferred, and updated AFTER the
-                               organize step once a file's final resting
-                               place is known.
-      backup_log.json       ← small history of each run (timestamps, counts)
+        DCIM/
+        Pictures/
+        Android/
+        ...
+      backup_manifest.json  - per-file index: size, modified date, original
+                              relative path, destination path, status, and
+                              failure count. Consulted before copy so unchanged
+                              files are never re-transferred, then refreshed
+                              from latest/ after each run.
+      backup_log.json       - small history of each run (timestamps, counts)
     Pixel_8_Pro/
-      …
+      ...
 
-Self-reliance
-──────────────
+Self-reliance──────────────
 backup_phone_until_complete() wraps a single backup_phone() attempt in an
 automatic retry loop: if the phone stops responding mid-copy, it waits,
 re-detects the device (in case Windows reassigned it a new MTP shell path
@@ -74,8 +62,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from unittest import result
-
-from modules.phone_file_organizer import PhoneFileOrganizer
 
 ProgressCallback = Callable[[int, str], None]
 StopCallback = Callable[[], bool]
@@ -147,7 +133,7 @@ else { $out | ConvertTo-Json -Compress -Depth 2 }
 #
 # Output protocol:
 #   FILE_OK:<local_dest_path>
-#   FILE_SKIP:<filename>                  (already in _incoming this run)
+#   FILE_SKIP:<filename>                  (already in latest/ this run)
 #   FILE_SKIP_MANIFEST:<relkey>            (manifest says unchanged/permanently-skip)
 #   FILE_TIMEOUT:<relkey>
 #   FILE_ERR:<relkey>:<message>
@@ -527,30 +513,23 @@ class PhoneBackupManager:
         """
         One incremental backup attempt for *device*.
 
-        Stage 1: copy phone files into ``Phones/<Device>/_incoming/``, consulting
-                 the manifest so unchanged files are never re-transferred.
-        Stage 2: PhoneFileOrganizer moves everything from _incoming/ into
-                 ``Phones/<Device>/latest/{Photos, Videos, …}``, and the
-                 manifest is updated with each file's final size, modified
-                 date, and category.
-
-        Stage 2 always runs, even if stage 1 stalled or was cancelled — so
-        whatever made it across is organized and recorded, nothing already
-        copied is lost, and the manifest reflects reality even after a
-        partial run.
+        Files are copied directly into ``Phones/<Device>/latest/`` using the
+        same relative paths they had on the phone. The manifest is consulted
+        before copying so unchanged files are skipped, then refreshed from the
+        ``latest/`` tree after each attempt so files from older runs are known.
 
         For the full unattended/overnight experience, use
         backup_phone_until_complete() instead, which wraps this in an
         automatic retry loop.
         """
         device_dir   = self._device_dir(device)
-        incoming_dir = device_dir / "_incoming"
         latest_dir   = device_dir / "latest"
 
         device_dir.mkdir(parents=True, exist_ok=True)
-        incoming_dir.mkdir(parents=True, exist_ok=True)
+        latest_dir.mkdir(parents=True, exist_ok=True)
 
         manifest = self._load_manifest(device_dir, device.display_name)
+        self._index_existing_backup_tree(manifest, latest_dir)
         manifest_lookup = self._build_manifest_lookup(manifest)
 
         result: Dict[str, Any] = {
@@ -563,6 +542,7 @@ class PhoneBackupManager:
             "stalled":         False,
             "stage":           "copy",
             "copy_result":     None,
+            "index_result":    None,
             "organize_result": None,
             "errors":          [],
         }
@@ -578,7 +558,7 @@ class PhoneBackupManager:
         if device.access_type == "mtp":
             copy_result = self._copy_mtp(
                 shell_path=device.shell_path,
-                dest=str(incoming_dir),
+                dest=str(latest_dir),
                 manifest_lookup=manifest_lookup,
                 progress_callback=progress_callback,
                 should_stop=should_stop,
@@ -586,7 +566,7 @@ class PhoneBackupManager:
         else:
             copy_result = self._copy_drive(
                 source=device.drive_root,
-                dest=str(incoming_dir),
+                dest=str(latest_dir),
                 manifest_lookup=manifest_lookup,
                 progress_callback=progress_callback,
                 should_stop=should_stop,
@@ -604,32 +584,18 @@ class PhoneBackupManager:
 
         copy_stopped = bool(copy_result.get("cancelled")) or bool(should_stop and should_stop())
 
-        result["stage"] = "organize"
+        result["stage"] = "index"
         if progress_callback:
-            progress_callback(-3, "Organizing files into categories…")
+            progress_callback(-3, "Indexing preserved phone folders...")
 
-        organizer = PhoneFileOrganizer(backup_root=str(self._phones_dir))
-        org_result = organizer.organize_existing_backup(
-            backup_path=str(incoming_dir),
-            device_name=device.display_name,
-            move_files=True,
-            progress_callback=lambda p, m: progress_callback(-1, m) if progress_callback else None,
-            should_stop=should_stop,
-        )
-        result["organize_result"] = org_result
-
-        for err in org_result.get("errors", []):
-            result["errors"].append(f"{err['file']}: {err['error']}")
-
-        self._record_successes(manifest, org_result.get("manifest_entries", []))
+        index_result = self._index_existing_backup_tree(manifest, latest_dir)
+        result["index_result"] = index_result
         self._save_manifest(device_dir, manifest)
         result["manifest_summary"] = self._summarize_manifest(manifest)
 
-        _prune_empty_dirs(incoming_dir)
-
         needs_retry = result["stalled"] or result["connection_failed"]
 
-        if copy_stopped or org_result.get("cancelled") or needs_retry:
+        if copy_stopped or needs_retry:
             result.update(cancelled=True, completed_at=datetime.now().isoformat())
             self._record_run(device_dir, result)
             if progress_callback:
@@ -816,19 +782,61 @@ class PhoneBackupManager:
                 "fail_count": 0,
             }
 
+    def _index_existing_backup_tree(self, manifest: Dict[str, Any], latest_dir: Path) -> Dict[str, int]:
+        """
+        Rebuild the manifest's known-good file entries from the preserved
+        latest/ tree. This makes old backups and partially completed runs part
+        of the incremental index without moving or reorganizing anything.
+        """
+        files = manifest.setdefault("files", {})
+        now = datetime.now().isoformat()
+        indexed = 0
+        total_bytes = 0
+
+        if not latest_dir.exists():
+            return {"indexed_files": 0, "indexed_bytes": 0}
+
+        for path in latest_dir.rglob("*"):
+            if not path.is_file():
+                continue
+
+            try:
+                rel = str(path.relative_to(latest_dir))
+                stat = path.stat()
+            except OSError:
+                continue
+
+            files[rel] = {
+                **files.get(rel, {}),
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "source_relative": rel,
+                "dest_path": rel,
+                "status": "ok",
+                "indexed_at": now,
+                "fail_count": 0,
+            }
+            indexed += 1
+            total_bytes += stat.st_size
+
+        return {"indexed_files": indexed, "indexed_bytes": total_bytes}
+
     def _summarize_manifest(self, manifest: Dict[str, Any]) -> Dict[str, int]:
         ok = 0
         failed_pending = 0
         skipped_permanent = 0
+        confirmed_bytes = 0
         for entry in manifest.get("files", {}).values():
             if entry.get("skip"):
                 skipped_permanent += 1
             elif entry.get("status") == "ok":
                 ok += 1
+                confirmed_bytes += int(entry.get("size") or 0)
             elif entry.get("status") == "failed":
                 failed_pending += 1
         return {
             "confirmed_files": ok,
+            "confirmed_bytes": confirmed_bytes,
             "pending_retry_files": failed_pending,
             "permanently_skipped_files": skipped_permanent,
         }
@@ -912,7 +920,7 @@ class PhoneBackupManager:
                         result["cancelled"] = True
                         result["errors"].append(
                             f"Phone stopped responding after {result['copied']} file(s) "
-                            f"copied this attempt. Already-copied files have been organized."
+                            f"copied this attempt. Already-copied files have been indexed."
                         )
                         break
                     continue
@@ -1055,7 +1063,7 @@ class PhoneBackupManager:
             filtered_dirs = []
             for d in dirs:
                 d_lower = d.lower()
-                if d_lower in _SKIP_DIRS or d.startswith("."):
+                if d_lower in _SKIP_DIRS:
                     continue
                 if d_lower in ("data", "obb") and parent_name == "android":
                     continue
@@ -1133,7 +1141,7 @@ class PhoneBackupManager:
                 history = []
 
         copy_r = result.get("copy_result") or {}
-        org_r  = result.get("organize_result") or {}
+        index_r = result.get("index_result") or {}
 
         history.append({
             "started_at":      result.get("started_at"),
@@ -1144,7 +1152,7 @@ class PhoneBackupManager:
             "files_copied":    copy_r.get("copied", 0),
             "files_skipped":   copy_r.get("skipped", 0),
             "files_skipped_manifest": copy_r.get("skipped_manifest", 0),
-            "files_organized": org_r.get("files_organized", 0),
+            "files_indexed":   index_r.get("indexed_files", 0),
             "error_count":     len(result.get("errors") or []),
             "manifest_summary": result.get("manifest_summary"),
         })

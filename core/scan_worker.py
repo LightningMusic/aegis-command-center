@@ -1,11 +1,9 @@
-import getpass
 import hashlib
 import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 
 EXCLUDED_DIRS = {
@@ -50,30 +48,10 @@ class ScanWorker(QObject):
         self.file_manager = file_manager
         self.drives = drives
         self._running = True
-        self.hash_pool = ThreadPoolExecutor(max_workers=4)
         self._seen_directories = set()
 
-    def _hash_and_store(self, path, size):
-        file_hash = self.calculate_hash(path, size)
-        if file_hash:
-            self.file_manager.db.execute(
-                """
-                UPDATE files
-                SET hash = ?
-                WHERE absolute_path = ?
-                """,
-                (file_hash, path),
-            )
-
     def _build_roots(self, drive):
-        roots = []
-        user_path = os.path.join(drive, "Users", getpass.getuser())
-
-        if os.path.exists(user_path):
-            roots.append(user_path)
-
-        roots.append(drive)
-        return roots
+        return [drive]
 
     def _should_skip_directory(self, entry):
         name_lower = entry.name.lower()
@@ -105,12 +83,21 @@ class ScanWorker(QObject):
 
         return name_lower in EXCLUDED_FILES or extension in EXCLUDED_EXTENSIONS
 
+    def _save_hashes_batch(self, hash_updates):
+        query = """
+        UPDATE files
+        SET hash = ?
+        WHERE absolute_path = ?
+        """
+        self.file_manager.db.execute_many(query, hash_updates)
+
     def run(self):
         total_indexed = 0
-        batch_counter = 0
+        batch_files = []
         interrupted = False
 
         try:
+            # Phase 1: Metadata scanning
             for drive in self.drives:
                 if not drive.endswith("\\"):
                     drive = f"{drive}\\"
@@ -169,18 +156,19 @@ class ScanWorker(QObject):
                                         "drive": entry.path[:3],
                                     }
 
-                                    self.file_manager._save_file_record(file_data)
-                                    self.hash_pool.submit(self._hash_and_store, entry.path, size)
-
+                                    batch_files.append(file_data)
                                     total_indexed += 1
-                                    batch_counter += 1
 
-                                    if total_indexed % 1000 == 0:
-                                        print(f"Indexed {total_indexed} files...")
-
-                                    if batch_counter >= 100:
+                                    # Save in batches of 1000
+                                    if len(batch_files) >= 1000:
+                                        self.file_manager._save_file_records_batch(batch_files)
+                                        batch_files = []
                                         self.progress.emit(total_indexed)
-                                        batch_counter = 0
+
+                                    # Throttle the scanner slightly to prevent freeze
+                                    if total_indexed % 500 == 0:
+                                        QThread.msleep(1)
+
                                 except PermissionError:
                                     continue
                                 except FileNotFoundError:
@@ -203,8 +191,58 @@ class ScanWorker(QObject):
 
                 if interrupted:
                     break
+
+            # Save any remaining indexed files
+            if batch_files and self._running:
+                self.file_manager._save_file_records_batch(batch_files)
+                self.progress.emit(total_indexed)
+
+            # Phase 2: Duplicate hashing (sequential, throttled)
+            if self._running:
+                self.status.emit("Analyzing files for duplicate size candidates...")
+                query = """
+                SELECT absolute_path, size_bytes
+                FROM files
+                WHERE size_bytes > 0 AND size_bytes IS NOT NULL AND hash IS NULL
+                AND size_bytes IN (
+                    SELECT size_bytes
+                    FROM files
+                    GROUP BY size_bytes
+                    HAVING COUNT(*) > 1
+                )
+                """
+                candidates = self.file_manager.db.fetchall(query)
+
+                if candidates:
+                    total_candidates = len(candidates)
+                    self.status.emit(f"Hashing duplicates (0/{total_candidates})...")
+
+                    hash_updates = []
+                    for idx, (path, size) in enumerate(candidates):
+                        if not self._running:
+                            interrupted = True
+                            break
+
+                        file_hash = self.calculate_hash(path, size)
+                        if file_hash:
+                            hash_updates.append((file_hash, path))
+
+                        # Save in batches of 100
+                        if len(hash_updates) >= 100:
+                            self._save_hashes_batch(hash_updates)
+                            hash_updates = []
+
+                        # Update status every 50 files
+                        if idx % 50 == 0 or idx == total_candidates - 1:
+                            self.status.emit(f"Hashing duplicate candidate {idx + 1} of {total_candidates}")
+
+                        # Sleep between hash operations to avoid high disk utilization and freeze
+                        QThread.msleep(2)
+
+                    if hash_updates and self._running:
+                        self._save_hashes_batch(hash_updates)
+
         finally:
-            self.hash_pool.shutdown(wait=True)
             self.progress.emit(total_indexed)
             self.finished.emit(total_indexed)
 

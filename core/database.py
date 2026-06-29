@@ -92,6 +92,12 @@ class Database:
         self.conn.commit()
         return cur
 
+    def execute_many(self, query, param_list):
+        cur = self.conn.cursor()
+        cur.executemany(query, param_list)
+        self.conn.commit()
+        return cur
+
     def fetchall(self, query, params=()):
         cur = self.conn.cursor()
         cur.execute(query, params)

@@ -9,8 +9,7 @@ class StorageAnalyzer:
         "programdata",
         "system volume information",
         "$recycle.bin",
-        "appdata\\local\\microsoft",
-        "appdata\\roaming\\microsoft",
+        "appdata",
         "steamapps",
         "epic games",
         "ubisoft",
@@ -183,6 +182,13 @@ class StorageAnalyzer:
 
         if self.is_protected_path(path):
             return None
+
+        try:
+            from core.file_manager import is_unmergeable_program_file
+            if is_unmergeable_program_file(path):
+                return None
+        except ImportError:
+            pass
 
         if self.is_app_critical_file(path):
             return None
