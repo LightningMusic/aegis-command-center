@@ -12,12 +12,14 @@ THEME_PATH = BASE_DIR / "assets" / "theme.qss"
 
 
 def _bootstrap_local_venv() -> None:
-    if "PyQt6" in sys.modules:
-        return
-
-    candidate = BASE_DIR / ".venv" / "Lib" / f"site-packages"
-    if candidate.exists():
-        site.addsitedir(str(candidate))
+    venv_dir = BASE_DIR / ".venv"
+    venv_python = venv_dir / "Scripts" / "python.exe"
+    if venv_dir.exists() and venv_python.exists():
+        current_prefix = Path(sys.prefix).resolve()
+        target_prefix = venv_dir.resolve()
+        if current_prefix != target_prefix:
+            import subprocess
+            sys.exit(subprocess.call([str(venv_python)] + sys.argv))
 
 
 _bootstrap_local_venv()

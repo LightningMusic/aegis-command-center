@@ -1044,32 +1044,11 @@ class FilesView(QWidget):
 
     def _render_duplicates(self, widget, drive):
         duplicates = self.file_manager.get_duplicate_files(drive)
-
         if isinstance(widget, DuplicateGroupsWidget):
             widget.set_duplicates(duplicates)
-            return
-
-        widget.clear()
-        if not duplicates:
-            widget.append("No duplicate groups found yet.")
-            return
-
-        for index, group in enumerate(duplicates, start=1):
-            widget.append(
-                f"{index}. {group['match_type']} - {group['file_count']} files - reclaim {_format_gb(group['reclaimable_bytes'])}"
-            )
-            widget.append(f"Keep: {group['keep_path']}")
-            widget.append(f"Drives: {', '.join(group['drives']) or drive}")
-            widget.append(f"Risk: {group['risk']}")
-            for duplicate_path in group["duplicate_paths"][:4]:
-                widget.append(f"Duplicate: {duplicate_path}")
-            if len(group["duplicate_paths"]) > 4:
-                widget.append(f"... and {len(group['duplicate_paths']) - 4} more")
-            widget.append("")
-
-        widget.append(
-            "Exact duplicates use full file content hashes. Probable duplicates use sampled signatures or matching size/name when a full hash is unavailable."
-        )
+        else:
+            widget.clear()
+            widget.append("Invalid widget type for Duplicates tab.")
 
     def _render_steam(self, widget, drive):
         widget.clear()

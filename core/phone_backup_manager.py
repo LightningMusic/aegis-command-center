@@ -48,6 +48,7 @@ Usage
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -200,9 +201,7 @@ function Get-ItemSizeBestEffort($Item) {
 function ShouldSkipItem([string]$ParentLabel, [string]$Name) {
     $lower = $Name.ToLower()
     if ($ALWAYS_SKIP -contains $lower) { return $true }
-    if (($lower -eq 'data' -or $lower -eq 'obb') -and $ParentLabel -match '\\Android$') {
-        return $true
-    }
+    if ($lower -eq 'android' -or $lower.StartsWith('.')) { return $true }
     return $false
 }
 
@@ -1063,9 +1062,7 @@ class PhoneBackupManager:
             filtered_dirs = []
             for d in dirs:
                 d_lower = d.lower()
-                if d_lower in _SKIP_DIRS:
-                    continue
-                if d_lower in ("data", "obb") and parent_name == "android":
+                if d_lower in _SKIP_DIRS or d_lower == "android" or d_lower.startswith("."):
                     continue
                 filtered_dirs.append(d)
             dirs[:] = filtered_dirs
@@ -1333,6 +1330,113 @@ class PhoneBackupManager:
 
     def clear_manifest(self, device: PhoneDevice) -> None:
         self.clear_manifest_dir(self._device_dir(device))
+
+    def merge_old_backup_folders_into_latest(
+        self,
+        device_dir: Path,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> None:
+        """
+        Scan device_dir for any old snapshot folders (or other backup directories),
+        merge their files into 'latest/' while deduplicating them using MD5 and size,
+        and clean up the old folders.
+        """
+        if not device_dir.exists():
+            return
+
+        latest_dir = device_dir / "latest"
+        latest_dir.mkdir(parents=True, exist_ok=True)
+
+        old_folders = []
+        for child in device_dir.iterdir():
+            if child.is_dir() and child.name not in {"latest", "logs", "_aegis_merge_logs"}:
+                old_folders.append(child)
+
+        if not old_folders:
+            return
+
+        if progress_callback:
+            progress_callback(-2, f"Merging {len(old_folders)} old backup folders into latest...")
+
+        # Helper to calculate MD5 hash
+        def _calculate_file_md5(file_path: Path) -> str:
+            hasher = hashlib.md5()
+            try:
+                with open(file_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        hasher.update(chunk)
+                return hasher.hexdigest()
+            except OSError:
+                return ""
+
+        # Index existing files in latest_dir
+        latest_files: Dict[str, int] = {}  # rel_path_lower -> size
+        for root, _, filenames in os.walk(str(latest_dir)):
+            for filename in filenames:
+                path = Path(root) / filename
+                try:
+                    rel_path = path.relative_to(latest_dir).as_posix().lower()
+                    latest_files[rel_path] = path.stat().st_size
+                except OSError:
+                    continue
+
+        merged_count = 0
+        deleted_duplicates = 0
+
+        for old_folder in old_folders:
+            if progress_callback:
+                progress_callback(-2, f"Merging folder: {old_folder.name}")
+            
+            for root, _, filenames in os.walk(str(old_folder)):
+                for filename in filenames:
+                    file_path = Path(root) / filename
+                    try:
+                        rel_path = file_path.relative_to(old_folder).as_posix().lower()
+                        size = file_path.stat().st_size
+                        target_path = latest_dir / file_path.relative_to(old_folder)
+
+                        if rel_path in latest_files:
+                            if latest_files[rel_path] == size:
+                                # Compare MD5 to confirm duplicate
+                                hash_old = _calculate_file_md5(file_path)
+                                hash_new = _calculate_file_md5(target_path)
+                                if hash_old == hash_new and hash_old != "":
+                                    # It's an exact duplicate. Delete.
+                                    file_path.unlink()
+                                    deleted_duplicates += 1
+                                    continue
+                                
+                            # If sizes/hashes differ, keep the newer modified one
+                            try:
+                                target_mtime = target_path.stat().st_mtime
+                                source_mtime = file_path.stat().st_mtime
+                                if source_mtime > target_mtime:
+                                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.move(str(file_path), str(target_path))
+                                    latest_files[rel_path] = size
+                                    merged_count += 1
+                                else:
+                                    file_path.unlink()
+                                    deleted_duplicates += 1
+                            except OSError:
+                                pass
+                        else:
+                            # Move new file
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(file_path), str(target_path))
+                            latest_files[rel_path] = size
+                            merged_count += 1
+                    except OSError:
+                        continue
+
+            # Delete the empty legacy folder structure
+            try:
+                shutil.rmtree(old_folder)
+            except OSError:
+                pass
+
+        if progress_callback:
+            progress_callback(-2, f"Merge complete. Merged: {merged_count}, Deduplicated: {deleted_duplicates}")
 
 
     # ── PowerShell helpers ────────────────────────────────────────────────
