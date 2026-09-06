@@ -184,7 +184,9 @@ class BackupManager:
         should_stop=None,
         device_id=None,
         device_name=None,
+        verify_copies=True,
     ):
+        self._verify_copies = verify_copies
         drives = [drive if drive.endswith("\\") else f"{drive}\\" for drive in drives]
         resolved_destination = self.resolve_destination(destination_root)
         filtered_drives = self._filter_source_drives(drives, resolved_destination)
@@ -646,6 +648,7 @@ class BackupManager:
             return
 
         try:
+            os.makedirs(destination_file.parent, exist_ok=True)
             if destination_file.exists():
                 src_stat = source_file.stat()
                 dst_stat = destination_file.stat()
@@ -659,11 +662,14 @@ class BackupManager:
             manifest["errors"].append({"path": str(source_file), "error": str(exc)})
             return
 
-        # Hash-verified copy (verify #1 + atomic promote); no read-back since a
-        # backup keeps the original.
         try:
-            verified_copy(str(source_file), str(destination_file),
-                          fsync=False, readback=False)
+            if getattr(self, "_verify_copies", True):
+                # Hash-verified copy (verify #1 + atomic promote); no read-back
+                # since a backup keeps the original.
+                verified_copy(str(source_file), str(destination_file),
+                              fsync=False, readback=False)
+            else:
+                shutil.copy2(str(source_file), str(destination_file))
         except (VerifiedCopyError, OSError) as exc:
             manifest["errors"].append({"path": str(source_file), "error": str(exc)})
             return

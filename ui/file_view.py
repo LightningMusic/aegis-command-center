@@ -95,13 +95,15 @@ class BackupWorker(QObject):
     finished = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, backup_manager, mode, drives, destination, set_default):
+    def __init__(self, backup_manager, mode, drives, destination, set_default,
+                 verify_copies=True):
         super().__init__()
         self.backup_manager = backup_manager
         self.mode = mode
         self.drives = drives
         self.destination = destination
         self.set_default = set_default
+        self.verify_copies = verify_copies
         self._stop_requested = False
 
     def run(self):
@@ -112,6 +114,7 @@ class BackupWorker(QObject):
                 self.destination,
                 progress_callback=self._report_progress,
                 should_stop=self.should_stop,
+                verify_copies=self.verify_copies,
             )
             if self.set_default and self.destination:
                 self.backup_manager.set_default_destination(self.destination)
@@ -484,6 +487,17 @@ class FilesView(QWidget):
 
         self.set_default_destination_box = QCheckBox("Save selected destination as default")
         backup_form.addRow(self.set_default_destination_box)
+
+        self.backup_verify_box = QCheckBox(
+            "Verify each copied file (hash-check against the source)"
+        )
+        self.backup_verify_box.setChecked(True)
+        self.backup_verify_box.setToolTip(
+            "On: every file is read back and compared to the source after copying "
+            "(catches silent copy corruption, slower). Off: only size + modified "
+            "time are checked (much faster)."
+        )
+        backup_form.addRow(self.backup_verify_box)
 
         backup_layout.addLayout(backup_form)
 
@@ -908,6 +922,7 @@ class FilesView(QWidget):
             selected_drives,
             destination,
             self.set_default_destination_box.isChecked(),
+            verify_copies=self.backup_verify_box.isChecked(),
         )
         self.backup_worker.moveToThread(self.backup_thread)
 
