@@ -1,11 +1,8 @@
 import os
 import re
-import uuid
-from datetime import datetime
 
 from core.backup_manager import BackupManager
 from core.database import Database
-from core.drive_indexer import DriveIndexer
 from core.storage_analyzer import StorageAnalyzer
 from core.windows_drives import list_connected_drives
 from modules.duplicate_detector import DuplicateDetector
@@ -44,61 +41,9 @@ def is_unmergeable_program_file(path: str) -> bool:
 class FileManager:
     def __init__(self, config_manager=None):
         self.db = Database()
-        self.indexer = DriveIndexer()
-        self.file_index = []
-        self.organizer = None
         self.storage_analyzer = StorageAnalyzer()
         self.duplicate_detector = DuplicateDetector()
         self.backup_manager = BackupManager(config_manager) if config_manager else None
-
-    def _save_file_record(self, file_data):
-        self.db.execute(
-            """
-            INSERT INTO files (
-                id,
-                absolute_path,
-                name,
-                extension,
-                size_bytes,
-                modified_at,
-                parent_directory,
-                is_directory,
-                depth,
-                drive,
-                last_accessed
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(absolute_path) DO UPDATE SET
-                name = excluded.name,
-                extension = excluded.extension,
-                size_bytes = excluded.size_bytes,
-                modified_at = excluded.modified_at,
-                parent_directory = excluded.parent_directory,
-                is_directory = excluded.is_directory,
-                depth = excluded.depth,
-                drive = excluded.drive,
-                last_accessed = excluded.last_accessed,
-                hash = CASE
-                    WHEN files.size_bytes = excluded.size_bytes
-                    AND files.modified_at = excluded.modified_at
-                    THEN files.hash
-                    ELSE NULL
-                END
-            """,
-            (
-                file_data["id"],
-                file_data["absolute_path"],
-                file_data["name"],
-                file_data["extension"],
-                file_data["size_bytes"],
-                file_data["modified_at"],
-                file_data["parent_directory"],
-                0,
-                file_data["depth"],
-                file_data["drive"],
-                file_data["last_accessed"],
-            ),
-        )
 
     def _save_file_records_batch(self, files_data):
         query = """
@@ -276,38 +221,6 @@ class FileManager:
     def get_drive_inventory(self):
         return list_connected_drives()
 
-    def full_scan(self, root_path):
-        files_indexed = []
-
-        for entry in os.scandir(root_path):
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    files_indexed.extend(self.full_scan(entry.path))
-                    continue
-
-                stat = entry.stat()
-                file_data = {
-                    "id": str(uuid.uuid4()),
-                    "absolute_path": entry.path,
-                    "name": entry.name,
-                    "extension": os.path.splitext(entry.name)[1].lower(),
-                    "size_bytes": stat.st_size,
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    "last_accessed": datetime.fromtimestamp(stat.st_atime).isoformat(),
-                    "parent_directory": os.path.dirname(entry.path),
-                    "depth": entry.path.count(os.sep),
-                    "drive": entry.path[:3],
-                }
-
-                self._save_file_record(file_data)
-                files_indexed.append(file_data)
-            except PermissionError:
-                continue
-            except Exception as exc:
-                print("Scan error:", exc)
-
-        return files_indexed
-
     def get_largest_files(self, limit=10):
         return self.db.fetchall(
             """
@@ -319,11 +232,6 @@ class FileManager:
             """,
             (limit,),
         )
-
-    def get_duplicates(self):
-        if not self.organizer:
-            return []
-        return self.organizer.find_duplicates()
 
     def get_extension_breakdown(self):
         return self.db.fetchall(
@@ -535,35 +443,3 @@ class FileManager:
             """
         )
 
-    def backup_phone(
-        self,
-        phone_mount_point: str,
-        device_name: str,
-        destination_root: str,
-        progress_callback=None,
-        should_stop=None,
-    ):
-        """
-        Backup a USB-connected phone with intelligent file organization.
-        
-        Args:
-            phone_mount_point: Mount point of the phone (e.g., "E:\\")
-            device_name: Human-readable device name (e.g., "iPhone_Elijah")
-            destination_root: Root backup destination
-            progress_callback: Optional callback(progress, message)
-            should_stop: Optional callable to check if should stop
-            
-        Returns:
-            Backup results dictionary
-        """
-        from core.phone_backup import PhoneBackup
-        
-        phone_backup = PhoneBackup()
-        return phone_backup.backup_phone(
-            phone_mount_point,
-            device_name,
-            destination_root,
-            organize=True,
-            progress_callback=progress_callback,
-            should_stop=should_stop,
-        )
