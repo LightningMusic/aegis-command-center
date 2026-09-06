@@ -5,6 +5,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from core.copy_engine import VerifiedCopyError, verified_copy
 from core.util import drive_map, human_bytes
 
 
@@ -412,10 +413,11 @@ class BackupManager:
                         ):
                             skipped_files += 1
                             continue
-                    shutil.copy2(source_file, target_file)
+                    verified_copy(str(source_file), str(target_file),
+                                  fsync=False, readback=False)
                     merged_files += 1
                     copied_bytes += source_file.stat().st_size
-                except OSError:
+                except (OSError, VerifiedCopyError):
                     skipped_files += 1
 
         log_root = Path(resolved_destination) / log_root_name
@@ -495,10 +497,11 @@ class BackupManager:
                         ):
                             skipped_files += 1
                             continue
-                    shutil.copy2(source_file, target_file)
+                    verified_copy(str(source_file), str(target_file),
+                                  fsync=False, readback=False)
                     merged_files += 1
                     copied_bytes += source_file.stat().st_size
-                except OSError:
+                except (OSError, VerifiedCopyError):
                     skipped_files += 1
 
         log_root = target / "_aegis_merge_logs"
@@ -643,7 +646,6 @@ class BackupManager:
             return
 
         try:
-            os.makedirs(destination_file.parent, exist_ok=True)
             if destination_file.exists():
                 src_stat = source_file.stat()
                 dst_stat = destination_file.stat()
@@ -653,12 +655,24 @@ class BackupManager:
                 ):
                     manifest["skipped_files"] += 1
                     return
-
-            shutil.copy2(source_file, destination_file)
-            manifest["copied_files"] += 1
-            manifest["copied_bytes"] += source_file.stat().st_size
         except OSError as exc:
             manifest["errors"].append({"path": str(source_file), "error": str(exc)})
+            return
+
+        # Hash-verified copy (verify #1 + atomic promote); no read-back since a
+        # backup keeps the original.
+        try:
+            verified_copy(str(source_file), str(destination_file),
+                          fsync=False, readback=False)
+        except (VerifiedCopyError, OSError) as exc:
+            manifest["errors"].append({"path": str(source_file), "error": str(exc)})
+            return
+
+        manifest["copied_files"] += 1
+        try:
+            manifest["copied_bytes"] += source_file.stat().st_size
+        except OSError:
+            pass
 
     def _estimate_path_size(self, path):
         target = Path(path)

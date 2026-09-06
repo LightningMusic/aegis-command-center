@@ -63,6 +63,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from core.copy_engine import VerifiedCopyError, verified_copy
+
 ProgressCallback = Callable[[int, str], None]
 StopCallback = Callable[[], bool]
 
@@ -1305,13 +1307,14 @@ class PhoneBackupManager:
             # Up to 3 tries per file — transient USB hiccups are common.
             for attempt in range(1, 4):
                 try:
-                    shutil.copy2(str(src_file), str(dst_file))
+                    verified_copy(str(src_file), str(dst_file),
+                                  fsync=True, readback=False)
                     result["copied"] += 1
                     consecutive_errors = 0
                     break
                 except PermissionError:
                     break  # locked file — skip silently
-                except OSError as exc:
+                except (OSError, VerifiedCopyError) as exc:
                     if attempt == 3:
                         result["errors"].append(f"{rel_key}: {exc}")
                         result["failed_keys"].append(rel_key)

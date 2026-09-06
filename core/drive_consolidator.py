@@ -56,6 +56,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from core.copy_engine import VerifiedCopyError, safe_unlink, verified_copy
 from core.integrity import verify_deep, verify_playthrough, verify_readable
 from core.util import human_bytes
 
@@ -801,57 +802,28 @@ class ConsolidationPlanner:
             _log(jf, e, "source-recheck-failed", s_detail or "no hash")
             return False
 
-        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-        tmp = dest + ".aegis-part"
-        _safe_unlink(tmp)
-
-        # 2. copy + fsync
+        # 2-5. fsync copy -> verify #1 (hash temp) -> atomic promote ->
+        # verify #2 (independent read-back). Shared core in core.copy_engine.
         try:
-            _copy_with_fsync(e.source_path, tmp)
-            try:
-                shutil.copystat(e.source_path, tmp)
-            except OSError:
-                pass
-        except OSError as exc:
-            _safe_unlink(tmp)
-            result["errors"].append(f"{e.rel_path}: copy failed ({exc}); source kept")
-            _log(jf, e, "copy-failed", str(exc))
-            return False
-
-        # 3. verify #1 — the just-written temp file
-        c_status, c_detail, copy_sha = verify_readable(tmp)
-        if c_status != "ok" or copy_sha != src_sha or _size(tmp) != src_size:
-            _safe_unlink(tmp)
-            result["errors"].append(
-                f"{e.rel_path}: copy verify #1 failed "
-                f"({c_detail or 'hash/size mismatch'}); source kept"
+            final_sha, _ = verified_copy(
+                e.source_path, dest, source_sha=src_sha, readback=True
             )
-            _log(jf, e, "verify1-failed", c_detail or "hash/size mismatch")
+        except VerifiedCopyError as exc:
+            safe_unlink(dest + ".aegis-part")
+            msg = str(exc)
+            if "verify #2" in msg:
+                event, tail = "verify2-failed", "; source kept, target copy left for inspection"
+            elif "verify #1" in msg:
+                event, tail = "verify1-failed", "; source kept"
+            elif "finalize" in msg:
+                event, tail = "finalize-failed", "; source kept"
+            else:
+                event, tail = "copy-failed", "; source kept"
+            result["errors"].append(f"{e.rel_path}: copy {msg}{tail}")
+            _log(jf, e, event, msg)
             return False
 
-        # 4. promote temp -> dest (atomic on one volume)
-        try:
-            os.replace(tmp, dest)
-        except OSError as exc:
-            _safe_unlink(tmp)
-            result["errors"].append(
-                f"{e.rel_path}: could not finalize copy ({exc}); source kept"
-            )
-            _log(jf, e, "finalize-failed", str(exc))
-            return False
-
-        # 5. verify #2 — independent re-read of the final file
-        f_status, f_detail, final_sha = verify_readable(dest)
-        if f_status != "ok" or final_sha != src_sha or _size(dest) != src_size:
-            result["errors"].append(
-                f"{e.rel_path}: copy verify #2 (read-back) failed "
-                f"({f_detail or 'hash/size mismatch'}); source kept, "
-                f"target copy left at {dest} for inspection"
-            )
-            _log(jf, e, "verify2-failed", f_detail or "hash/size mismatch")
-            return False
-
-        _log(jf, e, tag + "-verified", dest, sha=src_sha, size=src_size)
+        _log(jf, e, tag + "-verified", dest, sha=final_sha, size=src_size)
 
         # remember the new target file so a later Analyze doesn't re-hash it
         try:
@@ -980,20 +952,6 @@ def _dedupe_name(path: str, tag: str) -> str:
         i += 1
 
 
-def _safe_unlink(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def _size(path: str) -> int:
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return -1
-
-
 def _free(path: str) -> int:
     try:
         return shutil.disk_usage(path).free
@@ -1006,24 +964,6 @@ def _hash_job(job: tuple) -> tuple:
     path, size, mtime = job
     status, detail, sha = verify_readable(path)
     return path, size, mtime, status, detail, sha
-
-
-def _copy_with_fsync(src: str, dst: str, chunk: int = 4 * 1024 * 1024) -> None:
-    """
-    Byte copy that flushes to the storage device before returning, so the
-    read-back verification isn't just re-reading our own write cache.
-    """
-    with open(src, "rb", buffering=0) as fsrc, open(dst, "wb", buffering=0) as fdst:
-        while True:
-            block = fsrc.read(chunk)
-            if not block:
-                break
-            fdst.write(block)
-        fdst.flush()
-        try:
-            os.fsync(fdst.fileno())
-        except OSError:
-            pass
 
 
 def _recycle(path: str) -> bool:
