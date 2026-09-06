@@ -7,10 +7,11 @@ class Sidebar(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName("Sidebar")  # scopes the nav-rail styling in theme.qss
 
         # Adaptive: take just the width the longest button needs, never grab
         # extra horizontal space from the page area.
-        self.setMinimumWidth(110)
+        self.setMinimumWidth(120)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
 
         self.main_layout = QVBoxLayout()

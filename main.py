@@ -31,6 +31,27 @@ def _load_stylesheet(app) -> None:
         app.setStyleSheet(THEME_PATH.read_text(encoding="utf-8"))
 
 
+def _app_icon():
+    """A simple painted 'A' shield — no icon file needed."""
+    from PyQt6.QtCore import QRectF, Qt
+    from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+
+    pm = QPixmap(256, 256)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#1f2a35"))
+    p.drawRoundedRect(QRectF(14, 14, 228, 228), 52, 52)
+    p.setBrush(QColor("#4f8edc"))
+    p.drawRoundedRect(QRectF(42, 42, 172, 172), 38, 38)
+    p.setPen(QColor("#ffffff"))
+    p.setFont(QFont("Segoe UI", 118, QFont.Weight.Bold))
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "A")
+    p.end()
+    return QIcon(pm)
+
+
 def main() -> None:
     try:
         from PyQt6.QtCore import Qt
@@ -55,7 +76,17 @@ def main() -> None:
     except Exception:
         pass
 
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Aegis.App")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setApplicationName("Aegis")
+    app.setWindowIcon(_app_icon())
     _load_stylesheet(app)
 
     splash_pix = QPixmap(500, 300)
