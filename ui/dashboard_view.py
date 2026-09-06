@@ -63,15 +63,13 @@ class DashboardView(QWidget):
 
         self.brightspace_status_label = QLabel()
         self.brightspace_site_label = QLabel()
-        self.brightspace_org_label = QLabel()
-        self.brightspace_user_label = QLabel()
+        self.brightspace_items_label = QLabel()
         self.brightspace_sync_label = QLabel()
 
         for label in (
             self.brightspace_status_label,
             self.brightspace_site_label,
-            self.brightspace_org_label,
-            self.brightspace_user_label,
+            self.brightspace_items_label,
             self.brightspace_sync_label,
         ):
             label.setWordWrap(True)
@@ -107,22 +105,23 @@ class DashboardView(QWidget):
 
         brightspace = self.brightspace_client.get_dashboard_snapshot()
         if not brightspace["enabled"]:
-            self.brightspace_status_label.setText("Status: Brightspace integration is disabled.")
+            self.brightspace_status_label.setText("Status: Brightspace sync is disabled.")
         elif not brightspace["configured"]:
-            self.brightspace_status_label.setText("Status: Brightspace is enabled but not configured yet.")
+            self.brightspace_status_label.setText(
+                "Status: enabled, but not connected yet (OAuth or feed URL)."
+            )
         else:
             self.brightspace_status_label.setText(
                 f"Status: {brightspace['last_sync_status']}"
             )
 
+        mode_names = {"oauth": "OAuth 2.0", "feed": "Calendar feed", "none": "Not connected"}
+        where = brightspace.get("lms_url") or brightspace.get("feed_host") or "Not set"
         self.brightspace_site_label.setText(
-            f"Site: {brightspace['base_url'] or 'Not set'}"
+            f"Connection: {mode_names.get(brightspace.get('mode'), 'Unknown')} · {where}"
         )
-        self.brightspace_org_label.setText(
-            f"Org Unit ID: {brightspace['org_unit_id'] or 'Not set'}"
-        )
-        self.brightspace_user_label.setText(
-            f"User: {brightspace['username'] or 'Not set'}"
+        self.brightspace_items_label.setText(
+            f"Due items last sync: {brightspace['last_item_count']}"
         )
         self.brightspace_sync_label.setText(
             f"Last Checked: {brightspace['last_sync_at'] or 'Never'}"

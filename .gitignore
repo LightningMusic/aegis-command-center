@@ -4,6 +4,14 @@
 *.sqlite3
 config.json
 
+# Encrypted secrets (DPAPI, machine/user-bound)
+brightspace_secrets.xml
+*secrets*.xml
+*.xml.tmp
+
+# Embedded browser (QtWebEngine) profile / cache for Brightspace sign-in
+.webcache/
+
 # Virtual environments
 .venv/
 venv/
@@ -17,3 +25,13 @@ __pycache__/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Consolidation run artifacts
+__Aegis_Consolidation__/
+__Aegis_Quarantine__/
+
+# SQLite side files
+aegis.db-shm
+aegis.db-wal
+*.db-shm
+*.db-wal

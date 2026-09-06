@@ -14,7 +14,9 @@ from PyQt6.QtWidgets import (
     QDialog,
     QTabWidget,
 )
+import shutil
 from pathlib import Path
+from typing import Optional
 from core.phone_backup_manager import PhoneBackupManager
 from ui.phone_backup_view import PhoneBackupView
 from core.config import ConfigManager
@@ -30,9 +32,23 @@ class PhoneDetectionWorker(QObject):
     def run(self):
         try:
             detected = self.device_manager._detect_connected_phones()
-            self.finished.emit(detected)
         except Exception:
             self.finished.emit([])
+            return
+
+        # Resolve free space here (a stale mount can block for seconds) so the
+        # GUI thread never calls shutil.disk_usage itself.
+        for phone in detected:
+            mount = phone.get("path") or phone.get("drive_letter") or ""
+            if mount and not mount.startswith("::"):
+                try:
+                    phone["available_space"] = shutil.disk_usage(mount).free
+                except Exception:
+                    phone["available_space"] = None
+            else:
+                phone["available_space"] = None
+
+        self.finished.emit(detected)
 
 
 class DeviceDetectionWorker(QObject):
@@ -50,6 +66,44 @@ class DeviceDetectionWorker(QObject):
             self.finished.emit([])
 
 
+class DeviceListWorker(QObject):
+    """Gathers the registered-device table data and phone backup history off
+    the GUI thread — both hit the 1.6 GB SQLite file and parse per-device
+    manifest JSON, which froze the view on every switch to the Devices page."""
+
+    finished = pyqtSignal(dict)
+
+    def __init__(self, device_manager, phone_backup_manager):
+        super().__init__()
+        self.device_manager = device_manager
+        self.phone_backup_manager = phone_backup_manager
+
+    def run(self):
+        payload = {"devices": [], "history": []}
+
+        try:
+            devices = self.device_manager.get_all_devices(active_only=True)
+            rows = []
+            for device in devices:
+                history = self.device_manager.get_backup_history(
+                    device.get("device_id"), limit=1
+                )
+                rows.append({
+                    "device": device,
+                    "last_run": history[0] if history else None,
+                })
+            payload["devices"] = rows
+        except Exception:
+            pass
+
+        try:
+            payload["history"] = self.phone_backup_manager.list_all_backed_up_devices()
+        except Exception:
+            pass
+
+        self.finished.emit(payload)
+
+
 class DevicesView(QWidget):
     """UI for managing backup devices and phone backups."""
 
@@ -65,6 +119,9 @@ class DevicesView(QWidget):
         self.dev_detection_worker = None
         self.phone_detection_thread = None
         self.phone_detection_worker = None
+        self.device_list_thread = None
+        self.device_list_worker = None
+        self._pending_detect_phones = False
 
         # Initialize ConfigManager and PhoneBackupManager
         self.config_manager = ConfigManager()
@@ -191,39 +248,63 @@ class DevicesView(QWidget):
         self.dev_detection_worker = None
 
     def refresh_device_list(self, detect_phones=True):
-        """Refresh the list of registered devices and phone backup settings."""
-        # Refresh backup root from config
-        self.config_manager = ConfigManager() # Reload settings
+        """Refresh the list of registered devices and phone backup settings.
+
+        The slow parts (DB reads against a large file, manifest JSON parsing)
+        run on a worker thread; the table is filled in from the result.
+        """
+        # Refresh backup root from config (cheap — a small JSON read).
+        self.config_manager = ConfigManager()
         backup_settings = self.config_manager.get_backup_settings()
         dest = backup_settings.get("default_destination") or "C:\\Aegis_Backups"
-        
+
         self.phone_backup_manager.backup_root = Path(dest)
         try:
             self.phone_backup_manager._phones_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-            
-        self.phone_backup_view._refresh_history()
 
-        devices = self.device_manager.get_all_devices(active_only=True)
-        # Devices are sorted by name from DB query ("ORDER BY device_name ASC")
+        # Remember the caller's intent; the actual scan is kicked off once the
+        # list data comes back so the two threads don't pile up.
+        self._pending_detect_phones = bool(detect_phones)
 
-        self.devices_table.setRowCount(len(devices))
+        if self._thread_is_running(self.device_list_thread):
+            return
 
-        for row, device in enumerate(devices):
+        self.device_list_thread = QThread()
+        self.device_list_worker = DeviceListWorker(
+            self.device_manager, self.phone_backup_manager
+        )
+        self.device_list_worker.moveToThread(self.device_list_thread)
+
+        self.device_list_thread.started.connect(self.device_list_worker.run)
+        self.device_list_worker.finished.connect(self._on_device_list_ready)
+        self.device_list_worker.finished.connect(self.device_list_thread.quit)
+        self.device_list_worker.finished.connect(self.device_list_worker.deleteLater)
+        self.device_list_thread.finished.connect(self._cleanup_device_list_thread)
+        self.device_list_thread.finished.connect(self.device_list_thread.deleteLater)
+
+        self.device_list_thread.start()
+
+    def _cleanup_device_list_thread(self):
+        self.device_list_thread = None
+        self.device_list_worker = None
+
+    def _on_device_list_ready(self, payload):
+        self.phone_backup_view.populate_history(payload.get("history") or [])
+
+        rows = payload.get("devices") or []
+        self.devices_table.setRowCount(len(rows))
+
+        for row, entry in enumerate(rows):
+            device = entry["device"]
+            last_run = entry.get("last_run") or {}
+
             device_name = device.get("device_name", "Unknown")
             device_type = device.get("device_type", "unknown")
             last_backup = device.get("last_backup", "Never")
-
-            backup_history = self.device_manager.get_backup_history(
-                device.get("device_id"), limit=1
-            )
-            file_count = 0
-            total_size = 0
-
-            if backup_history:
-                file_count = backup_history[0].get("file_count", 0)
-                total_size = backup_history[0].get("size_bytes", 0)
+            file_count = last_run.get("file_count", 0)
+            total_size = last_run.get("size_bytes", 0)
 
             self.devices_table.setItem(row, 0, QTableWidgetItem(device_name))
             self.devices_table.setItem(row, 1, QTableWidgetItem(device_type))
@@ -251,7 +332,8 @@ class DevicesView(QWidget):
             actions_widget.setLayout(actions_layout)
             self.devices_table.setCellWidget(row, 5, actions_widget)
 
-        if detect_phones:
+        if self._pending_detect_phones:
+            self._pending_detect_phones = False
             self.detect_connected_phones()
 
     def detect_connected_phones(self):
@@ -294,16 +376,12 @@ class DevicesView(QWidget):
             self.phones_table.setItem(row, 1, QTableWidgetItem(mount_point))
             self.phones_table.setItem(row, 2, QTableWidgetItem("Ready"))
 
-            try:
-                import shutil
-                # Skip checking disk usage on MTP path formats (which start with ::)
-                if mount_point.startswith("::"):
-                    available = "N/A"
-                else:
-                    usage = shutil.disk_usage(mount_point)
-                    available = self._format_bytes(usage.free)
-            except Exception:
-                available = "Unknown"
+            # Free space was resolved on the worker thread (see PhoneDetectionWorker).
+            free_bytes = phone.get("available_space")
+            if free_bytes is None:
+                available = "N/A" if str(mount_point).startswith("::") else "Unknown"
+            else:
+                available = self._format_bytes(free_bytes)
 
             self.phones_table.setItem(row, 3, QTableWidgetItem(available))
 
@@ -345,30 +423,21 @@ class DevicesView(QWidget):
         device_type = device.get("device_type")
 
         if device_type == "phone":
-            # Check if this phone is currently connected
-            connected_phones = self.device_manager._detect_connected_phones()
-            matched_phone = None
-            for p in connected_phones:
-                if p.get("label") == device_name:
-                    matched_phone = p
-                    break
-            
-            if matched_phone:
-                self.backup_phone(matched_phone.get("path"), device_name)
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Phone Not Connected",
-                    f"Phone '{device_name}' is not currently connected.\n"
-                    "Please connect your phone via USB and enable File Transfer (MTP) mode."
-                )
+            # Detection happens on a background thread inside backup_phone();
+            # passing no path means "match this registered phone by name".
+            self.tabs.setCurrentIndex(1)
+            self.backup_phone(None, device_name)
             return
 
         self.backup_requested.emit(device_name, device_type)
         QMessageBox.information(self, "Backup", f"Starting backup for {device_name}...")
 
-    def backup_phone(self, phone_path: str, phone_name: str):
-        """Initiate backup for a phone."""
+    def backup_phone(self, phone_path: Optional[str], phone_name: str):
+        """Initiate backup for a phone.
+
+        Phone detection runs off the GUI thread; the actual match-and-start
+        happens in a callback once the connected-device list is ready.
+        """
         # Check if phone is already registered to avoid duplicates
         existing = self.device_manager.get_device_by_name(phone_name)
         if not existing:
@@ -380,34 +449,31 @@ class DevicesView(QWidget):
 
         # Switch to the Phone Backup tab
         self.tabs.setCurrentIndex(1)
-        self.phone_backup_view.detect_phones()
 
-        # Find the device in the phone list and select it
-        matched = False
-        for i in range(self.phone_backup_view.phone_list.count()):
-            item = self.phone_backup_view.phone_list.item(i)
-            
-            # Guard clause: Ensure item is not None before processing
-            if item is None:
-                continue
-                
-            device = item.data(Qt.ItemDataRole.UserRole)
-            if device:
+        def _start_matched_phone():
+            for i in range(self.phone_backup_view.phone_list.count()):
+                item = self.phone_backup_view.phone_list.item(i)
+                if item is None:
+                    continue
+
+                device = item.data(Qt.ItemDataRole.UserRole)
+                if not device:
+                    continue
+
                 dev_path = device.shell_path or device.drive_root
-                if dev_path == phone_path or device.name == phone_name:
+                if (phone_path and dev_path == phone_path) or device.name == phone_name:
                     self.phone_backup_view.phone_list.setCurrentRow(i)
-                    matched = True
-                    break
+                    self.phone_backup_view._start_or_stop()
+                    return
 
-        if matched:
-            # Trigger the start backup operation
-            self.phone_backup_view._start_or_stop()
-        else:
             QMessageBox.warning(
                 self,
-                "Backup Error",
-                f"Could not find connected phone '{phone_name}' at path '{phone_path}'."
+                "Phone Not Connected",
+                f"Phone '{phone_name}' is not currently connected.\n"
+                "Please connect your phone via USB and enable File Transfer (MTP) mode.",
             )
+
+        self.phone_backup_view.detect_phones(on_complete=_start_matched_phone)
     def show_add_device_dialog(self):
         """Show dialog to manually add a device."""
         dialog = QDialog(self)

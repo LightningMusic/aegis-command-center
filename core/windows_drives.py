@@ -2,6 +2,8 @@ import ctypes
 import os
 import shutil
 import string
+import threading
+import time
 from typing import Dict, List
 
 
@@ -42,7 +44,37 @@ def _safe_disk_usage(path: str):
         return None
 
 
-def list_connected_drives() -> List[Dict]:
+_CACHE_TTL_SECONDS = 5.0
+_cache_lock = threading.Lock()
+_cache_value: List[Dict] = []
+_cache_stamp = 0.0
+
+
+def list_connected_drives(use_cache: bool = True) -> List[Dict]:
+    """
+    Enumerate drives. Each call probes every drive letter with syscalls
+    (GetDriveTypeW / disk_usage / os.access) that can each block for seconds on
+    empty card readers, optical drives, or a phone in MTP mode. Callers on the
+    GUI thread hit this repeatedly per page switch, so results are cached for a
+    few seconds. Pass use_cache=False to force a fresh probe.
+    """
+    global _cache_value, _cache_stamp
+
+    if use_cache:
+        with _cache_lock:
+            if _cache_value and (time.monotonic() - _cache_stamp) < _CACHE_TTL_SECONDS:
+                return [dict(item) for item in _cache_value]
+
+    drives = _probe_connected_drives()
+
+    with _cache_lock:
+        _cache_value = [dict(item) for item in drives]
+        _cache_stamp = time.monotonic()
+
+    return drives
+
+
+def _probe_connected_drives() -> List[Dict]:
     drives = []
 
     for letter in string.ascii_uppercase:

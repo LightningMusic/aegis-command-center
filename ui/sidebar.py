@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QSizePolicy
 from PyQt6.QtCore import pyqtSignal
 
 
@@ -8,8 +8,10 @@ class Sidebar(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setMinimumWidth(140)
-        self.setMaximumWidth(220)
+        # Adaptive: take just the width the longest button needs, never grab
+        # extra horizontal space from the page area.
+        self.setMinimumWidth(110)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
 
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(10, 20, 10, 20)
@@ -25,7 +27,8 @@ class Sidebar(QWidget):
             "File Organizer",
             "Devices",
             "Analytics",
-            "Settings"
+            "Settings",
+            "Calendar"
         ]
 
         for index, name in enumerate(pages):

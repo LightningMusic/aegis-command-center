@@ -1,7 +1,6 @@
 import os
 import site
 import sys
-import time
 from pathlib import Path
 
 
@@ -50,6 +49,13 @@ def main() -> None:
 
     from ui.main_window import MainWindow
 
+    # Required for the embedded QtWebEngine Brightspace sign-in; harmless otherwise.
+    try:
+        from PyQt6.QtCore import QCoreApplication
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     _load_stylesheet(app)
 
@@ -74,8 +80,6 @@ def main() -> None:
 
     db = Database()
     task_manager = TaskManager(db)
-
-    time.sleep(0.4)
 
     splash.showMessage(
         "Loading dashboard...",

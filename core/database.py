@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from pathlib import Path
 
 
@@ -7,12 +8,38 @@ DB_PATH = BASE_DIR / "aegis.db"
 
 
 class Database:
+    """
+    SQLite access with one connection *per thread*.
+
+    The app runs background QThreads (scanning, backups, device detection) that
+    hit the database while the GUI thread is also querying it. A single shared
+    sqlite3 connection serializes every call behind one mutex, so a long read or
+    write on a worker freezes the UI thread's next query. Giving each thread its
+    own connection lets WAL readers run concurrently; writers still serialize at
+    the file level, handled by busy_timeout instead of a hard lock.
+    """
+
     def __init__(self):
-        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self._local = threading.local()
+        # Touch the connection once on the creating thread and run the one-time
+        # schema setup there.
         self.create_tables()
         self._ensure_columns()
-        pass
+
+    def _new_connection(self):
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    @property
+    def conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._new_connection()
+            self._local.conn = conn
+        return conn
 
     def create_tables(self):
         self.conn.execute(
@@ -191,10 +218,17 @@ class Database:
             "created_at": "TEXT",
             "completed": "INTEGER DEFAULT 0",
             "completed_at": "TEXT",
+            "external_id": "TEXT",
+            "source": "TEXT",
         }
 
         for column_name, column_type in task_columns.items():
             if column_name not in columns:
                 cur.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {column_type}")
+
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(external_id)"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source)")
 
         self.conn.commit()

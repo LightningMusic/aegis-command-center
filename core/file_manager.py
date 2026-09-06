@@ -151,25 +151,42 @@ class FileManager:
         ]
         self.db.execute_many(query, params)
 
-    def _fetch_drive_records(self, drive):
-        rows = self.db.fetchall(
+    def _fetch_drive_records(self, drive, duplicates_only=False):
+        if duplicates_only:
+            # Only rows that could possibly be part of a duplicate group: either
+            # already hashed, or sharing a size with another file on the drive.
+            # For a drive full of unique-size files this cuts the set the
+            # duplicate detector has to load into memory by orders of magnitude.
+            query = """
+                SELECT
+                    absolute_path, name, extension, size_bytes,
+                    modified_at, last_accessed, parent_directory, drive, hash
+                FROM files
+                WHERE is_directory = 0
+                AND drive = ?
+                AND size_bytes > 0
+                AND (
+                    hash IS NOT NULL
+                    OR size_bytes IN (
+                        SELECT size_bytes FROM files
+                        WHERE is_directory = 0 AND drive = ? AND size_bytes > 0
+                        GROUP BY size_bytes HAVING COUNT(*) > 1
+                    )
+                )
             """
-            SELECT
-                absolute_path,
-                name,
-                extension,
-                size_bytes,
-                modified_at,
-                last_accessed,
-                parent_directory,
-                drive,
-                hash
-            FROM files
-            WHERE is_directory = 0
-            AND drive = ?
-            """,
-            (drive,),
-        )
+            params = (drive, drive)
+        else:
+            query = """
+                SELECT
+                    absolute_path, name, extension, size_bytes,
+                    modified_at, last_accessed, parent_directory, drive, hash
+                FROM files
+                WHERE is_directory = 0
+                AND drive = ?
+            """
+            params = (drive,)
+
+        rows = self.db.fetchall(query, params)
 
         records = []
         for row in rows:
@@ -188,20 +205,45 @@ class FileManager:
             )
         return records
 
-    def remove_missing_files(self):
-        records = self.db.fetchall(
-            """
-            SELECT id, absolute_path FROM files
-            """
-        )
+    def remove_missing_files(self, should_stop=None, progress_callback=None):
+        """Drop rows whose file is gone from disk.
 
+        Batched: one DELETE + commit per 500 stale rows instead of per row, so
+        this can run over a large index without hammering the DB. Safe to call
+        from a worker thread. Returns the number of rows removed.
+        """
+        records = self.db.fetchall("SELECT id, absolute_path FROM files")
+
+        stale_ids = []
         removed = 0
-        for file_id, path in records:
+        for index, (file_id, path) in enumerate(records):
+            if should_stop and should_stop():
+                break
             if not os.path.exists(path):
-                self.db.execute("DELETE FROM files WHERE id = ?", (file_id,))
-                removed += 1
+                stale_ids.append(file_id)
+            if len(stale_ids) >= 500:
+                self._delete_file_ids(stale_ids)
+                removed += len(stale_ids)
+                stale_ids = []
+                if progress_callback:
+                    progress_callback(f"Removed {removed} missing files")
+            elif progress_callback and index % 5000 == 0:
+                progress_callback(f"Checking index ({index}/{len(records)})")
 
-        print(f"Removed {removed} missing files")
+        if stale_ids:
+            self._delete_file_ids(stale_ids)
+            removed += len(stale_ids)
+
+        return removed
+
+    def _delete_file_ids(self, file_ids):
+        if not file_ids:
+            return
+        placeholders = ",".join("?" for _ in file_ids)
+        self.db.execute(
+            f"DELETE FROM files WHERE id IN ({placeholders})",
+            tuple(file_ids),
+        )
 
     def delete_file(self, path):
         """Safely delete a file from disk and database, verifying it is not protected."""
@@ -220,8 +262,16 @@ class FileManager:
         except Exception as exc:
             return False, f"Failed to delete '{path}': {str(exc)}"
 
-    def get_available_drives(self):
-        return [item["root"] for item in self.get_drive_inventory() if item["is_scan_eligible"]]
+    def get_available_drives(self, include_network=False):
+        # Network drives are scan-eligible but recursively walking one over SMB
+        # can take hours and stalls on a disconnected share, so they're left out
+        # of "All Connected Drives" unless explicitly requested.
+        return [
+            item["root"]
+            for item in self.get_drive_inventory()
+            if item["is_scan_eligible"]
+            and (include_network or item.get("type_name") != "Network")
+        ]
 
     def get_drive_inventory(self):
         return list_connected_drives()
@@ -326,8 +376,48 @@ class FileManager:
         }
 
     def get_duplicate_files(self, drive):
-        records = self._fetch_drive_records(drive)
+        records = self._fetch_drive_records(drive, duplicates_only=True)
         return self.duplicate_detector.build_duplicate_groups(records, limit=20)
+
+    def get_drive_dashboard(self, drive):
+        """Everything the File Organizer drive tabs need, computed in one pass.
+
+        Meant to be called from a worker thread: the UI then just formats the
+        returned dict. Duplicates and cleanup suggestions are computed once here
+        instead of three times across the separate render calls.
+        """
+        result = self.db.fetchall(
+            """
+            SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
+            FROM files
+            WHERE is_directory = 0 AND drive = ?
+            """,
+            (drive,),
+        )
+        file_count, total_size = result[0] if result else (0, 0)
+
+        duplicates = self.get_duplicate_files(drive)
+        cleanup = self.get_cleanup_suggestions(drive)
+
+        drive_meta = next(
+            (item for item in self.get_drive_inventory() if item["root"] == drive),
+            None,
+        )
+
+        return {
+            "drive": drive,
+            "drive_meta": drive_meta,
+            "file_count": file_count,
+            "total_size_bytes": total_size,
+            "duplicates": duplicates,
+            "duplicate_reclaimable_bytes": sum(
+                group["reclaimable_bytes"] for group in duplicates
+            ),
+            "folders": self.get_storage_by_folder(drive),
+            "steam": self.get_steam_games_usage(drive),
+            "cleanup": cleanup,
+            "cleanup_candidate_bytes": sum(item["size_bytes"] for item in cleanup),
+        }
 
     def get_storage_by_folder(self, drive, limit=10):
         return self.db.fetchall(

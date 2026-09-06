@@ -27,11 +27,9 @@ Layout
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 import time
-from unittest import result
 from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
     QGroupBox,
@@ -88,6 +86,23 @@ class PhoneBackupWorker(QObject):
         self._stop = True
 
 
+class PhoneDetectWorker(QObject):
+    """Runs phone detection (PowerShell/MTP enumeration) off the GUI thread."""
+
+    finished = pyqtSignal(list)
+
+    def __init__(self, manager: PhoneBackupManager) -> None:
+        super().__init__()
+        self.manager = manager
+
+    def run(self) -> None:
+        try:
+            devices = self.manager.detect_phones()
+        except Exception:
+            devices = []
+        self.finished.emit(devices)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main view
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +124,9 @@ class PhoneBackupView(QWidget):
         self.detected: list[PhoneDevice] = []
         self.backup_thread:  Optional[QThread]  = None
         self.backup_worker:  Optional[PhoneBackupWorker] = None
+        self._detect_thread: Optional[QThread] = None
+        self._detect_worker: Optional[PhoneDetectWorker] = None
+        self._detect_callbacks: list[Callable[[], None]] = []
         self._backup_started_at: Optional[float] = None
         self._last_activity_at: Optional[float] = None
 
@@ -117,7 +135,9 @@ class PhoneBackupView(QWidget):
         self.activity_timer.timeout.connect(self._tick_activity)
 
         self._build_ui()
-        self._refresh_history()
+        # History is populated by the owner (DevicesView) from a worker thread
+        # so manifest parsing never blocks construction / the page switch.
+        self.populate_history([])
 
 
     def _tick_activity(self) -> None:
@@ -301,14 +321,40 @@ class PhoneBackupView(QWidget):
     # Detection
     # ─────────────────────────────────────────────────────────────────────
 
-    def detect_phones(self) -> None:
+    def detect_phones(self, _checked: bool = False,
+                      on_complete: Optional[Callable[[], None]] = None) -> None:
+        """
+        Kick off phone detection on a background thread. MTP enumeration shells
+        out to PowerShell and can take tens of seconds, so it must never run on
+        the GUI thread. ``on_complete`` (if given) fires once the list has been
+        populated, whether or not the current call started a new scan.
+        """
+        if on_complete is not None:
+            self._detect_callbacks.append(on_complete)
+
+        if self._detect_thread is not None:
+            return  # a scan is already running; callback will fire when it ends
+
         self.detect_btn.setEnabled(False)
         self.detect_btn.setText("Detecting…")
         self.phone_list.clear()
         self.no_phone_label.setVisible(False)
 
-        # Detection is fast enough (~1-2 s) to run on main thread.
-        self.detected = self.manager.detect_phones()
+        self._detect_thread = QThread()
+        self._detect_worker = PhoneDetectWorker(self.manager)
+        self._detect_worker.moveToThread(self._detect_thread)
+
+        self._detect_thread.started.connect(self._detect_worker.run)
+        self._detect_worker.finished.connect(self._on_detect_finished)
+        self._detect_worker.finished.connect(self._detect_thread.quit)
+        self._detect_worker.finished.connect(self._detect_worker.deleteLater)
+        self._detect_thread.finished.connect(self._cleanup_detect_thread)
+        self._detect_thread.finished.connect(self._detect_thread.deleteLater)
+
+        self._detect_thread.start()
+
+    def _on_detect_finished(self, devices: list) -> None:
+        self.detected = devices
 
         self.detect_btn.setEnabled(True)
         self.detect_btn.setText("Detect Phones")
@@ -316,17 +362,25 @@ class PhoneBackupView(QWidget):
         if not self.detected:
             self.no_phone_label.setVisible(True)
             self.backup_btn.setEnabled(False)
-            return
+        else:
+            for device in self.detected:
+                mode = "MTP" if device.access_type == "mtp" else "Drive"
+                label = f"{device.display_name}  [{mode}]"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, device)
+                self.phone_list.addItem(item)
+            self.phone_list.setCurrentRow(0)  # backup_btn enabled by _on_phone_selected
 
-        for device in self.detected:
-            mode  = "MTP" if device.access_type == "mtp" else "Drive"
-            label = f"{device.display_name}  [{mode}]"
-            item  = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, device)
-            self.phone_list.addItem(item)
+        callbacks, self._detect_callbacks = self._detect_callbacks, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
 
-        self.phone_list.setCurrentRow(0)
-        # backup_btn enabled by _on_phone_selected
+    def _cleanup_detect_thread(self) -> None:
+        self._detect_thread = None
+        self._detect_worker = None
 
     def _on_phone_selected(self, row: int) -> None:
         self.backup_btn.setEnabled(row >= 0 and self.backup_thread is None)
@@ -498,12 +552,10 @@ class PhoneBackupView(QWidget):
                     if not latest_dir_str:
                         return
 
-                    total_bytes = 0
-                    backup_path = Path(latest_dir_str)
-                    if backup_path.exists():
-                        for p in backup_path.rglob("*"):
-                            if p.is_file():
-                                total_bytes += p.stat().st_size
+                    # The worker already indexed latest/ into the manifest; reuse
+                    # its byte total instead of walking the whole tree again on
+                    # the GUI thread (that walk froze the UI right at "complete").
+                    total_bytes = int(manifest_summary.get("confirmed_bytes") or 0)
                     self.device_manager.update_last_backup(
                         device_id,
                         latest_dir_str,
@@ -568,10 +620,14 @@ class PhoneBackupView(QWidget):
     # ─────────────────────────────────────────────────────────────────────
 
     def _refresh_history(self) -> None:
+        # Synchronous path, kept for the in-view Refresh button and post-backup
+        # refresh. The Devices page feeds populate_history() from a worker so it
+        # never blocks on manifest parsing during a page switch.
+        self.populate_history(self.manager.list_all_backed_up_devices())
+
+    def populate_history(self, devices: list) -> None:
         self.history_list.clear()
         self.detail_box.clear()
-
-        devices = self.manager.list_all_backed_up_devices()
 
         if not devices:
             item = QListWidgetItem("No backups yet.")

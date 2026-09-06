@@ -97,6 +97,14 @@ class ScanWorker(QObject):
         interrupted = False
 
         try:
+            # Phase 0: prune rows whose file no longer exists (batched, here on
+            # the worker so clicking "Start Scan" never blocks the UI).
+            self.status.emit("Removing missing files from the index...")
+            self.file_manager.remove_missing_files(
+                should_stop=lambda: not self._running,
+                progress_callback=self.status.emit,
+            )
+
             # Phase 1: Metadata scanning
             for drive in self.drives:
                 if not drive.endswith("\\"):

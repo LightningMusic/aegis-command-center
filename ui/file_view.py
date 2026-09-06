@@ -23,8 +23,61 @@ from PyQt6.QtWidgets import (
 )
 
 from core.scan_worker import ScanWorker
-from core.phone_backup_manager import PhoneBackupManager
-from ui.phone_backup_view import PhoneBackupView
+from ui.consolidate_view import ConsolidateView
+
+
+class DashboardWorker(QObject):
+    """Computes the per-drive File Organizer stats off the GUI thread.
+
+    Each drive's data pass runs COUNT/SUM/GROUP BY queries against the large
+    files table, a duplicate scan, a cleanup scan, and an os.walk over Steam
+    libraries. Doing that for every drive on the GUI thread during a page
+    switch is what made the window go "Not Responding".
+    """
+
+    finished = pyqtSignal(dict)
+
+    def __init__(self, file_manager, drives):
+        super().__init__()
+        self.file_manager = file_manager
+        self.drives = list(drives)
+
+    def run(self):
+        data = {}
+        for drive in self.drives:
+            try:
+                data[drive] = self.file_manager.get_drive_dashboard(drive)
+            except Exception as exc:
+                print(f"Dashboard computation failed for {drive}: {exc}")
+        self.finished.emit(data)
+
+
+class BackupEstimateWorker(QObject):
+    """Estimates backup size (walks whole source drives) + validates the
+    destination off the GUI thread — 'Verify Destination' used to freeze the
+    window for as long as the walk took."""
+
+    finished = pyqtSignal(dict)
+
+    def __init__(self, backup_manager, mode, drives, destination):
+        super().__init__()
+        self.backup_manager = backup_manager
+        self.mode = mode
+        self.drives = drives
+        self.destination = destination
+
+    def run(self):
+        out = {"ok": False, "message": "", "usage": None,
+               "estimated_bytes": 0, "error": None}
+        try:
+            estimated = self.backup_manager.estimate_backup_size(self.mode, self.drives)
+            ok, message, usage = self.backup_manager.validate_destination(
+                self.destination, estimated
+            )
+            out.update(ok=ok, message=message, usage=usage, estimated_bytes=estimated)
+        except Exception as exc:
+            out["error"] = str(exc)
+        self.finished.emit(out)
 
 
 def _format_gb(size_bytes):
@@ -319,6 +372,11 @@ class FilesView(QWidget):
         self.drive_tabs = {}
         self.drive_checks = {}
         self._drive_panels_loaded = False
+        self._dashboard_thread = None
+        self._dashboard_worker = None
+        self._dashboard_pending = False
+        self._estimate_thread = None
+        self._estimate_worker = None
 
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -349,7 +407,7 @@ class FilesView(QWidget):
         self.content_layout.addWidget(intro)
 
         self.tools_tabs = QTabWidget()
-        self.tools_tabs.setMinimumHeight(220)
+        self.tools_tabs.setMinimumHeight(480)
         self.content_layout.addWidget(self.tools_tabs)
 
         scan_tab = QWidget()
@@ -370,9 +428,12 @@ class FilesView(QWidget):
         merge_tab_layout.setSpacing(12)
         merge_tab.setLayout(merge_tab_layout)
 
+        self.consolidate_view = ConsolidateView(self.file_manager)
+
         self.tools_tabs.addTab(scan_tab, "Scanner")
         self.tools_tabs.addTab(backup_tab, "Backup Manager")
         self.tools_tabs.addTab(merge_tab, "Merge Folders")
+        self.tools_tabs.addTab(self.consolidate_view, "Consolidate Drives")
 
         scan_group = QGroupBox("Scanner")
         scan_layout = QVBoxLayout()
@@ -683,7 +744,6 @@ class FilesView(QWidget):
         self.scan_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Starting scan...")
-        self.file_manager.remove_missing_files()
 
         option = self.drive_selector.currentText()
         drives = ["C:\\"] if option == "System Drive Only" else self.file_manager.get_available_drives()
@@ -723,22 +783,52 @@ class FilesView(QWidget):
         self.scan_button.setEnabled(True)
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat(f"Scan Complete - {total_files} files")
-        self.refresh_drive_panels()
-        self.load_dashboard()
+        self.refresh_drive_panels()  # already calls load_dashboard()
 
     def verify_backup_destination(self):
         if not self.file_manager.backup_manager:
             QMessageBox.warning(self, "Backup", "Backup manager is not available.")
             return
 
+        if self._estimate_thread is not None:
+            return
+
         destination = self._selected_backup_destination()
         selected_drives = self._selected_backup_drives()
         mode = self.backup_mode.currentData()
-        estimated_bytes = self.file_manager.backup_manager.estimate_backup_size(mode, selected_drives)
-        ok, message, usage = self.file_manager.backup_manager.validate_destination(
-            destination,
-            estimated_bytes,
+
+        self.verify_destination_button.setEnabled(False)
+        self.backup_status.setText("Estimating backup size…")
+
+        self._estimate_thread = QThread()
+        self._estimate_worker = BackupEstimateWorker(
+            self.file_manager.backup_manager, mode, selected_drives, destination
         )
+        self._estimate_worker.moveToThread(self._estimate_thread)
+
+        self._estimate_thread.started.connect(self._estimate_worker.run)
+        self._estimate_worker.finished.connect(self._on_estimate_ready)
+        self._estimate_worker.finished.connect(self._estimate_thread.quit)
+        self._estimate_worker.finished.connect(self._estimate_worker.deleteLater)
+        self._estimate_thread.finished.connect(self._cleanup_estimate_thread)
+        self._estimate_thread.finished.connect(self._estimate_thread.deleteLater)
+
+        self._estimate_thread.start()
+
+    def _cleanup_estimate_thread(self):
+        self._estimate_thread = None
+        self._estimate_worker = None
+        self.verify_destination_button.setEnabled(True)
+
+    def _on_estimate_ready(self, out):
+        if out.get("error"):
+            self.backup_status.setText(out["error"])
+            QMessageBox.warning(self, "Backup Destination", out["error"])
+            return
+
+        estimated_bytes = out.get("estimated_bytes", 0)
+        usage = out.get("usage")
+        message = out.get("message", "")
 
         usage_message = ""
         if usage:
@@ -748,7 +838,7 @@ class FilesView(QWidget):
             )
 
         self.backup_status.setText(message + usage_message)
-        if ok:
+        if out.get("ok"):
             QMessageBox.information(self, "Backup Destination", message + usage_message)
         else:
             QMessageBox.warning(self, "Backup Destination", message + usage_message)
@@ -1005,13 +1095,11 @@ class FilesView(QWidget):
     def _selected_backup_drives(self):
         return [drive for drive, box in self.drive_checks.items() if box.isChecked()]
 
-    def _render_overview(self, widget, drive):
+    def _render_overview(self, widget, drive, data):
         widget.clear()
-        overview = self.file_manager.get_drive_overview(drive)
-        drive_meta = next(
-            (item for item in self.file_manager.get_drive_inventory() if item["root"] == drive),
-            None,
-        )
+        drive_meta = data.get("drive_meta")
+        duplicates = data.get("duplicates") or []
+        cleanup = data.get("cleanup") or []
         widget.append(f"Drive: {drive}")
         if drive_meta:
             widget.append(f"Drive Type: {drive_meta['type_name']}")
@@ -1019,49 +1107,48 @@ class FilesView(QWidget):
             widget.append(f"Total Capacity: {_format_gb(drive_meta['total_bytes'])}")
             widget.append(f"Backup Target Ready: {'Yes' if drive_meta['is_writable'] else 'No'}")
             widget.append("")
-        widget.append(f"Files Indexed: {overview['file_count']}")
-        widget.append(f"Indexed Storage: {_format_gb(overview['total_size_bytes'])}")
+        widget.append(f"Files Indexed: {data.get('file_count', 0)}")
+        widget.append(f"Indexed Storage: {_format_gb(data.get('total_size_bytes', 0))}")
         widget.append("")
-        widget.append(f"Duplicate Groups Found: {overview['duplicate_groups']}")
+        widget.append(f"Duplicate Groups Found: {len(duplicates)}")
         widget.append(
-            f"Potential Duplicate Reclaim: {_format_gb(overview['duplicate_reclaimable_bytes'])}"
+            f"Potential Duplicate Reclaim: {_format_gb(data.get('duplicate_reclaimable_bytes', 0))}"
         )
         widget.append("")
-        widget.append(f"Cleanup Candidates: {overview['cleanup_candidates']}")
+        widget.append(f"Cleanup Candidates: {len(cleanup)}")
         widget.append(
-            f"Cleanup Candidates Size: {_format_gb(overview['cleanup_candidate_bytes'])}"
+            f"Cleanup Candidates Size: {_format_gb(data.get('cleanup_candidate_bytes', 0))}"
         )
         widget.append("")
         widget.append(
             "Downloads are included in Loose/User Files and Windows Backup. Self-backup protection blocks a destination drive from backing itself up."
         )
 
-    def _render_folders(self, widget, drive):
+    def _render_folders(self, widget, data):
         widget.clear()
-        folders = self.file_manager.get_storage_by_folder(drive)
-        for folder, size in folders:
+        for folder, size in data.get("folders") or []:
             widget.append(f"{_format_gb(size)} - {folder}")
 
-    def _render_duplicates(self, widget, drive):
-        duplicates = self.file_manager.get_duplicate_files(drive)
+    def _render_duplicates(self, widget, data):
+        duplicates = data.get("duplicates") or []
         if isinstance(widget, DuplicateGroupsWidget):
             widget.set_duplicates(duplicates)
         else:
             widget.clear()
             widget.append("Invalid widget type for Duplicates tab.")
 
-    def _render_steam(self, widget, drive):
+    def _render_steam(self, widget, data):
         widget.clear()
-        games = self.file_manager.get_steam_games_usage(drive)
+        games = data.get("steam") or []
         if games:
             for game, size in games:
                 widget.append(f"{_format_gb(size)} - {game}")
         else:
             widget.append("No Steam libraries detected.")
 
-    def _render_cleanup(self, widget, drive):
+    def _render_cleanup(self, widget, data):
         widget.clear()
-        suggestions = self.file_manager.get_cleanup_suggestions(drive)
+        suggestions = data.get("cleanup") or []
 
         if not suggestions:
             widget.append("No safe cleanup suggestions right now.")
@@ -1082,9 +1169,47 @@ class FilesView(QWidget):
         )
 
     def load_dashboard(self):
+        drives = list(self.drive_tabs.keys())
+        if not drives:
+            return
+
+        # Coalesce overlapping requests (scan-finished fires refresh twice).
+        if self._dashboard_thread is not None:
+            self._dashboard_pending = True
+            return
+
+        for tabs in self.drive_tabs.values():
+            overview = tabs.get("overview")
+            if hasattr(overview, "setPlaceholderText"):
+                overview.setPlaceholderText("Loading drive statistics…")
+
+        self._dashboard_thread = QThread()
+        self._dashboard_worker = DashboardWorker(self.file_manager, drives)
+        self._dashboard_worker.moveToThread(self._dashboard_thread)
+
+        self._dashboard_thread.started.connect(self._dashboard_worker.run)
+        self._dashboard_worker.finished.connect(self._apply_dashboard)
+        self._dashboard_worker.finished.connect(self._dashboard_thread.quit)
+        self._dashboard_worker.finished.connect(self._dashboard_worker.deleteLater)
+        self._dashboard_thread.finished.connect(self._cleanup_dashboard_thread)
+        self._dashboard_thread.finished.connect(self._dashboard_thread.deleteLater)
+
+        self._dashboard_thread.start()
+
+    def _cleanup_dashboard_thread(self):
+        self._dashboard_thread = None
+        self._dashboard_worker = None
+        if self._dashboard_pending:
+            self._dashboard_pending = False
+            self.load_dashboard()
+
+    def _apply_dashboard(self, data_by_drive):
         for drive, tabs in self.drive_tabs.items():
-            self._render_overview(tabs["overview"], drive)
-            self._render_folders(tabs["folders"], drive)
-            self._render_duplicates(tabs["duplicates"], drive)
-            self._render_steam(tabs["steam"], drive)
-            self._render_cleanup(tabs["cleanup"], drive)
+            data = data_by_drive.get(drive)
+            if not data:
+                continue
+            self._render_overview(tabs["overview"], drive, data)
+            self._render_folders(tabs["folders"], data)
+            self._render_duplicates(tabs["duplicates"], data)
+            self._render_steam(tabs["steam"], data)
+            self._render_cleanup(tabs["cleanup"], data)

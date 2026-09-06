@@ -67,16 +67,24 @@ from unittest import result
 ProgressCallback = Callable[[int, str], None]
 StopCallback = Callable[[], bool]
 
-# Per-file timeout for the MTP copy script.
-MTP_FILE_TIMEOUT_SECONDS = 60
+# How long to wait for a single file to first appear in the destination after
+# CopyHere is issued. Once it appears and is still growing, the script keeps
+# waiting well past this (see MTP_FILE_MAX_SECONDS) — big videos are fine.
+MTP_FILE_TIMEOUT_SECONDS = 90
 
-# If the whole MTP copy process produces no output at all for this long,
-# assume the phone has stopped responding and give up on this attempt.
-MTP_STALL_TIMEOUT_SECONDS = 120
+# Absolute ceiling for one file, even while it is still growing. Guards against
+# a genuinely wedged transfer without punishing large media files.
+MTP_FILE_MAX_SECONDS = 60 * 60
+
+# The phone can go quiet for a while between bursts (folder enumeration, the
+# provider staging a large file, the screen locking briefly). Warn softly first,
+# only treat it as a real disconnect after the hard timeout.
+MTP_SOFT_STALL_SECONDS = 75
+MTP_STALL_TIMEOUT_SECONDS = 240
 
 # A file that fails this many cumulative times gets marked "skip" in the
 # manifest so future attempts stop wasting time retrying a dead file.
-MAX_FILE_FAIL_ATTEMPTS = 3
+MAX_FILE_FAIL_ATTEMPTS = 5
 
 # Defaults for the unattended retry loop.
 DEFAULT_MAX_RETRY_ATTEMPTS = 200
@@ -147,9 +155,12 @@ _PS_COPY_MTP = r"""
 param(
     [string]$SourcePath,
     [string]$DestPath,
-    [int]$TimeoutSec = 60,
+    [int]$TimeoutSec = 90,
+    [int]$MaxFileSec = 3600,
     [string]$ManifestPath = ""
 )
+
+$ErrorActionPreference = 'Continue'
 
 $shell     = New-Object -ComObject Shell.Application
 $copied    = 0
@@ -207,11 +218,20 @@ function ShouldSkipItem([string]$ParentLabel, [string]$Name) {
 
 function Heartbeat {
     $now = Get-Date
-    if (($now - $script:lastBeat).TotalSeconds -ge 5) {
+    if (($now - $script:lastBeat).TotalSeconds -ge 4) {
         Write-Host "STATS:$($script:copied):$($script:skipped):$($script:errors)"
         [Console]::Out.Flush()
         $script:lastBeat = $now
     }
+}
+
+function Beat([string]$Msg) {
+    # Unconditional keep-alive with a note — used around calls that can block
+    # (folder enumeration, waiting on a large file) so the host never mistakes
+    # a slow-but-alive transfer for a disconnected phone.
+    Write-Host "PING:$Msg"
+    [Console]::Out.Flush()
+    $script:lastBeat = Get-Date
 }
 
 function EnsureFolder([string]$Path) {
@@ -219,6 +239,53 @@ function EnsureFolder([string]$Path) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
     return $shell.Namespace($Path)
+}
+
+function Wait-ForFile([string]$DestFile, [string]$RelKey, [int64]$ExpectedSize) {
+    # Wait for CopyHere to materialise $DestFile. Once it appears, keep waiting
+    # as long as it is still growing — only give up if it is genuinely stuck
+    # (no size change for a while) or the absolute ceiling is hit. Emits a
+    # progress line on every size change so the host's stall timer resets.
+    $started   = Get-Date
+    $appeared  = $false
+    $lastSize  = -1
+    $idleMs    = 0
+
+    while ($true) {
+        $elapsed = ((Get-Date) - $started).TotalSeconds
+        $exists  = Test-Path $DestFile
+
+        if (-not $exists) {
+            if ($elapsed -ge $TimeoutSec) { return $false }
+            Start-Sleep -Milliseconds 250
+            if ((((Get-Date) - $script:lastBeat).TotalSeconds) -ge 3) { Beat "waiting for $RelKey" }
+            continue
+        }
+
+        if (-not $appeared) { $appeared = $true }
+
+        $size = -1
+        try { $size = [int64](Get-Item -LiteralPath $DestFile -ErrorAction Stop).Length } catch { $size = -1 }
+
+        if ($size -gt $lastSize) {
+            $lastSize = $size
+            $idleMs = 0
+            Write-Host "COPY_PROGRESS:$($RelKey):$size"
+            [Console]::Out.Flush()
+            $script:lastBeat = Get-Date
+        } else {
+            $idleMs += 300
+            if ((((Get-Date) - $script:lastBeat).TotalSeconds) -ge 3) { Beat "copying $RelKey ($lastSize bytes)" }
+        }
+
+        # Considered done: size known and reached, or size unknown but stable
+        # for ~4.5s. Large files that are still flowing keep resetting $idleMs.
+        if ($ExpectedSize -gt 0 -and $lastSize -ge $ExpectedSize) { return $true }
+        if ($idleMs -ge 4500) { return $true }
+        if ($elapsed -ge $MaxFileSec) { return $true }
+
+        Start-Sleep -Milliseconds 300
+    }
 }
 
 function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string]$Dst) {
@@ -242,7 +309,17 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             return
         }
 
-        foreach ($item in $Folder.Items()) {
+        Beat "listing $Label"
+        $itemList = $null
+        try { $itemList = @($Folder.Items()) } catch {
+            $script:errors++
+            Write-Host "ERR:$($Label):Unable to list folder: $_"
+            [Console]::Out.Flush()
+            return
+        }
+        Beat "$Label has $($itemList.Count) entries"
+
+        foreach ($item in $itemList) {
             Heartbeat
             $safeName = $item.Name -replace '[\\/:*?"<>|]', '_'
             $relKey = if ($RelLabel) { "$RelLabel\$safeName" } else { $safeName }
@@ -255,6 +332,12 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 }
                 $childFolder = $null
                 try { $childFolder = $item.GetFolder() } catch { $childFolder = $null }
+                if ($null -eq $childFolder) {
+                    $script:errors++
+                    Write-Host "ERR:$($Label)\$($safeName):Could not open subfolder"
+                    [Console]::Out.Flush()
+                    continue
+                }
                 CopyMTPFolderObject $childFolder "$Label\$safeName" $relKey (Join-Path $Dst $safeName)
                 continue
             }
@@ -290,46 +373,67 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 # else: size genuinely differs on both sides — fall through and re-copy.
             }
 
+            $expectedSize = Get-ItemSizeBestEffort $item
+            if ($null -eq $expectedSize) { $expectedSize = 0 }
+
             $destFile = Join-Path $Dst $safeName
             if (Test-Path $destFile) {
-                $script:skipped++
-                Write-Host "FILE_SKIP:$safeName"
-                [Console]::Out.Flush()
-                continue
+                # Already present. Only re-fetch if we can prove it's short.
+                $haveSize = -1
+                try { $haveSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $haveSize = -1 }
+                if ($expectedSize -gt 0 -and $haveSize -ge 0 -and $haveSize -lt $expectedSize) {
+                    try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                } else {
+                    $script:skipped++
+                    Write-Host "FILE_SKIP:$safeName"
+                    [Console]::Out.Flush()
+                    continue
+                }
             }
 
-            try {
-                $dstNs.CopyHere($item, $copyFlags)
-            } catch {
-                $script:errors++
-                Write-Host "FILE_ERR:$($relKey):CopyHere failed: $_"
-                [Console]::Out.Flush()
-                continue
-            }
-
-            $ms    = 0
-            $limit = $TimeoutSec * 10
-            while (-not (Test-Path $destFile) -and $ms -lt $limit) {
-                Start-Sleep -Milliseconds 100
-                $ms++
-                if ($ms % 10 -eq 0) { Heartbeat }
-            }
-
-            if (Test-Path $destFile) {
+            $copyOk = $false
+            for ($try = 1; $try -le 3 -and -not $copyOk; $try++) {
                 try {
-                    $size = (Get-Item $destFile).Length
-                    if ($size -gt 5MB) {
-                        $stableChecks = 0
-                        $checks = 0
-                        while ($stableChecks -lt 2 -and $checks -lt 15) {
-                            Start-Sleep -Milliseconds 300
-                            $newSize = (Get-Item $destFile).Length
-                            if ($newSize -eq $size) { $stableChecks++ } else { $size = $newSize; $stableChecks = 0 }
-                            $checks++
-                        }
-                    }
-                } catch {}
+                    $dstNs.CopyHere($item, $copyFlags)
+                } catch {
+                    Beat "retrying $relKey (CopyHere error)"
+                    Start-Sleep -Milliseconds 800
+                    continue
+                }
 
+                if (Wait-ForFile $destFile $relKey $expectedSize) {
+                    $finalSize = -1
+                    try { $finalSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $finalSize = -1 }
+
+                    if ($finalSize -lt 0) {
+                        Beat "retrying $relKey (vanished)"
+                        Start-Sleep -Milliseconds 800
+                        continue
+                    }
+                    if ($expectedSize -gt 0 -and $finalSize -lt $expectedSize) {
+                        # Truncated transfer — drop it so it isn't recorded as good.
+                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                        Beat "retrying $relKey (short: $finalSize/$expectedSize)"
+                        Start-Sleep -Milliseconds 1000
+                        continue
+                    }
+
+                    $copyOk = $true
+                } else {
+                    # Never appeared within the appear-timeout. Clean any stub.
+                    if (Test-Path $destFile) {
+                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                    }
+                    # A file that produces nothing at all rarely recovers within
+                    # the same run — one extra attempt, then leave it for the
+                    # whole-backup retry so we don't burn minutes per dead file.
+                    if ($try -ge 2) { break }
+                    Beat "retrying $relKey (no data)"
+                    Start-Sleep -Milliseconds 1000
+                }
+            }
+
+            if ($copyOk) {
                 try {
                     $dateStr = $Folder.GetDetailsOf($item, 3)
                     if ($dateStr) {
@@ -344,7 +448,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 Write-Host "FILE_OK:$destFile"
             } else {
                 $script:errors++
-                Write-Host "FILE_TIMEOUT:$relKey"
+                Write-Host "FILE_ERR:$($relKey):transfer failed after 3 attempts"
             }
             [Console]::Out.Flush()
         }
@@ -361,11 +465,13 @@ if ($null -eq $srcNs) {
     Write-Host "CONNECT_FAILED:Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
 } else {
     CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
-}
 
-if ($script:visited -gt 0 -and $script:copied -eq 0 -and $script:skipped -eq 0 -and $script:errors -eq 0) {
-    $script:errors++
-    Write-Host "CONNECT_FAILED:No accessible files were found. Unlock the phone and confirm the USB mode is File Transfer / MTP."
+    if ($script:copied -eq 0 -and $script:skipped -eq 0 -and ($script:visited -le 2 -or $script:errors -gt 0)) {
+        # Opened the source but nothing came back — phone locked/half-mounted or
+        # the top of the tree wouldn't enumerate. Worth an automatic retry
+        # rather than a false "complete".
+        Write-Host "CONNECT_FAILED:Could not read any files from the phone. Unlock it and keep the USB mode on File Transfer / MTP."
+    }
 }
 
 Write-Host "DONE:$($script:copied):$($script:skipped):$($script:errors)"
@@ -508,6 +614,7 @@ class PhoneBackupManager:
         device: PhoneDevice,
         progress_callback: Optional[ProgressCallback] = None,
         should_stop: Optional[StopCallback] = None,
+        reindex_before: bool = True,
     ) -> Dict[str, Any]:
         """
         One incremental backup attempt for *device*.
@@ -528,7 +635,11 @@ class PhoneBackupManager:
         latest_dir.mkdir(parents=True, exist_ok=True)
 
         manifest = self._load_manifest(device_dir, device.display_name)
-        self._index_existing_backup_tree(manifest, latest_dir)
+        # Re-walking latest/ is only needed once per session; skipping it on
+        # rapid retries keeps reconnect turnaround fast on flaky phones. The
+        # post-copy index below still runs every attempt so resume stays correct.
+        if reindex_before:
+            self._index_existing_backup_tree(manifest, latest_dir)
         manifest_lookup = self._build_manifest_lookup(manifest)
 
         result: Dict[str, Any] = {
@@ -643,6 +754,8 @@ class PhoneBackupManager:
         last_result: Dict[str, Any] = {}
         current_device = device
         interruption_count = 0
+        stall_streak = 0          # consecutive retries with no forward progress
+        did_full_index = False
 
         for attempt in range(1, max_attempts + 1):
             if should_stop and should_stop():
@@ -652,12 +765,20 @@ class PhoneBackupManager:
                 current_device,
                 progress_callback=progress_callback,
                 should_stop=should_stop,
+                reindex_before=not did_full_index,
             )
+            did_full_index = True
             last_result["attempt"] = attempt
+
+            copy_result = last_result.get("copy_result") or {}
+            made_progress = int(copy_result.get("copied") or 0) > 0
 
             needs_retry = bool(last_result.get("stalled") or last_result.get("connection_failed"))
             if needs_retry:
                 interruption_count += 1
+                # A phone that keeps handing us files between drops is "working" —
+                # keep retries snappy. Only back off when nothing is getting through.
+                stall_streak = 0 if made_progress else stall_streak + 1
 
             if not needs_retry:
                 break
@@ -675,12 +796,15 @@ class PhoneBackupManager:
                 "lost the USB/MTP connection" if last_result.get("connection_failed")
                 else "stopped responding"
             )
-            wait_seconds = min(15 * attempt, self.MAX_RETRY_BACKOFF_SECONDS)
+            if made_progress:
+                wait_seconds = 3
+            else:
+                wait_seconds = min(10 * stall_streak, self.MAX_RETRY_BACKOFF_SECONDS)
             if progress_callback:
                 progress_callback(
                     -3,
-                    f"Phone {reason} — waiting up to {wait_seconds}s before retry "
-                    f"{attempt + 1} of {max_attempts}…",
+                    f"Phone {reason} after {int(copy_result.get('copied') or 0)} file(s) this "
+                    f"pass — retrying (attempt {attempt + 1})…",
                 )
 
             deadline = time.monotonic() + wait_seconds
@@ -691,7 +815,13 @@ class PhoneBackupManager:
                 refreshed = self._reacquire_device(current_device)
                 if refreshed:
                     break
-                time.sleep(self.DEVICE_POLL_INTERVAL_SECONDS)
+                time.sleep(min(self.DEVICE_POLL_INTERVAL_SECONDS, 2))
+
+            # Always re-detect once more before retrying — Windows often hands the
+            # phone a fresh MTP shell path after even a momentary drop, and the
+            # stale one will just fail again.
+            if not refreshed:
+                refreshed = self._reacquire_device(current_device)
 
             if refreshed:
                 current_device = refreshed
@@ -865,10 +995,12 @@ class PhoneBackupManager:
         try:
             cmd = [
                 "powershell", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass",
                 "-File", ps_path,
                 "-SourcePath", shell_path,
                 "-DestPath",   dest,
                 "-TimeoutSec", str(MTP_FILE_TIMEOUT_SECONDS),
+                "-MaxFileSec", str(MTP_FILE_MAX_SECONDS),
                 "-ManifestPath", manifest_path,
             ]
             proc = subprocess.Popen(
@@ -876,6 +1008,9 @@ class PhoneBackupManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
 
@@ -901,6 +1036,8 @@ class PhoneBackupManager:
             start_time = time.monotonic()
             last_activity = start_time
             stream_closed = False
+            soft_warned = False
+            last_progress_emit = 0.0
 
             while True:
                 if should_stop and should_stop():
@@ -913,13 +1050,31 @@ class PhoneBackupManager:
                 except queue.Empty:
                     if proc.poll() is not None and stream_closed:
                         break
-                    if time.monotonic() - last_activity > MTP_STALL_TIMEOUT_SECONDS:
+
+                    quiet_for = time.monotonic() - last_activity
+
+                    # The process finished but the reader hasn't drained yet —
+                    # keep looping, don't treat as a stall.
+                    if proc.poll() is not None:
+                        continue
+
+                    if quiet_for > MTP_SOFT_STALL_SECONDS and not soft_warned:
+                        soft_warned = True
+                        if progress_callback:
+                            progress_callback(
+                                -2,
+                                f"Phone has been quiet for {int(quiet_for)}s — still "
+                                f"connected, waiting (normal between large files)…",
+                            )
+
+                    if quiet_for > MTP_STALL_TIMEOUT_SECONDS:
                         proc.kill()
                         result["stalled"] = True
                         result["cancelled"] = True
                         result["errors"].append(
-                            f"Phone stopped responding after {result['copied']} file(s) "
-                            f"copied this attempt. Already-copied files have been indexed."
+                            f"Phone went unresponsive for {int(quiet_for)}s after "
+                            f"{result['copied']} file(s) this attempt. Progress is saved; "
+                            f"it will retry automatically."
                         )
                         break
                     continue
@@ -931,8 +1086,26 @@ class PhoneBackupManager:
                     continue
 
                 last_activity = time.monotonic()
+                soft_warned = False
                 line = line.rstrip()
                 if not line:
+                    continue
+
+                if line.startswith("PING:"):
+                    # Keep-alive from inside a blocking call. Nothing to record.
+                    continue
+
+                if line.startswith("COPY_PROGRESS:"):
+                    body = line[14:]
+                    relkey, _, size_str = body.rpartition(":")
+                    now = time.monotonic()
+                    if progress_callback and (now - last_progress_emit) >= 1.0:
+                        last_progress_emit = now
+                        try:
+                            mb = int(size_str) / (1024 * 1024)
+                        except ValueError:
+                            mb = 0.0
+                        progress_callback(-2, f"Copying {Path(relkey).name} — {mb:.1f} MB")
                     continue
 
                 if line.startswith("FILE_OK:"):
@@ -1072,9 +1245,21 @@ class PhoneBackupManager:
 
         total = max(len(all_files), 1)
 
+        consecutive_errors = 0
+
         for idx, src_file in enumerate(all_files):
             if should_stop and should_stop():
                 result["cancelled"] = True
+                break
+
+            # If the phone disconnected mid-run, stop and let the retry loop
+            # re-detect it rather than logging thousands of failures. The
+            # exists() probe is throttled so it doesn't stat the root per file.
+            if consecutive_errors >= 12 or (idx % 50 == 0 and not source_path.exists()):
+                result["connection_failed"] = True
+                result["errors"].append(
+                    "Lost contact with the phone during the copy — progress saved, will retry."
+                )
                 break
 
             rel_key = str(src_file.relative_to(source))
@@ -1097,8 +1282,9 @@ class PhoneBackupManager:
                 except OSError:
                     pass
 
+            dst_file = dest_path / rel_key
+
             try:
-                dst_file = dest_path / rel_key
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
 
                 if dst_file.exists():
@@ -1109,16 +1295,36 @@ class PhoneBackupManager:
                         and int(dst_stat.st_mtime) >= int(src_stat.st_mtime)
                     ):
                         result["skipped"] += 1
+                        consecutive_errors = 0
                         continue
-
-                shutil.copy2(str(src_file), str(dst_file))
-                result["copied"] += 1
-
             except PermissionError:
-                pass   # skip locked files silently
-            except Exception as exc:
-                result["errors"].append(f"{rel_key}: {exc}")
-                result["failed_keys"].append(rel_key)
+                continue
+            except OSError:
+                consecutive_errors += 1
+                continue
+
+            # Up to 3 tries per file — transient USB hiccups are common.
+            for attempt in range(1, 4):
+                try:
+                    shutil.copy2(str(src_file), str(dst_file))
+                    result["copied"] += 1
+                    consecutive_errors = 0
+                    break
+                except PermissionError:
+                    break  # locked file — skip silently
+                except OSError as exc:
+                    if attempt == 3:
+                        result["errors"].append(f"{rel_key}: {exc}")
+                        result["failed_keys"].append(rel_key)
+                        consecutive_errors += 1
+                        # Drop a partial so it retries cleanly next run.
+                        try:
+                            if dst_file.exists():
+                                dst_file.unlink()
+                        except OSError:
+                            pass
+                    else:
+                        time.sleep(0.5)
 
         return result
 

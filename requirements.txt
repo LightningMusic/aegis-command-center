@@ -2,3 +2,17 @@ PyQt6==6.10.2
 PyQt6-Charts==6.10.0
 psutil==7.2.2
 pywin32==312
+# Embedded browser for the Brightspace sign-in. Must match PyQt6-Qt6 6.10.x —
+# a 6.11 WebEngine build fails to load its DLLs against Qt 6.10.
+PyQt6-WebEngine==6.10.0
+
+# ── Optional (integrity checks degrade gracefully without them) ──────────────
+# Pillow        — full pixel decode for PNG/JPEG/GIF/WEBP/TIFF in Consolidate
+# pillow-heif   — adds HEIC/HEIF/AVIF decode + inline preview (iPhone photos).
+#                 Without it, .heic files are reported "unverified", never "corrupt".
+# pypdf         — full page walk for PDFs (else header/trailer sniff only)
+# ffmpeg on PATH — frame-by-frame video/audio verification in bulk Analyze
+# Pillow
+# pillow-heif
+# pypdf
+
