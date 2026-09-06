@@ -205,11 +205,12 @@ class CalendarView(QWidget):
         if self._sync_thread is not None:
             return
         client = self.brightspace_sync.client
-        if not client.is_enabled() or not client.has_feed():
+        if not client.is_enabled() or not client.is_configured():
             QMessageBox.information(
                 self,
                 "Brightspace",
-                "Turn on Brightspace and paste your calendar feed URL in Settings first.",
+                "Turn on Brightspace in Settings and connect it (browser sign-in, "
+                "OAuth, or a calendar feed URL) first.",
             )
             return
 

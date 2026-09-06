@@ -111,46 +111,39 @@ class TasksView(QWidget):
     # ADD TASK
     # -------------------------
 
+    def _pick_date(self, title, initial=None):
+        """Modal date picker. Returns a 'yyyy-MM-dd' string, or None if cancelled."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+
+        picker = QDateEdit()
+        picker.setCalendarPopup(True)
+        picker.setDate(initial or QDate.currentDate())
+        layout.addWidget(picker)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return picker.date().toString("yyyy-MM-dd")
+
     def add_task(self):
         title, ok = QInputDialog.getText(self, "New Task", "Task title:")
         if not ok or not title.strip():
             return
 
-        # Date picker dialog
-        date_dialog = QDateEdit()
-        date_dialog.setCalendarPopup(True)
-        date_dialog.setDate(QDate.currentDate())
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Select Due Date")
-
-        layout = QVBoxLayout(dialog)
-
-        date_dialog = QDateEdit()
-        date_dialog.setCalendarPopup(True)
-        date_dialog.setDate(QDate.currentDate())
-
-        layout.addWidget(date_dialog)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        layout.addWidget(buttons)
-
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        due_date = self._pick_date("Select Due Date")
+        if due_date is None:
             return
 
-        due_date = date_dialog.date().toString("yyyy-MM-dd")
-
         try:
-            self.task_manager.create_task(
-                title=title,
-                due_date=due_date,
-            )
+            self.task_manager.create_task(title=title, due_date=due_date)
             self.load_tasks()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -279,59 +272,12 @@ class TasksView(QWidget):
         if not ok:
             return
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Edit Due Date")
-
-        layout = QVBoxLayout(dialog)
-
-        date_dialog = QDateEdit()
-        date_dialog.setCalendarPopup(True)
-
+        initial = None
         if task.get("due_date"):
-            date_dialog.setDate(QDate.fromString(task["due_date"], "yyyy-MM-dd"))
-        else:
-            date_dialog.setDate(QDate.currentDate())
-
-        layout.addWidget(date_dialog)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        layout.addWidget(buttons)
-
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+            initial = QDate.fromString(task["due_date"], "yyyy-MM-dd")
+        new_due_date = self._pick_date("Edit Due Date", initial)
+        if new_due_date is None:
             return
-
-        new_due_date = date_dialog.date().toString("yyyy-MM-dd")
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Select Due Date")
-
-        layout = QVBoxLayout(dialog)
-
-        date_dialog = QDateEdit()
-        date_dialog.setCalendarPopup(True)
-        date_dialog.setDate(QDate.currentDate())
-
-        layout.addWidget(date_dialog)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        layout.addWidget(buttons)
-
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        new_due_date = date_dialog.date().toString("yyyy-MM-dd")
 
         self.task_manager.update_task(
             task_id,

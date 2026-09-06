@@ -62,7 +62,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from unittest import result
 
 ProgressCallback = Callable[[int, str], None]
 StopCallback = Callable[[], bool]
