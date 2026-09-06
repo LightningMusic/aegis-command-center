@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.scan_worker import ScanWorker
+from core.util import human_bytes
 from ui.consolidate_view import ConsolidateView
 
 
@@ -81,16 +82,11 @@ class BackupEstimateWorker(QObject):
 
 
 def _format_gb(size_bytes):
-    return f"{round(size_bytes / (1024**3), 2)} GB"
+    return f"{round((size_bytes or 0) / (1024**3), 2)} GB"
 
 
 def _format_bytes(size_bytes):
-    units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(size_bytes or 0)
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            return f"{size:.2f} {unit}"
-        size /= 1024
+    return human_bytes(size_bytes, 2)
 
 
 class BackupWorker(QObject):

@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from core.database import Database
-from core.windows_drives import get_drive_map
+from core.util import drive_map as _drive_map
 
 
 class DeviceManager:
@@ -193,7 +193,7 @@ class DeviceManager:
         """
         detected = []
 
-        drive_map = get_drive_map()
+        drive_map = _drive_map()
         for drive_letter, drive_info in drive_map.items():
             if not drive_info["is_backup_destination"]:
                 detected.append(

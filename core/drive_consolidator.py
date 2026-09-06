@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from core.integrity import verify_deep, verify_playthrough, verify_readable
+from core.util import human_bytes
 
 ProgressCB = Callable[[str, int, int, str], None]
 StopCB = Callable[[], bool]
@@ -960,12 +961,7 @@ _ACTION_ORDER = {
 
 
 def _h(n: int) -> str:
-    x = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if x < 1024 or unit == "TB":
-            return f"{x:.1f} {unit}"
-        x /= 1024
-    return f"{x:.1f} B"
+    return human_bytes(n)
 
 
 def _drive_label(path: str) -> str:

@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
 
 from core.phone_backup_manager import PhoneBackupManager, PhoneDevice
 from core.device_manager import DeviceManager
+from core.util import human_bytes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Background worker
@@ -689,11 +690,4 @@ class PhoneBackupView(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fmt_bytes(n: int | float) -> str:
-    size = float(n)
-
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.1f} {unit}"
-        size /= 1024
-
-    return f"{size:.1f} B"
+    return human_bytes(n)

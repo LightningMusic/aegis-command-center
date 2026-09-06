@@ -4,7 +4,7 @@ import re
 from core.backup_manager import BackupManager
 from core.database import Database
 from core.storage_analyzer import StorageAnalyzer
-from core.windows_drives import list_connected_drives
+from core.util import connected_drives
 from modules.duplicate_detector import DuplicateDetector
 
 
@@ -219,7 +219,7 @@ class FileManager:
         ]
 
     def get_drive_inventory(self):
-        return list_connected_drives()
+        return connected_drives()
 
     def get_largest_files(self, limit=10):
         return self.db.fetchall(

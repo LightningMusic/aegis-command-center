@@ -33,17 +33,14 @@ from PyQt6.QtWidgets import (
 )
 
 from core.drive_consolidator import ConsolidationPlanner, DbHashCache, Plan, PlanEntry
-from core.windows_drives import list_connected_drives
 from ui.preview_panel import PreviewPanel
 
 
+from core.util import connected_drives, human_bytes
+
+
 def _h(n: int) -> str:
-    x = float(n or 0)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if x < 1024 or unit == "TB":
-            return f"{x:.1f} {unit}"
-        x /= 1024
-    return f"{x:.1f} B"
+    return human_bytes(n)
 
 
 _ACTION_LABELS = {
@@ -325,7 +322,7 @@ class ConsolidateView(QWidget):
         keep_tgt = self.target_combo.currentText()
         self.source_combo.clear()
         self.target_combo.clear()
-        for d in list_connected_drives():
+        for d in connected_drives(force=True):
             if not d["is_scan_eligible"]:
                 continue
             label = (

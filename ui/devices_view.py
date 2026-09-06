@@ -20,6 +20,7 @@ from typing import Optional
 from core.phone_backup_manager import PhoneBackupManager
 from ui.phone_backup_view import PhoneBackupView
 from core.config import ConfigManager
+from core.util import human_bytes
 
 
 class PhoneDetectionWorker(QObject):
@@ -562,10 +563,4 @@ class DevicesView(QWidget):
         dialog.exec()
 
     def _format_bytes(self, bytes_value):
-        """Format bytes to human-readable size."""
-        units = ["B", "KB", "MB", "GB", "TB"]
-        size = float(bytes_value)
-        for unit in units:
-            if size < 1024 or unit == units[-1]:
-                return f"{size:.2f} {unit}"
-            size /= 1024
+        return human_bytes(bytes_value, 2)

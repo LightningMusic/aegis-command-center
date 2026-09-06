@@ -5,7 +5,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from core.windows_drives import get_drive_map
+from core.util import drive_map, human_bytes
 
 
 EXCLUDED_DIR_NAMES = {
@@ -101,7 +101,7 @@ class BackupManager:
     def get_destination_candidates(self):
         current_default = self.get_default_destination()
         candidates = []
-        for drive in get_drive_map().values():
+        for drive in drive_map().values():
             if not drive["is_backup_destination"]:
                 continue
             candidates.append(
@@ -724,12 +724,7 @@ class BackupManager:
             return False
 
     def _format_bytes(self, value):
-        units = ["B", "KB", "MB", "GB", "TB"]
-        size = float(value)
-        for unit in units:
-            if size < 1024 or unit == units[-1]:
-                return f"{size:.2f} {unit}"
-            size /= 1024
+        return human_bytes(value, 2)
 
     def _resolve_backup_root(self, destination_root, backup_root_name, mode, drives, stamp):
         root = Path(destination_root) / backup_root_name
