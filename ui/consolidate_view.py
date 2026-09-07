@@ -136,15 +136,10 @@ class ConsolidateView(QWidget):
         title.setStyleSheet("font-size: 22px; font-weight: 600;")
         root.addWidget(title)
 
-        blurb = QLabel(
-            "Compare every file on the source against the target, then move what's "
-            "missing, delete verified duplicates and junk, and flag anything corrupt. "
-            "A source file is only deleted after an identical copy is confirmed on the "
-            "target; deletions go to the Recycle Bin."
-        )
-        blurb.setWordWrap(True)
-        blurb.setStyleSheet("color: #888;")
-        root.addWidget(blurb)
+        self.blurb = QLabel()
+        self.blurb.setWordWrap(True)
+        self.blurb.setStyleSheet("color: #888;")
+        root.addWidget(self.blurb)
 
         pick = QGroupBox("Source and target")
         form = QFormLayout(pick)
@@ -166,6 +161,27 @@ class ConsolidateView(QWidget):
         tgt_browse.clicked.connect(lambda: self._browse(self.target_combo))
         tgt_row.addWidget(tgt_browse)
         form.addRow("Target (keep everything)", self._wrap(tgt_row))
+
+        mode_row = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem(
+            "Consolidate — copy missing files to the target, then remove the originals",
+            "consolidate",
+        )
+        self.mode_combo.addItem(
+            "Reclaim — only remove files that are already backed up on the target",
+            "reclaim",
+        )
+        self.mode_combo.setToolTip(
+            "Consolidate moves everything onto the target drive.\n"
+            "Reclaim never copies — it just deletes, from the source, files that "
+            "are already byte-identical on the target (your backup drive). "
+            "Anything not on the target is left alone."
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(QLabel("Mode:"))
+        mode_row.addWidget(self.mode_combo, 1)
+        form.addRow("Mode", self._wrap(mode_row))
 
         opts = QHBoxLayout()
         self.verify_combo = QComboBox()
@@ -291,6 +307,24 @@ class ConsolidateView(QWidget):
         self.target_combo.editTextChanged.connect(self._validate_pair)
         self.source_combo.currentIndexChanged.connect(self._validate_pair)
         self.target_combo.currentIndexChanged.connect(self._validate_pair)
+        self._on_mode_changed()
+
+    def _on_mode_changed(self, *_a):
+        if self.mode_combo.currentData() == "reclaim":
+            self.blurb.setText(
+                "Reclaim: for every file on the source, check whether a "
+                "byte-identical copy already exists on the target (your backup "
+                "drive). If it does, the source copy is removed. Nothing is ever "
+                "copied to the target, and files that aren't backed up are left "
+                "alone. Removals only happen after a fresh full-read hash match."
+            )
+        else:
+            self.blurb.setText(
+                "Consolidate: compare every file on the source against the "
+                "target, copy across what's missing, delete verified duplicates "
+                "and junk, flag anything corrupt. A source file is only removed "
+                "after an identical copy is confirmed on the target."
+            )
 
     @staticmethod
     def _wrap(layout) -> QWidget:
@@ -386,6 +420,7 @@ class ConsolidateView(QWidget):
                 playthrough=level == "playthrough",
                 aggressive_junk=self.aggressive_box.isChecked(),
                 deletion_mode=self.delete_combo.currentData(),
+                copy_missing=self.mode_combo.currentData() == "consolidate",
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Consolidate", str(exc))

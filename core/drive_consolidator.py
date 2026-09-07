@@ -313,10 +313,15 @@ class ConsolidationPlanner:
         use_recycle_bin: bool = True,
         deletion_mode: Optional[str] = None,
         hash_workers: int = 4,
+        copy_missing: bool = True,
     ) -> None:
         self.source_root = str(Path(source_root))
         self.target_root = str(Path(target_root))
         self.hash_cache = hash_cache or DbHashCache(None)
+        # copy_missing=False -> "Reclaim" mode: never copy anything to the
+        # target; only remove source files that are ALREADY verified-present
+        # there. Files missing from the target are left untouched (SKIP).
+        self.copy_missing = copy_missing
         # playthrough implies deep_verify (it's the strongest tier).
         self.deep_verify = deep_verify or playthrough
         self.playthrough = playthrough
@@ -647,10 +652,15 @@ class ConsolidationPlanner:
                 plan.entries.append(entry)
                 continue
 
-            # 6. genuinely new -> move it
-            entry.action = "MOVE"
-            entry.reason = "not present on target"
-            entry.selected = True
+            # 6. not on the target
+            if self.copy_missing:
+                entry.action = "MOVE"
+                entry.reason = "not present on target"
+                entry.selected = True
+            else:
+                entry.action = "SKIP"
+                entry.reason = "not backed up to the target — left in place"
+                entry.selected = False
             plan.entries.append(entry)
 
         plan.entries.sort(key=lambda e: (_ACTION_ORDER.get(e.action, 9), -e.size))
