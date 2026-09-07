@@ -89,6 +89,45 @@ def _format_bytes(size_bytes):
     return human_bytes(size_bytes, 2)
 
 
+class DiskMapWorker(QObject):
+    """Full-drive folder-size walk + Steam/installed-app detection, off the GUI
+    thread. Covers Program Files / games / everything the file index skips."""
+
+    finished = pyqtSignal(str, dict)   # drive, payload
+    progress = pyqtSignal(str, str)    # drive, message
+
+    def __init__(self, drive):
+        super().__init__()
+        self.drive = drive
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from core.app_scanner import installed_programs, steam_games
+        from core.disk_map import scan_folder_sizes
+
+        payload = {}
+        try:
+            payload["folders"] = scan_folder_sizes(
+                self.drive,
+                progress=lambda n, msg: self.progress.emit(self.drive, msg),
+                should_stop=lambda: self._stop,
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload["folders_error"] = str(exc)
+        try:
+            payload["steam"] = steam_games(self.drive)
+        except Exception:  # noqa: BLE001
+            payload["steam"] = []
+        try:
+            payload["programs"] = installed_programs(self.drive, should_stop=lambda: self._stop)
+        except Exception:  # noqa: BLE001
+            payload["programs"] = []
+        self.finished.emit(self.drive, payload)
+
+
 class BackupWorker(QObject):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
@@ -376,6 +415,10 @@ class FilesView(QWidget):
         self._dashboard_pending = False
         self._estimate_thread = None
         self._estimate_worker = None
+        self._diskmap_thread = None
+        self._diskmap_worker = None
+        self._diskmap_cache = {}
+        self._diskmap_state = {}
 
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -721,28 +764,95 @@ class FilesView(QWidget):
             self.drive_checks[drive["root"]] = box
 
 
+    _SUBTABS = (
+        ("Overview", "overview"),
+        ("Disk Map", "diskmap"),
+        ("Games & Apps", "apps"),
+        ("Duplicates", "duplicates"),
+        ("Cleanup", "cleanup"),
+    )
+
     def _rebuild_drive_tabs(self, inventory):
         self.tabs.clear()
         self.drive_tabs = {}
+        self._diskmap_cache = {}
+        self._diskmap_state = {}
 
         for drive in inventory:
             if not drive["is_scan_eligible"]:
                 continue
+            root = drive["root"]
             inner_tabs = QTabWidget()
             sections = {}
 
-            for tab_name in ("Overview", "Folders", "Duplicates", "Steam", "Cleanup"):
-                if tab_name == "Duplicates":
-                    widget = DuplicateGroupsWidget(self.file_manager, drive["root"], self)
+            for label, key in self._SUBTABS:
+                if key == "duplicates":
+                    widget = DuplicateGroupsWidget(self.file_manager, root, self)
                 else:
                     widget = QTextEdit()
                     widget.setReadOnly(True)
                     widget.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-                inner_tabs.addTab(widget, tab_name)
-                sections[tab_name.lower()] = widget
+                    if key in ("diskmap", "apps"):
+                        widget.setPlainText(
+                            "Open this tab to scan — this walks the whole drive "
+                            "(Program Files, games, everything) and can take a minute."
+                        )
+                inner_tabs.addTab(widget, label)
+                sections[key] = widget
 
-            self.tabs.addTab(inner_tabs, drive["root"])
-            self.drive_tabs[drive["root"]] = sections
+            inner_tabs.currentChanged.connect(
+                lambda idx, r=root, it=inner_tabs: self._on_drive_subtab(r, it, idx)
+            )
+            self.tabs.addTab(inner_tabs, root)
+            self.drive_tabs[root] = sections
+
+    # ── Disk Map / Games & Apps (lazy, full-drive walk) ──────────────────
+    def _on_drive_subtab(self, drive, inner_tabs, index):
+        key = inner_tabs.tabText(index).lower()
+        if "disk map" in key or "games" in key:
+            self._ensure_diskmap(drive)
+
+    def _ensure_diskmap(self, drive, force=False):
+        state = self._diskmap_state.get(drive)
+        if state == "loading" or (state == "done" and not force):
+            return
+        if self._diskmap_thread is not None and self._diskmap_thread.isRunning():
+            # one full-drive walk at a time
+            self.drive_tabs[drive]["diskmap"].setPlainText(
+                "Another drive scan is running — open this tab again when it finishes."
+            )
+            return
+        self._diskmap_state[drive] = "loading"
+        for k in ("diskmap", "apps"):
+            self.drive_tabs[drive][k].setPlainText(f"Scanning {drive} …")
+
+        thread = QThread()
+        worker = DiskMapWorker(drive)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(
+            lambda d, msg: self.drive_tabs.get(d, {}).get("diskmap")
+            and self.drive_tabs[d]["diskmap"].setPlainText(f"Scanning {d} …\n{msg}")
+        )
+        worker.finished.connect(self._on_diskmap_ready)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # keep refs alive
+        self._diskmap_thread = thread
+        self._diskmap_worker = worker
+        thread.start()
+
+    def _on_diskmap_ready(self, drive, payload):
+        self._diskmap_state[drive] = "done"
+        self._diskmap_cache[drive] = payload
+        self._diskmap_thread = None
+        self._diskmap_worker = None
+        tabs = self.drive_tabs.get(drive)
+        if not tabs:
+            return
+        self._render_disk_map(tabs["diskmap"], payload)
+        self._render_apps(tabs["apps"], payload)
 
     def update_status(self, text):
         self.progress_bar.setFormat(text)
@@ -1118,8 +1228,16 @@ class FilesView(QWidget):
             widget.append(f"Total Capacity: {_format_gb(drive_meta['total_bytes'])}")
             widget.append(f"Backup Target Ready: {'Yes' if drive_meta['is_writable'] else 'No'}")
             widget.append("")
-        widget.append(f"Files Indexed: {data.get('file_count', 0)}")
+        widget.append(f"Files Indexed: {data.get('file_count', 0)}  (excludes Program Files / games / Windows)")
         widget.append(f"Indexed Storage: {_format_gb(data.get('total_size_bytes', 0))}")
+        fm = (self._diskmap_cache.get(drive) or {}).get("folders")
+        if fm:
+            widget.append(
+                f"Actual disk usage (all folders): ~{_format_gb(fm['total'])}  "
+                f"— see the Disk Map tab"
+            )
+        else:
+            widget.append("Open the Disk Map and Games & Apps tabs for full disk usage.")
         widget.append("")
         widget.append(f"Duplicate Groups Found: {len(duplicates)}")
         widget.append(
@@ -1135,10 +1253,57 @@ class FilesView(QWidget):
             "Downloads are included in Loose/User Files and Windows Backup. Self-backup protection blocks a destination drive from backing itself up."
         )
 
-    def _render_folders(self, widget, data):
+    def _render_disk_map(self, widget, payload):
         widget.clear()
-        for folder, size in data.get("folders") or []:
-            widget.append(f"{_format_gb(size)} - {folder}")
+        fm = payload.get("folders")
+        if not fm:
+            widget.append("Disk map unavailable: " + str(payload.get("folders_error", "")))
+            return
+        widget.append(
+            f"Apparent size of {fm['root']}: {_format_gb(fm['total'])} "
+            f"across {fm['file_count']:,} files"
+        )
+        widget.append(
+            "(approximate — Windows hardlinks and OneDrive online-only files "
+            "can inflate this)"
+        )
+        if fm.get("stopped"):
+            widget.append("— scan was stopped early, totals are partial —")
+        widget.append("")
+        widget.append("By category")
+        for name, size in fm.get("categories", {}).items():
+            widget.append(f"   {_format_gb(size):>12}   {name}")
+        widget.append("")
+        widget.append("Biggest folders")
+        for child in fm.get("children", []):
+            widget.append(f"   {_format_gb(child['size']):>12}   {child['name']}")
+
+    def _render_apps(self, widget, payload):
+        widget.clear()
+        steam = payload.get("steam") or []
+        if steam:
+            total = sum(g["size_bytes"] for g in steam)
+            libs = sorted({g["library"] for g in steam})
+            widget.append(
+                f"Steam — {len(steam)} game(s), {_format_gb(total)}"
+                + (f"   ·   library: {'; '.join(libs)}" if libs else "")
+            )
+            for g in steam:
+                widget.append(f"   {_format_gb(g['size_bytes']):>12}   {g['name']}")
+        else:
+            widget.append("Steam: no games found on this drive.")
+        widget.append("")
+
+        programs = payload.get("programs") or []
+        if programs:
+            widget.append("Installed program folders (over 50 MB)")
+            for p in programs[:60]:
+                widget.append(
+                    f"   {_format_gb(p['size_bytes']):>12}   {p['name']}   "
+                    f"[{p['location']}]"
+                )
+        else:
+            widget.append("No large program folders found on this drive.")
 
     def _render_duplicates(self, widget, data):
         duplicates = data.get("duplicates") or []
@@ -1147,15 +1312,6 @@ class FilesView(QWidget):
         else:
             widget.clear()
             widget.append("Invalid widget type for Duplicates tab.")
-
-    def _render_steam(self, widget, data):
-        widget.clear()
-        games = data.get("steam") or []
-        if games:
-            for game, size in games:
-                widget.append(f"{_format_gb(size)} - {game}")
-        else:
-            widget.append("No Steam libraries detected.")
 
     def _render_cleanup(self, widget, data):
         widget.clear()
@@ -1220,7 +1376,5 @@ class FilesView(QWidget):
             if not data:
                 continue
             self._render_overview(tabs["overview"], drive, data)
-            self._render_folders(tabs["folders"], data)
             self._render_duplicates(tabs["duplicates"], data)
-            self._render_steam(tabs["steam"], data)
             self._render_cleanup(tabs["cleanup"], data)

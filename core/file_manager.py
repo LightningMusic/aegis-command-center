@@ -1,5 +1,4 @@
 import os
-import re
 
 from core.backup_manager import BackupManager
 from core.database import Database
@@ -321,8 +320,6 @@ class FileManager:
             "duplicate_reclaimable_bytes": sum(
                 group["reclaimable_bytes"] for group in duplicates
             ),
-            "folders": self.get_storage_by_folder(drive),
-            "steam": self.get_steam_games_usage(drive),
             "cleanup": cleanup,
             "cleanup_candidate_bytes": sum(item["size_bytes"] for item in cleanup),
         }
@@ -341,43 +338,11 @@ class FileManager:
         )
 
     def get_steam_games_usage(self, drive):
-        steam_paths = self.db.fetchall(
-            """
-            SELECT absolute_path FROM files
-            WHERE name = 'libraryfolders.vdf'
-            AND drive = ?
-            """,
-            (drive,),
-        )
+        """(name, size_bytes) pairs, biggest first. Uses the registry + Steam
+        manifests directly — the file index skips Program Files."""
+        from core.app_scanner import steam_games
 
-        games = {}
-
-        for (vdf_path,) in steam_paths:
-            try:
-                with open(vdf_path, "r", encoding="utf-8", errors="ignore") as file_handle:
-                    content = file_handle.read()
-                paths = re.findall(r'"path"\s+"([^"]+)"', content)
-
-                for path in paths:
-                    common_path = os.path.join(path, "steamapps", "common")
-                    if not os.path.exists(common_path):
-                        continue
-
-                    for game in os.listdir(common_path):
-                        game_path = os.path.join(common_path, game)
-                        total = 0
-                        for root, _, files in os.walk(game_path):
-                            for file_name in files:
-                                try:
-                                    total += os.path.getsize(os.path.join(root, file_name))
-                                except OSError:
-                                    continue
-
-                        games[game] = total
-            except OSError:
-                continue
-
-        return sorted(games.items(), key=lambda item: item[1], reverse=True)
+        return [(g["name"], g["size_bytes"]) for g in steam_games(drive)]
 
     def get_cleanup_suggestions(self, drive):
         rows = self.db.fetchall(
