@@ -51,6 +51,7 @@ from PyQt6.QtWidgets import (
 from core.phone_backup_manager import PhoneBackupManager, PhoneDevice
 from core.device_manager import DeviceManager
 from core.util import human_bytes
+from ui.thread_utils import stop_thread
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Background worker
@@ -382,6 +383,15 @@ class PhoneBackupView(QWidget):
     def _cleanup_detect_thread(self) -> None:
         self._detect_thread = None
         self._detect_worker = None
+
+    def shutdown(self) -> None:
+        if getattr(self, "activity_timer", None) is not None:
+            self.activity_timer.stop()
+        stop_thread(getattr(self, "_detect_thread", None), getattr(self, "_detect_worker", None))
+        # A running phone backup can take a long time to reach a stop point;
+        # ask it to stop and give it a bounded wait, then terminate at exit.
+        stop_thread(getattr(self, "backup_thread", None), getattr(self, "backup_worker", None),
+                    wait_ms=6000)
 
     def _on_phone_selected(self, row: int) -> None:
         self.backup_btn.setEnabled(row >= 0 and self.backup_thread is None)

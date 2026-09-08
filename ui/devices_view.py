@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 from core.phone_backup_manager import PhoneBackupManager
 from ui.phone_backup_view import PhoneBackupView
+from ui.thread_utils import stop_thread
 from core.config import ConfigManager
 from core.util import human_bytes
 
@@ -564,3 +565,14 @@ class DevicesView(QWidget):
 
     def _format_bytes(self, bytes_value):
         return human_bytes(bytes_value, 2)
+
+    def shutdown(self):
+        for tname, wname in (
+            ("dev_detection_thread", "dev_detection_worker"),
+            ("phone_detection_thread", "phone_detection_worker"),
+            ("device_list_thread", "device_list_worker"),
+        ):
+            stop_thread(getattr(self, tname, None), getattr(self, wname, None))
+        pbv = getattr(self, "phone_backup_view", None)
+        if pbv is not None and hasattr(pbv, "shutdown"):
+            pbv.shutdown()

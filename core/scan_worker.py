@@ -11,7 +11,18 @@ EXCLUDED_DIRS = {
     "System Volume Information",
     "$Recycle.Bin",
     "PerfLogs",
+    "Config.Msi",
+    "$WinREAgent",
 }
+
+# Always ACL-locked — trying to enter them just spams Access Denied.
+EXCLUDED_DIR_SUBPATHS = (
+    "\\windows defender advanced threat protection",
+    "\\windows defender\\platform",
+    "\\microsoft\\windows defender",
+    "\\system volume information",
+    "\\$recycle.bin",
+)
 
 PROTECTED_PATH_KEYWORDS = (
     "windows\\",
@@ -58,6 +69,10 @@ class ScanWorker(QObject):
         if entry.name in EXCLUDED_DIRS or name_lower.startswith("."):
             return True
 
+        path_lower = entry.path.lower()
+        if any(sub in path_lower for sub in EXCLUDED_DIR_SUBPATHS):
+            return True
+
         try:
             if entry.is_symlink():
                 return True
@@ -67,8 +82,7 @@ class ScanWorker(QObject):
                 return True
         except AttributeError:
             pass
-        except OSError as exc:
-            print(f"Error occurred while processing directory {entry.path}: {exc}")
+        except OSError:
             return True
 
         return False
@@ -177,24 +191,18 @@ class ScanWorker(QObject):
                                     if total_indexed % 500 == 0:
                                         QThread.msleep(1)
 
-                                except PermissionError:
+                                except (PermissionError, FileNotFoundError, OSError):
                                     continue
-                                except FileNotFoundError:
-                                    continue
-                                except Exception as exc:
-                                    print(f"File processing error: {entry.path} - {exc}")
+                                except Exception:  # noqa: BLE001
                                     continue
 
                             if interrupted:
                                 break
-                    except PermissionError as exc:
-                        print(f"PermissionError at {current_dir}: {exc}")
+                    except (PermissionError, FileNotFoundError, OSError):
+                        # ACL-locked or vanished directory — expected on a full
+                        # drive walk, skip it quietly.
                         continue
-                    except FileNotFoundError as exc:
-                        print(f"FileNotFoundError at {current_dir}: {exc}")
-                        continue
-                    except Exception as exc:
-                        print(f"Unexpected error at {current_dir}: {exc}")
+                    except Exception:  # noqa: BLE001
                         continue
 
                 if interrupted:

@@ -233,6 +233,11 @@ class CalendarView(QWidget):
         self._sync_worker = None
         self.sync_btn.setEnabled(True)
 
+    def shutdown(self) -> None:
+        from ui.thread_utils import stop_thread
+
+        stop_thread(getattr(self, "_sync_thread", None), getattr(self, "_sync_worker", None))
+
     def _on_sync_done(self, ok: bool, message: str) -> None:
         self.reload()
         self.tasks_changed.emit()

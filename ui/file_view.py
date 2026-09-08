@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 from core.scan_worker import ScanWorker
 from core.util import human_bytes
 from ui.consolidate_view import ConsolidateView
+from ui.thread_utils import stop_thread
 
 
 class DashboardWorker(QObject):
@@ -42,13 +43,19 @@ class DashboardWorker(QObject):
         super().__init__()
         self.file_manager = file_manager
         self.drives = list(drives)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
 
     def run(self):
         data = {}
         for drive in self.drives:
+            if self._stop:
+                break
             try:
                 data[drive] = self.file_manager.get_drive_dashboard(drive)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 print(f"Dashboard computation failed for {drive}: {exc}")
         self.finished.emit(data)
 
@@ -837,17 +844,23 @@ class FilesView(QWidget):
         worker.finished.connect(self._on_diskmap_ready)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        # Null the Python refs only AFTER the thread's event loop has actually
+        # stopped (thread.finished), never in the worker.finished slot — doing
+        # it there drops the last ref while QThread::exec() is still running,
+        # and PyQt then deletes a running QThread -> qFatal() -> the app aborts.
+        thread.finished.connect(self._cleanup_diskmap_thread)
         thread.finished.connect(thread.deleteLater)
-        # keep refs alive
         self._diskmap_thread = thread
         self._diskmap_worker = worker
         thread.start()
 
+    def _cleanup_diskmap_thread(self):
+        self._diskmap_thread = None
+        self._diskmap_worker = None
+
     def _on_diskmap_ready(self, drive, payload):
         self._diskmap_state[drive] = "done"
         self._diskmap_cache[drive] = payload
-        self._diskmap_thread = None
-        self._diskmap_worker = None
         tabs = self.drive_tabs.get(drive)
         if not tabs:
             return
@@ -1378,3 +1391,17 @@ class FilesView(QWidget):
             self._render_overview(tabs["overview"], drive, data)
             self._render_duplicates(tabs["duplicates"], data)
             self._render_cleanup(tabs["cleanup"], data)
+
+    # ── shutdown ────────────────────────────────────────────────────────
+    def shutdown(self):
+        for tname, wname in (
+            ("scan_thread", "worker"),
+            ("backup_thread", "backup_worker"),
+            ("_dashboard_thread", "_dashboard_worker"),
+            ("_estimate_thread", "_estimate_worker"),
+            ("_diskmap_thread", "_diskmap_worker"),
+        ):
+            stop_thread(getattr(self, tname, None), getattr(self, wname, None))
+        cv = getattr(self, "consolidate_view", None)
+        if cv is not None and hasattr(cv, "shutdown"):
+            cv.shutdown()

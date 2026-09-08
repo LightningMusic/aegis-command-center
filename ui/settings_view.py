@@ -73,6 +73,11 @@ class SettingsView(QWidget):
         self._oauth_worker = None
         self._google_thread = None
         self._google_worker = None
+        self._thread_pairs = (
+            ("_test_thread", "_test_worker"),
+            ("_oauth_thread", "_oauth_worker"),
+            ("_google_thread", "_google_worker"),
+        )
 
         layout = QVBoxLayout()
         layout.setContentsMargins(20, 20, 20, 20)
@@ -722,3 +727,9 @@ class SettingsView(QWidget):
 
         box = QMessageBox.information if ok else QMessageBox.warning
         box(self, "Brightspace", message)
+
+    def shutdown(self):
+        from ui.thread_utils import stop_thread
+
+        for tname, wname in self._thread_pairs:
+            stop_thread(getattr(self, tname, None), getattr(self, wname, None))

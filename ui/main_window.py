@@ -32,6 +32,7 @@ from ui.devices_view import DevicesView
 from ui.analytics_view import AnalyticsView
 from ui.settings_view import SettingsView
 from ui.calendar_view import CalendarView
+from ui.thread_utils import stop_thread
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -265,3 +266,22 @@ class MainWindow(QMainWindow):
         self.calendar_view.reload()
         self.tasks_view.load_tasks()
         self.dashboard_view.refresh()
+
+    # ── clean shutdown ───────────────────────────────────────────────────
+    def closeEvent(self, event):
+        """Stop every background worker before the widgets are destroyed —
+        otherwise a still-running QThread aborts the process on exit."""
+        try:
+            self._sync_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        stop_thread(getattr(self, "_auto_sync_thread", None),
+                    getattr(self, "_auto_sync_worker", None))
+        for page in getattr(self, "_pages", []):
+            fn = getattr(page, "shutdown", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    pass
+        super().closeEvent(event)

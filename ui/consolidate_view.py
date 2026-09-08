@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 
 from core.drive_consolidator import ConsolidationPlanner, DbHashCache, Plan, PlanEntry
 from ui.preview_panel import PreviewPanel
+from ui.thread_utils import stop_thread
 
 
 from core.util import connected_drives, human_bytes
@@ -759,6 +760,16 @@ class ConsolidateView(QWidget):
             self._worker.stop()
             self.progress.setFormat("Stopping…")
             self.log.append("Stop requested — finishing the current file…")
+
+    def shutdown(self) -> None:
+        stop_thread(getattr(self, "_thread", None), getattr(self, "_worker", None),
+                    wait_ms=8000)
+        preview = getattr(self, "preview", None)
+        if preview is not None:
+            if hasattr(preview, "stop"):
+                preview.stop()
+            stop_thread(getattr(preview, "_verify_thread", None),
+                        getattr(preview, "_verify_worker", None))
 
     def _set_running(self, running: bool, analyzing: bool = True) -> None:
         self.analyze_btn.setEnabled(not running)
