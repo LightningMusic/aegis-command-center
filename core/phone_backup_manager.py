@@ -191,6 +191,19 @@ if ($ManifestPath -and (Test-Path $ManifestPath)) {
     }
 }
 
+# All CopyHere() calls land in a fresh, guaranteed-empty staging folder on the
+# SAME drive as the destination — never directly in the real destination tree.
+# This is what actually prevents the "There is already a file with this name"
+# conflict dialog that Explorer's WPD/MTP copy engine can pop up even with
+# FOF_NOCONFIRMATION (a long-standing quirk: that flag isn't fully honoured
+# for portable-device sources). The dialog can only appear if CopyHere's
+# target folder already has a same-named file, and a fresh per-run GUID
+# folder never does. The finished file is then moved into place with
+# Move-Item, a plain filesystem rename that never shows any UI.
+$runStageDir = Join-Path $DestPath ("_aegis_stage_" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $runStageDir -Force | Out-Null
+$stageNs = $shell.Namespace($runStageDir)
+
 function Get-ItemSizeBestEffort($Item) {
     # WPD/MTP shell namespace extensions are notoriously inconsistent about
     # exposing .Size — for many Android phones it's always $null. Try the
@@ -392,19 +405,24 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 }
             }
 
+            $stagedFile = Join-Path $runStageDir $item.Name
+            if (Test-Path $stagedFile) {
+                try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
+            }
+
             $copyOk = $false
             for ($try = 1; $try -le 3 -and -not $copyOk; $try++) {
                 try {
-                    $dstNs.CopyHere($item, $copyFlags)
+                    $stageNs.CopyHere($item, $copyFlags)
                 } catch {
                     Beat "retrying $relKey (CopyHere error)"
                     Start-Sleep -Milliseconds 800
                     continue
                 }
 
-                if (Wait-ForFile $destFile $relKey $expectedSize) {
+                if (Wait-ForFile $stagedFile $relKey $expectedSize) {
                     $finalSize = -1
-                    try { $finalSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $finalSize = -1 }
+                    try { $finalSize = [int64](Get-Item -LiteralPath $stagedFile -ErrorAction Stop).Length } catch { $finalSize = -1 }
 
                     if ($finalSize -lt 0) {
                         Beat "retrying $relKey (vanished)"
@@ -413,17 +431,30 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                     }
                     if ($expectedSize -gt 0 -and $finalSize -lt $expectedSize) {
                         # Truncated transfer — drop it so it isn't recorded as good.
-                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                        try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
                         Beat "retrying $relKey (short: $finalSize/$expectedSize)"
                         Start-Sleep -Milliseconds 1000
+                        continue
+                    }
+
+                    # Staged copy is verified good — move it into the real
+                    # destination. Same drive, so this is an instant rename,
+                    # never a shell operation, never a dialog.
+                    try {
+                        if (Test-Path $destFile) { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop }
+                        Move-Item -LiteralPath $stagedFile -Destination $destFile -Force -ErrorAction Stop
+                    } catch {
+                        Beat "retrying $relKey (stage move failed: $_)"
+                        try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
+                        Start-Sleep -Milliseconds 800
                         continue
                     }
 
                     $copyOk = $true
                 } else {
                     # Never appeared within the appear-timeout. Clean any stub.
-                    if (Test-Path $destFile) {
-                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                    if (Test-Path $stagedFile) {
+                        try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
                     }
                     # A file that produces nothing at all rarely recovers within
                     # the same run — one extra attempt, then leave it for the
@@ -460,19 +491,23 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
     }
 }
 
-$srcNs = $shell.Namespace($SourcePath)
-if ($null -eq $srcNs) {
-    $errors++
-    Write-Host "CONNECT_FAILED:Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
-} else {
-    CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
+try {
+    $srcNs = $shell.Namespace($SourcePath)
+    if ($null -eq $srcNs) {
+        $errors++
+        Write-Host "CONNECT_FAILED:Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
+    } else {
+        CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
 
-    if ($script:copied -eq 0 -and $script:skipped -eq 0 -and ($script:visited -le 2 -or $script:errors -gt 0)) {
-        # Opened the source but nothing came back — phone locked/half-mounted or
-        # the top of the tree wouldn't enumerate. Worth an automatic retry
-        # rather than a false "complete".
-        Write-Host "CONNECT_FAILED:Could not read any files from the phone. Unlock it and keep the USB mode on File Transfer / MTP."
+        if ($script:copied -eq 0 -and $script:skipped -eq 0 -and ($script:visited -le 2 -or $script:errors -gt 0)) {
+            # Opened the source but nothing came back — phone locked/half-mounted or
+            # the top of the tree wouldn't enumerate. Worth an automatic retry
+            # rather than a false "complete".
+            Write-Host "CONNECT_FAILED:Could not read any files from the phone. Unlock it and keep the USB mode on File Transfer / MTP."
+        }
     }
+} finally {
+    try { Remove-Item -LiteralPath $runStageDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 Write-Host "DONE:$($script:copied):$($script:skipped):$($script:errors)"
@@ -929,6 +964,8 @@ class PhoneBackupManager:
         for path in latest_dir.rglob("*"):
             if not path.is_file():
                 continue
+            if any(part.startswith("_aegis_stage_") for part in path.parts):
+                continue  # orphaned staging leftovers from a killed attempt
 
             try:
                 rel = str(path.relative_to(latest_dir))
@@ -991,6 +1028,12 @@ class PhoneBackupManager:
             result["errors"].append("MTP copy is only supported on Windows.")
             return result
 
+        # Clean up any staging folder left behind by an attempt that was
+        # killed mid-file (its own try/finally never got to run) — otherwise
+        # it just sits there as orphaned partial data forever.
+        for stray in Path(dest).glob("_aegis_stage_*"):
+            shutil.rmtree(stray, ignore_errors=True)
+
         manifest_path = _write_temp_manifest_lookup(manifest_lookup)
         ps_path = _write_temp_script(_PS_COPY_MTP)
         try:
@@ -1042,7 +1085,7 @@ class PhoneBackupManager:
 
             while True:
                 if should_stop and should_stop():
-                    proc.kill()
+                    _kill_process_tree(proc)
                     result["cancelled"] = True
                     break
 
@@ -1069,7 +1112,7 @@ class PhoneBackupManager:
                             )
 
                     if quiet_for > MTP_STALL_TIMEOUT_SECONDS:
-                        proc.kill()
+                        _kill_process_tree(proc)
                         result["stalled"] = True
                         result["cancelled"] = True
                         result["errors"].append(
@@ -1668,6 +1711,32 @@ class PhoneBackupManager:
 # Module-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """
+    Kill *proc* and everything it spawned. `Popen.kill()` alone only ends the
+    powershell.exe wrapper — Shell.Application's CopyHere() for MTP/WPD
+    sources can hand the actual file operation off to a separate COM
+    surrogate process, which then keeps running orphaned (still holding the
+    phone's connection) after powershell.exe is gone. `taskkill /T` kills the
+    whole process tree instead.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
+            )
+        else:
+            proc.kill()
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _write_temp_script(body: str) -> str:
     """Write *body* to a temp .ps1 file and return its path."""
     with tempfile.NamedTemporaryFile(
@@ -1709,7 +1778,9 @@ def _dir_size(path: Path) -> int:
     total = 0
     try:
         for entry in path.rglob("*"):
-            if entry.is_file():
+            if entry.is_file() and not any(
+                part.startswith("_aegis_stage_") for part in entry.parts
+            ):
                 try:
                     total += entry.stat().st_size
                 except OSError:
