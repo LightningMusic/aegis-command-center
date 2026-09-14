@@ -79,7 +79,12 @@ class PhoneBackupWorker(QObject):
             )
             self.finished.emit(result)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            # A bare str(exc) is useless (or actively misleading) for some
+            # exception types — e.g. str(KeyError('x')) is just "'x'", which
+            # reads like a real status rather than a bug. Always include the
+            # exception type so a message like this is diagnosable instead
+            # of a cryptic fragment.
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
     def _emit_progress(self, percent: int, message: str) -> None:
         self.progress.emit(percent, message)

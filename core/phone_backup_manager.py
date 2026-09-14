@@ -722,18 +722,19 @@ class PhoneBackupManager:
         manifest_lookup = self._build_manifest_lookup(manifest)
 
         result: Dict[str, Any] = {
-            "device":          device.display_name,
-            "device_folder":   str(device_dir),
-            "latest_dir":      str(latest_dir),
-            "started_at":      datetime.now().isoformat(),
-            "completed_at":    None,
-            "cancelled":       False,
-            "stalled":         False,
-            "stage":           "copy",
-            "copy_result":     None,
-            "index_result":    None,
-            "organize_result": None,
-            "errors":          [],
+            "device":            device.display_name,
+            "device_folder":     str(device_dir),
+            "latest_dir":        str(latest_dir),
+            "started_at":        datetime.now().isoformat(),
+            "completed_at":      None,
+            "cancelled":         False,
+            "stalled":           False,
+            "connection_failed": False,
+            "stage":             "copy",
+            "copy_result":       None,
+            "index_result":      None,
+            "organize_result":   None,
+            "errors":            [],
         }
 
         if should_stop and should_stop():
@@ -782,15 +783,15 @@ class PhoneBackupManager:
         self._save_manifest(device_dir, manifest)
         result["manifest_summary"] = self._summarize_manifest(manifest)
 
-        needs_retry = result["stalled"] or result["connection_failed"]
+        needs_retry = bool(result.get("stalled")) or bool(result.get("connection_failed"))
 
         if copy_stopped or needs_retry:
             result.update(cancelled=True, completed_at=datetime.now().isoformat())
             self._record_run(device_dir, result)
             if progress_callback:
-                if result["connection_failed"]:
+                if result.get("connection_failed"):
                     progress_callback(-3, "Could not reach the phone — progress saved.")
-                elif result["stalled"]:
+                elif result.get("stalled"):
                     progress_callback(-3, "Phone stopped responding — progress saved.")
                 else:
                     progress_callback(-3, "Backup stopped — progress saved.")
