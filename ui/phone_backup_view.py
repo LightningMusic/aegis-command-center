@@ -513,9 +513,16 @@ class PhoneBackupView(QWidget):
         index_r = result.get("index_result") or {}
         manifest_summary = result.get("manifest_summary") or {}
 
+        confirmed_files = manifest_summary.get("confirmed_files")
+        confirmed_bytes = manifest_summary.get("confirmed_bytes")
         lines = [
             "Preserved folder structure in latest/",
         ]
+        if confirmed_files is not None:
+            lines.append(
+                f"Confirmed on disk: {confirmed_files} file(s)"
+                + (f", {human_bytes(confirmed_bytes)}" if confirmed_bytes else "")
+            )
 
         errors = result.get("errors") or []
         if errors:
@@ -585,7 +592,40 @@ class PhoneBackupView(QWidget):
         self.progress_bar.setFormat("Failed")
         self.status_lbl.setText(f"Error: {error_message}")
         self.log_box.append(f"\nERROR: {error_message}")
-        QMessageBox.warning(self, "Backup Failed", error_message)
+
+        # A crash here doesn't mean nothing was backed up — files land on
+        # disk (and get indexed into the manifest) as they're copied,
+        # independent of whether this run finished cleanly. Show what's
+        # actually confirmed saved so far so a failure never just looks
+        # like a void with no way to tell what happened.
+        device = getattr(self.backup_worker, "device", None)
+        confirmed_note = None
+        if device is not None:
+            try:
+                for dev in self.manager.list_all_backed_up_devices():
+                    if Path(dev.get("folder", "")).name == device.safe_folder_name:
+                        confirmed = dev.get("confirmed_files", 0)
+                        confirmed_note = (
+                            f"{confirmed} file(s) confirmed backed up so far in "
+                            f"{dev.get('folder', '?')}. Nothing already copied is "
+                            f"lost — click Start Backup again to pick up where "
+                            f"this left off."
+                        )
+                        break
+            except Exception:
+                pass
+
+        if confirmed_note:
+            self.log_box.append(f"\n{confirmed_note}")
+
+        sb = self.log_box.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+        QMessageBox.warning(
+            self, "Backup Failed",
+            f"{error_message}\n\n{confirmed_note}" if confirmed_note else error_message,
+        )
 
     def _cleanup_backup_thread(self) -> None:
         self.backup_thread = None
