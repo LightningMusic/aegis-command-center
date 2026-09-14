@@ -158,6 +158,7 @@ else { $out | ConvertTo-Json -Compress -Depth 2 }
 #   FILE_TIMEOUT:<relkey>
 #   FILE_ERR:<relkey>:<message>
 #   FOLDER_ENTER:<shell_path>
+#   FENTER_KEY:<relkey>                    (machine-readable companion to FOLDER_ENTER)
 #   FOLDER_SKIP:<shell_path>
 #   STATS:<copied>:<skipped>:<errors>      (heartbeat, every ~5s)
 #   ERR:<shell_path>:<message>             (folder/source-level, not file-specific)
@@ -168,7 +169,8 @@ param(
     [string]$DestPath,
     [int]$TimeoutSec = 90,
     [int]$MaxFileSec = 3600,
-    [string]$ManifestPath = ""
+    [string]$ManifestPath = "",
+    [string]$SkipFoldersPath = ""
 )
 
 $ErrorActionPreference = 'Continue'
@@ -198,6 +200,24 @@ if ($ManifestPath -and (Test-Path $ManifestPath)) {
         }
     } catch {
         $manifestLookup = @{}
+    }
+}
+
+# Folders that repeatedly timed out listing on a previous attempt within
+# this same backup_phone_until_complete() run — skip them so one folder
+# WPD can't enumerate doesn't block the rest of the phone forever.
+$skipFolderSet = @{}
+if ($SkipFoldersPath -and (Test-Path $SkipFoldersPath)) {
+    try {
+        $raw = Get-Content $SkipFoldersPath -Raw -ErrorAction Stop
+        if ($raw) {
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            foreach ($k in @($parsed)) {
+                if ($k) { $skipFolderSet[[string]$k] = $true }
+            }
+        }
+    } catch {
+        $skipFolderSet = @{}
     }
 }
 
@@ -321,8 +341,15 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             return
         }
 
+        if ($RelLabel -and $skipFolderSet.ContainsKey($RelLabel)) {
+            Write-Host "FOLDER_SKIP:$($Label) (skipped — timed out repeatedly on a previous attempt)"
+            [Console]::Out.Flush()
+            return
+        }
+
         $script:visited++
         Write-Host "FOLDER_ENTER:$($Label)"
+        Write-Host "FENTER_KEY:$RelLabel"
         [Console]::Out.Flush()
 
         $dstNs = EnsureFolder $Dst
@@ -694,6 +721,7 @@ class PhoneBackupManager:
         progress_callback: Optional[ProgressCallback] = None,
         should_stop: Optional[StopCallback] = None,
         reindex_before: bool = True,
+        skip_folder_keys: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         One incremental backup attempt for *device*.
@@ -702,6 +730,12 @@ class PhoneBackupManager:
         same relative paths they had on the phone. The manifest is consulted
         before copying so unchanged files are skipped, then refreshed from the
         ``latest/`` tree after each attempt so files from older runs are known.
+
+        *skip_folder_keys*, if given, is a set of phone-relative folder paths
+        (the same "A\\B\\C" keys used in the manifest) to skip entirely this
+        attempt — used by backup_phone_until_complete() to route around a
+        folder that has repeatedly timed out, so one bad folder can't block
+        the rest of the phone forever.
 
         For the full unattended/overnight experience, use
         backup_phone_until_complete() instead, which wraps this in an
@@ -752,6 +786,7 @@ class PhoneBackupManager:
                 manifest_lookup=manifest_lookup,
                 progress_callback=progress_callback,
                 should_stop=should_stop,
+                skip_folder_keys=skip_folder_keys,
             )
         else:
             copy_result = self._copy_drive(
@@ -837,6 +872,16 @@ class PhoneBackupManager:
         stall_streak = 0          # consecutive retries with no forward progress
         did_full_index = False
 
+        # If the SAME folder is where the phone stalls two attempts in a row
+        # with zero files copied since entering it, that folder itself is the
+        # problem (an item WPD can't enumerate, most likely) — not the USB
+        # connection. Retrying it forever makes zero progress on the rest of
+        # the phone every single time. Skip it after that, and say so.
+        skip_folder_keys: set = set()
+        skip_messages: List[str] = []
+        stuck_folder_key: Optional[str] = None
+        stuck_folder_repeats = 0
+
         for attempt in range(1, max_attempts + 1):
             if should_stop and should_stop():
                 break
@@ -846,9 +891,12 @@ class PhoneBackupManager:
                 progress_callback=progress_callback,
                 should_stop=should_stop,
                 reindex_before=not did_full_index,
+                skip_folder_keys=skip_folder_keys or None,
             )
             did_full_index = True
             last_result["attempt"] = attempt
+            if skip_folder_keys:
+                last_result["skipped_folders"] = sorted(skip_folder_keys)
 
             copy_result = last_result.get("copy_result") or {}
             made_progress = int(copy_result.get("copied") or 0) > 0
@@ -859,6 +907,30 @@ class PhoneBackupManager:
                 # A phone that keeps handing us files between drops is "working" —
                 # keep retries snappy. Only back off when nothing is getting through.
                 stall_streak = 0 if made_progress else stall_streak + 1
+
+            this_stuck_key = copy_result.get("stuck_folder_key")
+            if last_result.get("stalled") and this_stuck_key:
+                if this_stuck_key == stuck_folder_key:
+                    stuck_folder_repeats += 1
+                else:
+                    stuck_folder_key = this_stuck_key
+                    stuck_folder_repeats = 1
+
+                if stuck_folder_repeats >= 2 and stuck_folder_key not in skip_folder_keys:
+                    skip_folder_keys.add(stuck_folder_key)
+                    msg = (
+                        f"Skipping '{stuck_folder_key}' after it repeatedly timed out "
+                        f"partway through listing it — continuing with the rest of the "
+                        f"phone instead of retrying it forever. Open that folder in "
+                        f"File Explorer to check it manually if it has files you need."
+                    )
+                    skip_messages.append(msg)
+                    last_result.setdefault("errors", []).append(msg)
+                    if progress_callback:
+                        progress_callback(-3, msg)
+            else:
+                stuck_folder_key = None
+                stuck_folder_repeats = 0
 
             if not needs_retry:
                 break
@@ -912,6 +984,16 @@ class PhoneBackupManager:
 
         last_result["attempts_used"] = last_result.get("attempt", 1)
         last_result["interruption_count"] = interruption_count
+        if skip_folder_keys:
+            last_result["skipped_folders"] = sorted(skip_folder_keys)
+        # Folder-skip notices were recorded on whichever attempt discovered
+        # them, which isn't necessarily this final one (e.g. the very next
+        # attempt might succeed cleanly) — make sure they survive either way,
+        # since the user still needs to know a folder was left out.
+        existing_errors = last_result.setdefault("errors", [])
+        for msg in skip_messages:
+            if msg not in existing_errors:
+                existing_errors.append(msg)
         return last_result
 
     def _reacquire_device(self, device: PhoneDevice) -> Optional[PhoneDevice]:
@@ -1061,6 +1143,7 @@ class PhoneBackupManager:
         manifest_lookup: Dict[str, Dict[str, Any]],
         progress_callback: Optional[ProgressCallback],
         should_stop: Optional[StopCallback],
+        skip_folder_keys: Optional[set] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "copied": 0, "skipped": 0, "skipped_manifest": 0,
@@ -1079,7 +1162,14 @@ class PhoneBackupManager:
             shutil.rmtree(stray, ignore_errors=True)
 
         manifest_path = _write_temp_manifest_lookup(manifest_lookup)
+        skip_folders_path = _write_temp_skip_folders(skip_folder_keys or set())
         ps_path = _write_temp_script(_PS_COPY_MTP)
+        # Which folder we most recently entered, and how many files had been
+        # copied cumulatively at that moment — lets us tell, if this attempt
+        # stalls, whether the folder we were listing made zero progress (i.e.
+        # is itself the problem) rather than blaming the phone/connection.
+        last_folder_key: Optional[str] = None
+        folder_key_baseline_copied = 0
         try:
             cmd = [
                 "powershell", "-NoProfile", "-NonInteractive",
@@ -1090,6 +1180,7 @@ class PhoneBackupManager:
                 "-TimeoutSec", str(MTP_FILE_TIMEOUT_SECONDS),
                 "-MaxFileSec", str(MTP_FILE_MAX_SECONDS),
                 "-ManifestPath", manifest_path,
+                "-SkipFoldersPath", skip_folders_path,
             ]
             proc = subprocess.Popen(
                 cmd,
@@ -1166,6 +1257,11 @@ class PhoneBackupManager:
                             f"{result['copied']} file(s) this attempt. Progress is saved; "
                             f"it will retry automatically."
                         )
+                        if last_folder_key and result["copied"] == folder_key_baseline_copied:
+                            # Nothing at all came through since we entered this
+                            # folder — it's the folder itself that's stuck, not
+                            # a generic connection drop.
+                            result["stuck_folder_key"] = last_folder_key
                         break
                     continue
 
@@ -1227,6 +1323,10 @@ class PhoneBackupManager:
                     if progress_callback:
                         progress_callback(-1, f"Scanning: {folder}")
 
+                elif line.startswith("FENTER_KEY:"):
+                    last_folder_key = line[11:] or None
+                    folder_key_baseline_copied = result["copied"]
+
                 elif line.startswith("FOLDER_SKIP:"):
                     folder = line[12:].split("\\")[-1]
                     if progress_callback:
@@ -1270,6 +1370,10 @@ class PhoneBackupManager:
                 pass
             try:
                 os.unlink(manifest_path)
+            except OSError:
+                pass
+            try:
+                os.unlink(skip_folders_path)
             except OSError:
                 pass
 
@@ -1798,6 +1902,15 @@ def _write_temp_manifest_lookup(lookup: Dict[str, Dict[str, Any]]) -> str:
         mode="w", suffix=".json", delete=False, encoding="utf-8"
     ) as f:
         json.dump(lookup, f)
+        return f.name
+
+
+def _write_temp_skip_folders(keys: set) -> str:
+    """Write the set of phone-relative folder keys to skip to a temp .json file."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as f:
+        json.dump(sorted(keys), f)
         return f.name
 
 
