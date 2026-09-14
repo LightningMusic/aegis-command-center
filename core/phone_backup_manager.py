@@ -182,7 +182,13 @@ $errors    = 0
 $visited   = 0
 $lastBeat  = Get-Date
 
-$copyFlags = 1556
+# FOF_SILENT(4) | FOF_NOCONFIRMATION(16) | FOF_NOCONFIRMMKDIR(512) |
+# FOF_NOERRORUI(1024) | FOF_RENAMEONCOLLISION(8). The rename flag is belt
+# and suspenders on top of the unique-per-attempt staging folders below: if
+# a name collision ever happens anyway, tell the shell to silently rename
+# rather than prompt, instead of relying on FOF_NOCONFIRMATION alone — which
+# WPD/MTP sources are known to not fully honour for the overwrite prompt.
+$copyFlags = 1564
 
 $ALWAYS_SKIP = @('.thumbnails', '.trashed', '.cache', '.thumbcache', 'lost.dir')
 
@@ -442,17 +448,27 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 }
             }
 
-            $stagedFile = Join-Path $runStageDir $item.Name
-            if (Test-Path $stagedFile) {
-                try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
-            }
-
             $copyOk = $false
             for ($try = 1; $try -le 3 -and -not $copyOk; $try++) {
+                # CopyHere() is fire-and-forget — it can still be finishing
+                # asynchronously in the background well after Wait-ForFile
+                # gives up on it. Reusing one staging path across retries
+                # meant a late-arriving first attempt and a fresh retry could
+                # both land on the SAME name at the SAME time — a collision
+                # of our own making, which is exactly the "already exists"
+                # dialog this was supposed to prevent. Every attempt now gets
+                # its own throwaway folder, so two overlapping copies —
+                # however they're timed — can never touch the same path.
+                $attemptStageDir = Join-Path $runStageDir ([guid]::NewGuid().ToString("N"))
+                $stagedFile = $null
                 try {
-                    $stageNs.CopyHere($item, $copyFlags)
+                    New-Item -ItemType Directory -Path $attemptStageDir -Force | Out-Null
+                    $attemptStageNs = $shell.Namespace($attemptStageDir)
+                    $stagedFile = Join-Path $attemptStageDir $item.Name
+                    $attemptStageNs.CopyHere($item, $copyFlags)
                 } catch {
                     Beat "retrying $relKey (CopyHere error)"
+                    try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                     Start-Sleep -Milliseconds 800
                     continue
                 }
@@ -463,12 +479,13 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
                     if ($finalSize -lt 0) {
                         Beat "retrying $relKey (vanished)"
+                        try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                         Start-Sleep -Milliseconds 800
                         continue
                     }
                     if ($expectedSize -gt 0 -and $finalSize -lt $expectedSize) {
                         # Truncated transfer — drop it so it isn't recorded as good.
-                        try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
+                        try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                         Beat "retrying $relKey (short: $finalSize/$expectedSize)"
                         Start-Sleep -Milliseconds 1000
                         continue
@@ -482,20 +499,25 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                         Move-Item -LiteralPath $stagedFile -Destination $destFile -Force -ErrorAction Stop
                     } catch {
                         Beat "retrying $relKey (stage move failed: $_)"
-                        try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
+                        try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                         Start-Sleep -Milliseconds 800
                         continue
                     }
 
+                    try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                     $copyOk = $true
                 } else {
-                    # Never appeared within the appear-timeout. Clean any stub.
-                    if (Test-Path $stagedFile) {
-                        try { Remove-Item -LiteralPath $stagedFile -Force -ErrorAction Stop } catch {}
-                    }
-                    # A file that produces nothing at all rarely recovers within
-                    # the same run — one extra attempt, then leave it for the
-                    # whole-backup retry so we don't burn minutes per dead file.
+                    # Never appeared within the appear-timeout. Leave this
+                    # attempt's folder for the final cleanup rather than
+                    # deleting it here — if CopyHere really is still working
+                    # in the background, ripping the folder out from under it
+                    # is exactly the kind of thing that can throw its own
+                    # shell error. It's harmless clutter either way; the
+                    # per-run stage dir gets wiped wholesale at the end.
+                    # A file that produces nothing at all rarely recovers
+                    # within the same run — one extra attempt, then leave it
+                    # for the whole-backup retry so we don't burn minutes per
+                    # dead file.
                     if ($try -ge 2) { break }
                     Beat "retrying $relKey (no data)"
                     Start-Sleep -Milliseconds 1000
