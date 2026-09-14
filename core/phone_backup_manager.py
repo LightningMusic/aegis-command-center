@@ -80,8 +80,18 @@ MTP_FILE_MAX_SECONDS = 60 * 60
 # The phone can go quiet for a while between bursts (folder enumeration, the
 # provider staging a large file, the screen locking briefly). Warn softly first,
 # only treat it as a real disconnect after the hard timeout.
+#
+# Folder *listing* (not file copying) is the main reason a perfectly healthy
+# phone goes quiet for a long time: Shell.Application's Folder.Items() call
+# for an MTP folder is a single call that returns nothing at all until the
+# whole folder is enumerated, and on-device this is well known to take
+# several minutes for a folder with thousands of files (a big camera roll or
+# a WhatsApp media folder, say) — Explorer itself is just as slow browsing
+# the same folder. There is no progress to report during that one call, so
+# the stall ceiling has to be generous enough to outlast it rather than
+# reading normal-but-slow enumeration as a real disconnect.
 MTP_SOFT_STALL_SECONDS = 75
-MTP_STALL_TIMEOUT_SECONDS = 240
+MTP_STALL_TIMEOUT_SECONDS = 480
 
 # A file that fails this many cumulative times gets marked "skip" in the
 # manifest so future attempts stop wasting time retrying a dead file.
@@ -492,10 +502,43 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 }
 
 try {
-    $srcNs = $shell.Namespace($SourcePath)
+    # Many WPD/MTP phones only allow ONE active session at a time. A File
+    # Explorer window left open browsing the phone (very easy to do — e.g.
+    # checking on it, or it never got closed from a manual look) silently
+    # holds that session, so our own script can see the device fine but
+    # can't actually open it for copying — which looks exactly like "the
+    # computer can see it but the app can't access it". Close any such
+    # windows before we try.
+    try {
+        foreach ($win in @($shell.Windows())) {
+            try {
+                $winPath = $win.Document.Folder.Self.Path
+            } catch {
+                $winPath = $null
+            }
+            if ($winPath -and ($winPath -eq $SourcePath -or $winPath.StartsWith($SourcePath))) {
+                Beat "closing a File Explorer window open on the phone"
+                try { $win.Quit() } catch {}
+            }
+        }
+    } catch {}
+
+    # Opening the source can fail transiently right after Explorer releases
+    # it (or on a phone that's a little slow to hand over a session) — retry
+    # a few times before giving up, instead of a single try/fail per whole
+    # PowerShell process.
+    $srcNs = $null
+    for ($openTry = 1; $openTry -le 4 -and $null -eq $srcNs; $openTry++) {
+        $srcNs = $shell.Namespace($SourcePath)
+        if ($null -eq $srcNs -and $openTry -lt 4) {
+            Beat "retrying connection to phone (attempt $openTry)"
+            Start-Sleep -Milliseconds 1500
+        }
+    }
+
     if ($null -eq $srcNs) {
         $errors++
-        Write-Host "CONNECT_FAILED:Unable to open MTP source. Unlock the phone and keep File Transfer enabled."
+        Write-Host "CONNECT_FAILED:Unable to open the phone for file access. Unlock it, keep it on File Transfer/MTP mode, and close any other app or File Explorer window browsing it (only one program can access it at a time), then it will retry automatically."
     } else {
         CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
 
@@ -1108,7 +1151,9 @@ class PhoneBackupManager:
                             progress_callback(
                                 -2,
                                 f"Phone has been quiet for {int(quiet_for)}s — still "
-                                f"connected, waiting (normal between large files)…",
+                                f"connected, waiting (normal while it lists a large "
+                                f"folder, e.g. thousands of photos — can take several "
+                                f"minutes)…",
                             )
 
                     if quiet_for > MTP_STALL_TIMEOUT_SECONDS:
