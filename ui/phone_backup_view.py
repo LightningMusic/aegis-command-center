@@ -31,6 +31,7 @@ from typing import Callable, Optional
 import time
 from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -64,10 +65,11 @@ class PhoneBackupWorker(QObject):
     finished  = pyqtSignal(dict)
     failed    = pyqtSignal(str)
 
-    def __init__(self, manager: PhoneBackupManager, device: PhoneDevice) -> None:
+    def __init__(self, manager: PhoneBackupManager, device: PhoneDevice, force_verify: bool = False) -> None:
         super().__init__()
         self.manager = manager
         self.device  = device
+        self.force_verify = force_verify
         self._stop   = False
 
     def run(self) -> None:
@@ -76,6 +78,7 @@ class PhoneBackupWorker(QObject):
                 self.device,
                 progress_callback=self._emit_progress,
                 should_stop=lambda: self._stop,
+                force_verify=self.force_verify,
             )
             self.finished.emit(result)
         except Exception as exc:
@@ -254,6 +257,16 @@ class PhoneBackupView(QWidget):
         backup_btns.addStretch()
         backup_layout.addLayout(backup_btns)
 
+        self.verify_everything_chk = QCheckBox("Verify everything (ignore fast-skip — slower, but nothing is taken on trust)")
+        self.verify_everything_chk.setToolTip(
+            "Normally, if a file can't be sized or dated by the phone at all, it's "
+            "skipped on the assumption it's unchanged since the last backup. Check "
+            "this to re-check every such file against the phone instead — much "
+            "slower on a big phone, but nothing gets skipped just because it "
+            "couldn't be verified."
+        )
+        backup_layout.addWidget(self.verify_everything_chk)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Idle")
@@ -429,19 +442,23 @@ class PhoneBackupView(QWidget):
 
 
     def _start_backup(self, device: PhoneDevice) -> None:
+        force_verify = self.verify_everything_chk.isChecked()
+
         self.log_box.clear()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Starting…")
-        self.status_lbl.setText(f"Backing up {device.display_name}…")
+        verify_note = " (verifying everything — this will be slower)" if force_verify else ""
+        self.status_lbl.setText(f"Backing up {device.display_name}…{verify_note}")
         self.activity_lbl.setText("")
         self.backup_btn.setText("Stop Backup")
         self.detect_btn.setEnabled(False)
+        self.verify_everything_chk.setEnabled(False)
 
         self._backup_started_at = time.monotonic()
         self._last_activity_at = self._backup_started_at
         self.activity_timer.start()
         thread = QThread()
-        worker = PhoneBackupWorker(self.manager, device)
+        worker = PhoneBackupWorker(self.manager, device, force_verify=force_verify)
 
         self.backup_thread = thread
         self.backup_worker = worker
@@ -518,9 +535,31 @@ class PhoneBackupView(QWidget):
         lines = [
             "Preserved folder structure in latest/",
         ]
+
+        # What THIS run's last pass actually did — separate from the
+        # "confirmed on disk" total below, which reflects everything ever
+        # backed up (including earlier sessions) and can look identical
+        # whether this run copied 20,000 files or zero.
+        copied_now = copy_r.get("copied")
+        skipped_now = copy_r.get("skipped")
+        skipped_manifest_now = copy_r.get("skipped_manifest") or 0
+        if copied_now is not None:
+            lines.append(
+                f"This pass: {copied_now} copied, {skipped_now} skipped"
+                + (f" ({skipped_manifest_now} already backed up, unchanged)"
+                   if skipped_manifest_now else "")
+            )
+            if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:
+                lines.append(
+                    "  (nothing copied because everything matched what's "
+                    "already saved — check “Verify everything” above "
+                    "to re-check those files against the phone instead of "
+                    "trusting the record.)"
+                )
+
         if confirmed_files is not None:
             lines.append(
-                f"Confirmed on disk: {confirmed_files} file(s)"
+                f"Confirmed on disk (all-time total): {confirmed_files} file(s)"
                 + (f", {human_bytes(confirmed_bytes)}" if confirmed_bytes else "")
             )
 
@@ -638,6 +677,7 @@ class PhoneBackupView(QWidget):
         row = self.phone_list.currentRow()
         self.backup_btn.setEnabled(row >= 0 and bool(self.detected))
         self.detect_btn.setEnabled(True)
+        self.verify_everything_chk.setEnabled(True)
 
     def _cleanup_duplicates(self) -> None:
         device_dir = None

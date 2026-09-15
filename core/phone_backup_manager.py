@@ -170,7 +170,8 @@ param(
     [int]$TimeoutSec = 90,
     [int]$MaxFileSec = 3600,
     [string]$ManifestPath = "",
-    [string]$SkipFoldersPath = ""
+    [string]$SkipFoldersPath = "",
+    [switch]$ForceVerify
 )
 
 $ErrorActionPreference = 'Continue'
@@ -256,6 +257,22 @@ function Get-ItemSizeBestEffort($Item) {
         if ($Item.Size -and $Item.Size -gt 0) { return [int64]$Item.Size }
     } catch {}
 
+    return $null
+}
+
+function Get-ItemModifiedBestEffort($Folder, $Item) {
+    # Second signal for "has this file changed", used when Size can't tell
+    # us (the common case for this device). $Folder.GetDetailsOf($Item, 3)
+    # returns the item's modified-date column as localized display text —
+    # strip the non-ASCII bits some locales inject (e.g. RTL marks) before
+    # parsing. Returns $null if unavailable/unparsable.
+    try {
+        $dateStr = $Folder.GetDetailsOf($Item, 3)
+        if ($dateStr) {
+            $dateStr = ($dateStr -replace '[^\x20-\x7E]', '').Trim()
+            if ($dateStr) { return [datetime]::Parse($dateStr) }
+        }
+    } catch {}
     return $null
 }
 
@@ -401,16 +418,21 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
             # Consult the manifest BEFORE touching the USB/MTP layer at all.
             # Safe-by-default: only re-copy if we have POSITIVE evidence the
-            # file changed (both sizes known and they differ). If size info
-            # isn't available — which is the common case for this device's
-            # MTP provider — trust the manifest instead of re-downloading
-            # the whole phone every single run.
+            # file changed. Size is the first signal, but this device's MTP
+            # provider frequently can't report it at all — when that happens,
+            # fall back to comparing modified dates (a real, independently
+            # fetched signal) instead of immediately trusting an old record.
+            # Only when NEITHER signal is available at all do we fall back to
+            # trusting the manifest outright, and -ForceVerify turns even
+            # that off — nothing gets skipped on trust alone, so a genuinely
+            # unchanged phone still finishes fast, but nothing gets skipped
+            # just because we couldn't tell.
             if ($manifestLookup.ContainsKey($relKey)) {
                 $entry = $manifestLookup[$relKey]
                 $isPermSkip = $false
                 try { $isPermSkip = [bool]$entry.skip } catch { $isPermSkip = $false }
 
-                if ($isPermSkip) {
+                if ($isPermSkip -and -not $ForceVerify) {
                     $script:skipped++
                     Write-Host "FILE_SKIP_MANIFEST:$relKey"
                     [Console]::Out.Flush()
@@ -421,13 +443,47 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 try { $knownSize = [int64]$entry.size } catch { $knownSize = $null }
                 $liveSize = Get-ItemSizeBestEffort $item
 
-                if ($null -eq $liveSize -or $null -eq $knownSize -or $liveSize -eq $knownSize) {
+                $matches = $false
+                $checkedSomething = $false
+                if ($null -ne $liveSize -and $null -ne $knownSize) {
+                    $checkedSomething = $true
+                    $matches = ($liveSize -eq $knownSize)
+                } else {
+                    # Size couldn't settle it (one or both sides unknown) —
+                    # try modified date as an independent second signal.
+                    $knownModified = $null
+                    try { $knownModified = [datetime]$entry.modified } catch { $knownModified = $null }
+                    $liveModified = Get-ItemModifiedBestEffort $Folder $item
+
+                    if ($null -ne $knownModified -and $null -ne $liveModified) {
+                        $checkedSomething = $true
+                        # MTP date precision can be coarse — allow slack.
+                        $deltaSec = [Math]::Abs(($liveModified - $knownModified).TotalSeconds)
+                        $matches = ($deltaSec -lt 120)
+                    }
+                }
+
+                if ($checkedSomething) {
+                    if ($matches) {
+                        $script:skipped++
+                        Write-Host "FILE_SKIP_MANIFEST:$relKey"
+                        [Console]::Out.Flush()
+                        continue
+                    }
+                    # else: a real signal disagreed — fall through and re-copy.
+                } elseif (-not $ForceVerify) {
+                    # Neither size nor date could be read from the device at
+                    # all — nothing to actually check against. Trust the
+                    # manifest rather than re-downloading the whole phone
+                    # every run, unless the user explicitly asked to verify
+                    # everything regardless of cost.
                     $script:skipped++
                     Write-Host "FILE_SKIP_MANIFEST:$relKey"
                     [Console]::Out.Flush()
                     continue
                 }
-                # else: size genuinely differs on both sides — fall through and re-copy.
+                # else ($ForceVerify and nothing could be checked): fall
+                # through and re-copy rather than guess.
             }
 
             $expectedSize = Get-ItemSizeBestEffort $item
@@ -744,6 +800,7 @@ class PhoneBackupManager:
         should_stop: Optional[StopCallback] = None,
         reindex_before: bool = True,
         skip_folder_keys: Optional[set] = None,
+        force_verify: bool = False,
     ) -> Dict[str, Any]:
         """
         One incremental backup attempt for *device*.
@@ -758,6 +815,14 @@ class PhoneBackupManager:
         attempt — used by backup_phone_until_complete() to route around a
         folder that has repeatedly timed out, so one bad folder can't block
         the rest of the phone forever.
+
+        *force_verify*, if True (MTP devices only), turns off the last-resort
+        "trust the manifest" fallback that applies when this phone's MTP
+        provider can't report a file's size OR its modified date — normally
+        that ambiguous case is skipped on trust, but under force_verify it's
+        re-copied instead, so nothing is ever taken on faith. Slower, and
+        meant for exactly that: an explicit "verify everything, however long
+        it takes" request.
 
         For the full unattended/overnight experience, use
         backup_phone_until_complete() instead, which wraps this in an
@@ -809,6 +874,7 @@ class PhoneBackupManager:
                 progress_callback=progress_callback,
                 should_stop=should_stop,
                 skip_folder_keys=skip_folder_keys,
+                force_verify=force_verify,
             )
         else:
             copy_result = self._copy_drive(
@@ -873,6 +939,7 @@ class PhoneBackupManager:
         should_stop: Optional[StopCallback] = None,
         max_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
         max_total_seconds: int = DEFAULT_MAX_TOTAL_RUNTIME_SECONDS,
+        force_verify: bool = False,
     ) -> Dict[str, Any]:
         """
         Run backup_phone() in an automatic retry loop so a single call can be
@@ -881,6 +948,12 @@ class PhoneBackupManager:
         failure (the MTP source won't even open — USB drop, driver hiccup).
         Treating only the first kind as retry-worthy was the bug that made a
         genuinely-unreachable phone get reported as "Completed".
+
+        *force_verify*, if True, disables the last-resort "trust it" fallback
+        in the per-file check (see backup_phone()) for the whole run — every
+        file the manifest can't positively confirm unchanged gets re-copied
+        instead of skipped. Slower, deliberately: for when the user wants a
+        genuinely thorough pass rather than a fast one.
 
         During the wait between attempts, polls for the device every few
         seconds rather than sleeping blindly for the whole backoff window, so
@@ -914,6 +987,7 @@ class PhoneBackupManager:
                 should_stop=should_stop,
                 reindex_before=not did_full_index,
                 skip_folder_keys=skip_folder_keys or None,
+                force_verify=force_verify,
             )
             did_full_index = True
             last_result["attempt"] = attempt
@@ -1166,6 +1240,7 @@ class PhoneBackupManager:
         progress_callback: Optional[ProgressCallback],
         should_stop: Optional[StopCallback],
         skip_folder_keys: Optional[set] = None,
+        force_verify: bool = False,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "copied": 0, "skipped": 0, "skipped_manifest": 0,
@@ -1204,6 +1279,8 @@ class PhoneBackupManager:
                 "-ManifestPath", manifest_path,
                 "-SkipFoldersPath", skip_folders_path,
             ]
+            if force_verify:
+                cmd.append("-ForceVerify")
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
