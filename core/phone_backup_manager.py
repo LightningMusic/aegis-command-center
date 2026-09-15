@@ -74,8 +74,12 @@ StopCallback = Callable[[], bool]
 MTP_FILE_TIMEOUT_SECONDS = 90
 
 # Absolute ceiling for one file, even while it is still growing. Guards against
-# a genuinely wedged transfer without punishing large media files.
-MTP_FILE_MAX_SECONDS = 60 * 60
+# a genuinely wedged transfer without punishing large media files. Kept well
+# under the whole-run stall timeout so a single slow file can never itself be
+# the reason the run looks frozen for most of an hour — if it doesn't make it
+# in this window, move on to the rest of the phone; the manifest means a
+# later pass picks it back up rather than losing it.
+MTP_FILE_MAX_SECONDS = 8 * 60
 
 # The phone can go quiet for a while between bursts (folder enumeration, the
 # provider staging a large file, the screen locking briefly). Warn softly first,
@@ -349,7 +353,19 @@ function Wait-ForFile([string]$DestFile, [string]$RelKey, [int64]$ExpectedSize) 
         # for ~4.5s. Large files that are still flowing keep resetting $idleMs.
         if ($ExpectedSize -gt 0 -and $lastSize -ge $ExpectedSize) { return $true }
         if ($idleMs -ge 4500) { return $true }
-        if ($elapsed -ge $MaxFileSec) { return $true }
+        if ($elapsed -ge $MaxFileSec) {
+            # Ran out of time. If it had actually gone quiet, that's a real
+            # completion (or a stall) either way, safe to accept. But if
+            # bytes were STILL actively arriving when the ceiling hit and we
+            # don't know the true target size to confirm against, accepting
+            # it as "done" would mean trusting an arbitrarily truncated file
+            # as a good backup with no way to tell. Treat that case as a
+            # timeout instead, same as "never appeared" - the caller cleans
+            # up the partial and retries in a fresh attempt rather than
+            # recording a partial file as verified.
+            if ($idleMs -ge 1000 -or $ExpectedSize -gt 0) { return $true }
+            return $false
+        }
 
         Start-Sleep -Milliseconds 300
     }
@@ -1377,7 +1393,17 @@ class PhoneBackupManager:
                     continue
 
                 if line.startswith("PING:"):
-                    # Keep-alive from inside a blocking call. Nothing to record.
+                    # Keep-alive from inside a blocking call (folder listing,
+                    # waiting on one file). This resets the stall timer above
+                    # — the process genuinely isn't stuck — but it used to be
+                    # dropped here entirely, so the UI just sat frozen with no
+                    # way to tell "slow" from "dead" for as long as a single
+                    # file's wait allows. Surface it (throttled) so there's
+                    # always visible proof of life.
+                    now = time.monotonic()
+                    if progress_callback and (now - last_progress_emit) >= 1.0:
+                        last_progress_emit = now
+                        progress_callback(-2, line[5:])
                     continue
 
                 if line.startswith("COPY_PROGRESS:"):
