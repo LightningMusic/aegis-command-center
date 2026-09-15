@@ -187,7 +187,7 @@ $lastBeat  = Get-Date
 # FOF_NOERRORUI(1024) | FOF_RENAMEONCOLLISION(8). The rename flag is belt
 # and suspenders on top of the unique-per-attempt staging folders below: if
 # a name collision ever happens anyway, tell the shell to silently rename
-# rather than prompt, instead of relying on FOF_NOCONFIRMATION alone — which
+# rather than prompt, instead of relying on FOF_NOCONFIRMATION alone - which
 # WPD/MTP sources are known to not fully honour for the overwrite prompt.
 $copyFlags = 1564
 
@@ -211,7 +211,7 @@ if ($ManifestPath -and (Test-Path $ManifestPath)) {
 }
 
 # Folders that repeatedly timed out listing on a previous attempt within
-# this same backup_phone_until_complete() run — skip them so one folder
+# this same backup_phone_until_complete() run - skip them so one folder
 # WPD can't enumerate doesn't block the rest of the phone forever.
 $skipFolderSet = @{}
 if ($SkipFoldersPath -and (Test-Path $SkipFoldersPath)) {
@@ -229,7 +229,7 @@ if ($SkipFoldersPath -and (Test-Path $SkipFoldersPath)) {
 }
 
 # All CopyHere() calls land in a fresh, guaranteed-empty staging folder on the
-# SAME drive as the destination — never directly in the real destination tree.
+# SAME drive as the destination - never directly in the real destination tree.
 # This is what actually prevents the "There is already a file with this name"
 # conflict dialog that Explorer's WPD/MTP copy engine can pop up even with
 # FOF_NOCONFIRMATION (a long-standing quirk: that flag isn't fully honoured
@@ -243,10 +243,10 @@ $stageNs = $shell.Namespace($runStageDir)
 
 function Get-ItemSizeBestEffort($Item) {
     # WPD/MTP shell namespace extensions are notoriously inconsistent about
-    # exposing .Size — for many Android phones it's always $null. Try the
+    # exposing .Size - for many Android phones it's always $null. Try the
     # extended-property path first (goes through IPropertyStore, which MTP
     # providers implement far more reliably than the legacy .Size getter),
-    # then fall back to .Size. Returns $null if genuinely unavailable —
+    # then fall back to .Size. Returns $null if genuinely unavailable -
     # callers must treat that as "unknown", never as "changed".
     try {
         $extSize = $Item.ExtendedProperty("System.Size")
@@ -263,7 +263,7 @@ function Get-ItemSizeBestEffort($Item) {
 function Get-ItemModifiedBestEffort($Folder, $Item) {
     # Second signal for "has this file changed", used when Size can't tell
     # us (the common case for this device). $Folder.GetDetailsOf($Item, 3)
-    # returns the item's modified-date column as localized display text —
+    # returns the item's modified-date column as localized display text -
     # strip the non-ASCII bits some locales inject (e.g. RTL marks) before
     # parsing. Returns $null if unavailable/unparsable.
     try {
@@ -293,7 +293,7 @@ function Heartbeat {
 }
 
 function Beat([string]$Msg) {
-    # Unconditional keep-alive with a note — used around calls that can block
+    # Unconditional keep-alive with a note - used around calls that can block
     # (folder enumeration, waiting on a large file) so the host never mistakes
     # a slow-but-alive transfer for a disconnected phone.
     Write-Host "PING:$Msg"
@@ -310,7 +310,7 @@ function EnsureFolder([string]$Path) {
 
 function Wait-ForFile([string]$DestFile, [string]$RelKey, [int64]$ExpectedSize) {
     # Wait for CopyHere to materialise $DestFile. Once it appears, keep waiting
-    # as long as it is still growing — only give up if it is genuinely stuck
+    # as long as it is still growing - only give up if it is genuinely stuck
     # (no size change for a while) or the absolute ceiling is hit. Emits a
     # progress line on every size change so the host's stall timer resets.
     $started   = Get-Date
@@ -365,7 +365,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
         }
 
         if ($RelLabel -and $skipFolderSet.ContainsKey($RelLabel)) {
-            Write-Host "FOLDER_SKIP:$($Label) (skipped — timed out repeatedly on a previous attempt)"
+            Write-Host "FOLDER_SKIP:$($Label) (skipped - timed out repeatedly on a previous attempt)"
             [Console]::Out.Flush()
             return
         }
@@ -419,12 +419,12 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             # Consult the manifest BEFORE touching the USB/MTP layer at all.
             # Safe-by-default: only re-copy if we have POSITIVE evidence the
             # file changed. Size is the first signal, but this device's MTP
-            # provider frequently can't report it at all — when that happens,
+            # provider frequently can't report it at all - when that happens,
             # fall back to comparing modified dates (a real, independently
             # fetched signal) instead of immediately trusting an old record.
             # Only when NEITHER signal is available at all do we fall back to
             # trusting the manifest outright, and -ForceVerify turns even
-            # that off — nothing gets skipped on trust alone, so a genuinely
+            # that off - nothing gets skipped on trust alone, so a genuinely
             # unchanged phone still finishes fast, but nothing gets skipped
             # just because we couldn't tell.
             if ($manifestLookup.ContainsKey($relKey)) {
@@ -449,7 +449,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                     $checkedSomething = $true
                     $matches = ($liveSize -eq $knownSize)
                 } else {
-                    # Size couldn't settle it (one or both sides unknown) —
+                    # Size couldn't settle it (one or both sides unknown) -
                     # try modified date as an independent second signal.
                     $knownModified = $null
                     try { $knownModified = [datetime]$entry.modified } catch { $knownModified = $null }
@@ -457,7 +457,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
                     if ($null -ne $knownModified -and $null -ne $liveModified) {
                         $checkedSomething = $true
-                        # MTP date precision can be coarse — allow slack.
+                        # MTP date precision can be coarse - allow slack.
                         $deltaSec = [Math]::Abs(($liveModified - $knownModified).TotalSeconds)
                         $matches = ($deltaSec -lt 120)
                     }
@@ -470,10 +470,10 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                         [Console]::Out.Flush()
                         continue
                     }
-                    # else: a real signal disagreed — fall through and re-copy.
+                    # else: a real signal disagreed - fall through and re-copy.
                 } elseif (-not $ForceVerify) {
                     # Neither size nor date could be read from the device at
-                    # all — nothing to actually check against. Trust the
+                    # all - nothing to actually check against. Trust the
                     # manifest rather than re-downloading the whole phone
                     # every run, unless the user explicitly asked to verify
                     # everything regardless of cost.
@@ -506,15 +506,15 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
             $copyOk = $false
             for ($try = 1; $try -le 3 -and -not $copyOk; $try++) {
-                # CopyHere() is fire-and-forget — it can still be finishing
+                # CopyHere() is fire-and-forget - it can still be finishing
                 # asynchronously in the background well after Wait-ForFile
                 # gives up on it. Reusing one staging path across retries
                 # meant a late-arriving first attempt and a fresh retry could
-                # both land on the SAME name at the SAME time — a collision
+                # both land on the SAME name at the SAME time - a collision
                 # of our own making, which is exactly the "already exists"
                 # dialog this was supposed to prevent. Every attempt now gets
-                # its own throwaway folder, so two overlapping copies —
-                # however they're timed — can never touch the same path.
+                # its own throwaway folder, so two overlapping copies -
+                # however they're timed - can never touch the same path.
                 $attemptStageDir = Join-Path $runStageDir ([guid]::NewGuid().ToString("N"))
                 $stagedFile = $null
                 try {
@@ -540,14 +540,14 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                         continue
                     }
                     if ($expectedSize -gt 0 -and $finalSize -lt $expectedSize) {
-                        # Truncated transfer — drop it so it isn't recorded as good.
+                        # Truncated transfer - drop it so it isn't recorded as good.
                         try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                         Beat "retrying $relKey (short: $finalSize/$expectedSize)"
                         Start-Sleep -Milliseconds 1000
                         continue
                     }
 
-                    # Staged copy is verified good — move it into the real
+                    # Staged copy is verified good - move it into the real
                     # destination. Same drive, so this is an instant rename,
                     # never a shell operation, never a dialog.
                     try {
@@ -565,13 +565,13 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 } else {
                     # Never appeared within the appear-timeout. Leave this
                     # attempt's folder for the final cleanup rather than
-                    # deleting it here — if CopyHere really is still working
+                    # deleting it here - if CopyHere really is still working
                     # in the background, ripping the folder out from under it
                     # is exactly the kind of thing that can throw its own
                     # shell error. It's harmless clutter either way; the
                     # per-run stage dir gets wiped wholesale at the end.
                     # A file that produces nothing at all rarely recovers
-                    # within the same run — one extra attempt, then leave it
+                    # within the same run - one extra attempt, then leave it
                     # for the whole-backup retry so we don't burn minutes per
                     # dead file.
                     if ($try -ge 2) { break }
@@ -608,10 +608,10 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
 try {
     # Many WPD/MTP phones only allow ONE active session at a time. A File
-    # Explorer window left open browsing the phone (very easy to do — e.g.
+    # Explorer window left open browsing the phone (very easy to do - e.g.
     # checking on it, or it never got closed from a manual look) silently
     # holds that session, so our own script can see the device fine but
-    # can't actually open it for copying — which looks exactly like "the
+    # can't actually open it for copying - which looks exactly like "the
     # computer can see it but the app can't access it". Close any such
     # windows before we try.
     try {
@@ -629,7 +629,7 @@ try {
     } catch {}
 
     # Opening the source can fail transiently right after Explorer releases
-    # it (or on a phone that's a little slow to hand over a session) — retry
+    # it (or on a phone that's a little slow to hand over a session) - retry
     # a few times before giving up, instead of a single try/fail per whole
     # PowerShell process.
     $srcNs = $null
@@ -648,7 +648,7 @@ try {
         CopyMTPFolderObject $srcNs $SourcePath "" $DestPath
 
         if ($script:copied -eq 0 -and $script:skipped -eq 0 -and ($script:visited -le 2 -or $script:errors -gt 0)) {
-            # Opened the source but nothing came back — phone locked/half-mounted or
+            # Opened the source but nothing came back - phone locked/half-mounted or
             # the top of the tree wouldn't enumerate. Worth an automatic retry
             # rather than a false "complete".
             Write-Host "CONNECT_FAILED:Could not read any files from the phone. Unlock it and keep the USB mode on File Transfer / MTP."
@@ -1987,9 +1987,20 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
 
 
 def _write_temp_script(body: str) -> str:
-    """Write *body* to a temp .ps1 file and return its path."""
+    """
+    Write *body* to a temp .ps1 file and return its path.
+
+    Must be UTF-8 WITH a BOM ("utf-8-sig"). Windows PowerShell 5.1 (the
+    classic powershell.exe these scripts run under) only recognizes a script
+    file as UTF-8 if it starts with a BOM — without one, it reads the file
+    under the system ANSI codepage instead, silently mangling any non-ASCII
+    byte. A single such character anywhere in the script — even inside a
+    plain comment — can corrupt the whole parse and make the file fail to
+    run at all, with no output the caller can distinguish from "the phone
+    had nothing to back up".
+    """
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+        mode="w", suffix=".ps1", delete=False, encoding="utf-8-sig"
     ) as f:
         f.write(body)
         return f.name
