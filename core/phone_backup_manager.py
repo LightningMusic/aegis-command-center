@@ -164,6 +164,7 @@ else { $out | ConvertTo-Json -Compress -Depth 2 }
 #   FOLDER_ENTER:<shell_path>
 #   FENTER_KEY:<relkey>                    (machine-readable companion to FOLDER_ENTER)
 #   FOLDER_SKIP:<shell_path>
+#   FOLDER_SIG:<relkey>:<count>:<hash>     (folder's contents fingerprint, for next run's fast-skip)
 #   STATS:<copied>:<skipped>:<errors>      (heartbeat, every ~5s)
 #   ERR:<shell_path>:<message>             (folder/source-level, not file-specific)
 #   DONE:<copied>:<skipped>:<errors>
@@ -175,6 +176,7 @@ param(
     [int]$MaxFileSec = 3600,
     [string]$ManifestPath = "",
     [string]$SkipFoldersPath = "",
+    [string]$FolderSigPath = "",
     [switch]$ForceVerify
 )
 
@@ -230,6 +232,76 @@ if ($SkipFoldersPath -and (Test-Path $SkipFoldersPath)) {
     } catch {
         $skipFolderSet = @{}
     }
+}
+
+# Per-folder fingerprint from the last run that saw it: total item count +
+# a hash of every item's name. If a folder's current listing matches its
+# cached fingerprint exactly, nothing was added, removed, or renamed in it
+# since last time, so the expensive per-file Size/Date lookups below can be
+# skipped entirely for files already confirmed in the manifest -- that COM
+# round-trip per file is the real cost on a big unchanged folder, not the
+# listing itself. Accepted tradeoff: a file replaced by a same-named,
+# same-count substitute would be missed until a "Verify everything" pass.
+#
+# The phone's root folder has relKey "" (empty string). ConvertFrom-Json on
+# this PowerShell version throws on a JSON object with an empty-string
+# property name ("only supported using -AsHashTable", which this version
+# doesn't have) -- so "" can never appear as an actual key in the JSON this
+# reads or writes. A non-empty sentinel stands in for the root everywhere a
+# folder-signature key is looked up or emitted.
+$ROOT_SIG_KEY = "__ROOT__"
+$folderSigLookup = @{}
+if ($FolderSigPath -and (Test-Path $FolderSigPath)) {
+    try {
+        $raw = Get-Content $FolderSigPath -Raw -ErrorAction Stop
+        if ($raw) {
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed) {
+                foreach ($prop in $parsed.PSObject.Properties) {
+                    $folderSigLookup[$prop.Name] = $prop.Value
+                }
+            }
+        }
+    } catch {
+        $folderSigLookup = @{}
+    }
+}
+
+function Get-FolderSignature([string[]]$Names) {
+    # Deterministic across separate process launches (unlike .GetHashCode(),
+    # which .NET randomizes per-process for strings) so it's comparable
+    # between this run and a cached value written by a previous one.
+    $sorted = ($Names | Sort-Object) -join "`n"
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($sorted)
+    $hashBytes = $md5.ComputeHash($bytes)
+    return [System.BitConverter]::ToString($hashBytes).Replace('-', '')
+}
+
+# Folders likely to receive new content (camera roll, screenshots,
+# downloads, messaging media) are visited before everything else at each
+# level of the tree, so newly added files get backed up early in a run
+# instead of waiting behind folders that rarely change. Purely an ordering
+# change -- never skips anything, never changes what gets backed up.
+$PRIORITY_FOLDER_PATTERNS = @(
+    'camera', 'dcim', 'screenshot', 'download', 'whatsapp images',
+    'whatsapp video', 'whatsapp', 'pictures', 'movies', 'video', 'recent'
+)
+
+function Get-PriorityOrderedItems($ItemList) {
+    $priority = @()
+    $rest = @()
+    foreach ($it in $ItemList) {
+        $isPriority = $false
+        if ($it.IsFolder) {
+            $nameLower = $it.Name.ToLower()
+            foreach ($pat in $PRIORITY_FOLDER_PATTERNS) {
+                if ($nameLower -like "*$pat*") { $isPriority = $true; break }
+            }
+        }
+        if ($isPriority) { $priority += $it } else { $rest += $it }
+    }
+    return @($priority) + @($rest)
 }
 
 # All CopyHere() calls land in a fresh, guaranteed-empty staging folder on the
@@ -409,7 +481,22 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
         }
         Beat "$Label has $($itemList.Count) entries"
 
-        foreach ($item in $itemList) {
+        $currentCount = $itemList.Count
+        $currentSig = Get-FolderSignature (@($itemList | ForEach-Object { $_.Name }))
+        $sigKey = if ($RelLabel) { $RelLabel } else { $ROOT_SIG_KEY }
+        $folderUnchanged = $false
+        if (-not $ForceVerify -and $folderSigLookup.ContainsKey($sigKey)) {
+            $cached = $folderSigLookup[$sigKey]
+            $cachedCount = $null
+            try { $cachedCount = [int]$cached.count } catch { $cachedCount = $null }
+            $cachedSig = $null
+            try { $cachedSig = [string]$cached.sig } catch { $cachedSig = $null }
+            if ($null -ne $cachedCount -and $cachedCount -eq $currentCount -and $cachedSig -eq $currentSig) {
+                $folderUnchanged = $true
+            }
+        }
+
+        foreach ($item in (Get-PriorityOrderedItems $itemList)) {
             Heartbeat
             $safeName = $item.Name -replace '[\\/:*?"<>|]', '_'
             $relKey = if ($RelLabel) { "$RelLabel\$safeName" } else { $safeName }
@@ -429,6 +516,19 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                     continue
                 }
                 CopyMTPFolderObject $childFolder "$Label\$safeName" $relKey (Join-Path $Dst $safeName)
+                continue
+            }
+
+            # Fast path: this folder's whole contents (names + count) match
+            # exactly what was here last time we looked, so nothing in it
+            # was added, removed, or renamed. Skip the per-file Size/Date
+            # COM round-trips entirely for anything already confirmed backed
+            # up - that per-file cost is what actually makes re-walking a
+            # big unchanged folder slow, not the listing itself.
+            if ($folderUnchanged -and $manifestLookup.ContainsKey($relKey)) {
+                $script:skipped++
+                Write-Host "FILE_SKIP_MANIFEST:$relKey"
+                [Console]::Out.Flush()
                 continue
             }
 
@@ -615,6 +715,9 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             }
             [Console]::Out.Flush()
         }
+
+        Write-Host "FOLDER_SIG:$($sigKey):$($currentCount):$($currentSig)"
+        [Console]::Out.Flush()
     } catch {
         $script:errors++
         Write-Host "ERR:$($Label):$_"
@@ -891,6 +994,7 @@ class PhoneBackupManager:
                 should_stop=should_stop,
                 skip_folder_keys=skip_folder_keys,
                 force_verify=force_verify,
+                folder_sig_lookup=manifest.get("folder_sigs"),
             )
         else:
             copy_result = self._copy_drive(
@@ -908,6 +1012,11 @@ class PhoneBackupManager:
             result["stalled"] = True
         if copy_result.get("connection_failed"):
             result["connection_failed"] = True
+        if copy_result.get("folder_sigs"):
+            # Cache each folder's just-seen fingerprint (item count + name
+            # hash) so the next attempt can skip re-checking every file in
+            # any folder that hasn't changed at all since this pass.
+            manifest.setdefault("folder_sigs", {}).update(copy_result["folder_sigs"])
 
         self._record_failures(manifest, copy_result.get("failed_keys", []))
 
@@ -1257,11 +1366,13 @@ class PhoneBackupManager:
         should_stop: Optional[StopCallback],
         skip_folder_keys: Optional[set] = None,
         force_verify: bool = False,
+        folder_sig_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "copied": 0, "skipped": 0, "skipped_manifest": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
+            "folder_sigs": {},
         }
 
         if os.name != "nt":
@@ -1276,6 +1387,7 @@ class PhoneBackupManager:
 
         manifest_path = _write_temp_manifest_lookup(manifest_lookup)
         skip_folders_path = _write_temp_skip_folders(skip_folder_keys or set())
+        folder_sig_path = _write_temp_manifest_lookup(folder_sig_lookup or {})
         ps_path = _write_temp_script(_PS_COPY_MTP)
         # Which folder we most recently entered, and how many files had been
         # copied cumulatively at that moment — lets us tell, if this attempt
@@ -1294,6 +1406,7 @@ class PhoneBackupManager:
                 "-MaxFileSec", str(MTP_FILE_MAX_SECONDS),
                 "-ManifestPath", manifest_path,
                 "-SkipFoldersPath", skip_folders_path,
+                "-FolderSigPath", folder_sig_path,
             ]
             if force_verify:
                 cmd.append("-ForceVerify")
@@ -1457,6 +1570,14 @@ class PhoneBackupManager:
                     if progress_callback:
                         progress_callback(-1, f"Skipping restricted folder: {folder}")
 
+                elif line.startswith("FOLDER_SIG:"):
+                    body = line[11:]
+                    try:
+                        relkey, count_str, sig = body.rsplit(":", 2)
+                        result["folder_sigs"][relkey] = {"count": int(count_str), "sig": sig}
+                    except ValueError:
+                        pass
+
                 elif line.startswith("STATS:"):
                     parts = line[6:].split(":")
                     if len(parts) >= 3:
@@ -1499,6 +1620,10 @@ class PhoneBackupManager:
                 pass
             try:
                 os.unlink(skip_folders_path)
+            except OSError:
+                pass
+            try:
+                os.unlink(folder_sig_path)
             except OSError:
                 pass
 
