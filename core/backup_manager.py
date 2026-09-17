@@ -53,9 +53,9 @@ class BackupManager:
 
     def get_saved_destinations(self) -> List[str]:
         settings = self.config_manager.get_backup_settings()
-        saved = settings.get("saved_destinations", [])
+        saved: List[str] = settings.get("saved_destinations", [])
         normalized: List[str] = []
-        seen = set()
+        seen: set[str] = set()
         for item in saved:
             resolved = self.resolve_destination(item)
             if not resolved:
@@ -73,9 +73,9 @@ class BackupManager:
             raise RuntimeError("Choose a destination path first.")
 
         current = self.config_manager.get_backup_settings()
-        saved = current.get("saved_destinations", [])
+        saved: List[str] = current.get("saved_destinations", [])
         normalized: List[str] = []
-        seen = set()
+        seen: set[str] = set()
         for item in [resolved, *saved]:
             normalized_item = self.resolve_destination(item)
             if not normalized_item:
@@ -120,9 +120,9 @@ class BackupManager:
 
     def get_destination_choices(self) -> List[str]:
         saved = self.get_saved_destinations()
-        auto = [item["root"] for item in self.get_destination_candidates()]
+        auto: List[str] = [item["root"] for item in self.get_destination_candidates()]
         choices: List[str] = []
-        seen = set()
+        seen: set[str] = set()
         for item in [*saved, *auto]:
             resolved = self.resolve_destination(item)
             if not resolved:
@@ -326,7 +326,7 @@ class BackupManager:
         if not backup_root.exists():
             return []
 
-        folders = []
+        folders: List[str] = []
         for child in backup_root.iterdir():
             if child.is_dir():
                 folders.append(child.name)
@@ -349,7 +349,7 @@ class BackupManager:
         if not backup_root.exists():
             return []
 
-        devices = []
+        devices: List[Dict[str, Any]] = []
         for device_folder in sorted(backup_root.iterdir()):
             if not device_folder.is_dir():
                 continue
