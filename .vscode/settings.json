@@ -2,5 +2,24 @@
   "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
   "python.analysis.extraPaths": [
     "${workspaceFolder}"
-  ]
+  ],
+
+  // "standard" is Pylance's default: it still catches the errors that matter
+  // (undefined names, bad attributes, wrong argument counts, incompatible
+  // types) but drops the "type is partially unknown" family that strict mode
+  // emits. Those are unwinnable in this project — PyQt6's stubs are
+  // incomplete in places, and the config/manifest/drive data here is
+  // dict-shaped by design, so it surfaces as Any no matter how much of our
+  // own code is annotated. Workspace-scoped, so a stricter user-level
+  // setting still applies to other projects.
+  "python.analysis.typeCheckingMode": "standard",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportUnknownVariableType": "none",
+    "reportUnknownMemberType": "none",
+    "reportUnknownParameterType": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownLambdaType": "none",
+    "reportMissingParameterType": "none",
+    "reportMissingTypeStubs": "none"
+  }
 }
