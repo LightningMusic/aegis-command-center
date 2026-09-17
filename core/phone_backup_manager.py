@@ -157,8 +157,10 @@ else { $out | ConvertTo-Json -Compress -Depth 2 }
 #
 # Output protocol:
 #   FILE_OK:<local_dest_path>
+#   FILE_OK_UNSIZED:<local_dest_path>      (copied, but the phone never reported a size to verify against)
 #   FILE_SKIP:<filename>                  (already in latest/ this run)
 #   FILE_SKIP_MANIFEST:<relkey>            (manifest says unchanged/permanently-skip)
+#   FILE_SKIP_ELSEWHERE:<relkey>           (same name+size already confirmed backed up under a different path)
 #   FILE_TIMEOUT:<relkey>
 #   FILE_ERR:<relkey>:<message>
 #   FOLDER_ENTER:<shell_path>
@@ -177,6 +179,7 @@ param(
     [string]$ManifestPath = "",
     [string]$SkipFoldersPath = "",
     [string]$FolderSigPath = "",
+    [string]$NameSizeIndexPath = "",
     [switch]$ForceVerify
 )
 
@@ -264,6 +267,27 @@ if ($FolderSigPath -and (Test-Path $FolderSigPath)) {
         }
     } catch {
         $folderSigLookup = @{}
+    }
+}
+
+# "<lowercase filename>|<size>" -> 1, for every file already confirmed
+# backed up anywhere on the phone (any folder). Lets a file the phone has
+# moved to a different folder since the last run be recognized as already
+# covered instead of re-transferred.
+$nameSizeIndex = @{}
+if ($NameSizeIndexPath -and (Test-Path $NameSizeIndexPath)) {
+    try {
+        $raw = Get-Content $NameSizeIndexPath -Raw -ErrorAction Stop
+        if ($raw) {
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed) {
+                foreach ($prop in $parsed.PSObject.Properties) {
+                    $nameSizeIndex[$prop.Name] = $true
+                }
+            }
+        }
+    } catch {
+        $nameSizeIndex = @{}
     }
 }
 
@@ -602,8 +626,27 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 # through and re-copy rather than guess.
             }
 
+            $ownPathKnown = $manifestLookup.ContainsKey($relKey)
+
             $expectedSize = Get-ItemSizeBestEffort $item
             if ($null -eq $expectedSize) { $expectedSize = 0 }
+
+            if (-not $ownPathKnown -and -not $ForceVerify -and $expectedSize -gt 0) {
+                # Never seen at this exact path before -- but if a file with
+                # the same name AND size is already confirmed backed up
+                # somewhere else on the phone, this is almost certainly that
+                # same file after Android moved/reorganized it (WhatsApp
+                # media folders do this often). Trust it at the same level
+                # the rest of this manifest already does, instead of paying
+                # to re-transfer content that's already safely backed up.
+                $xrefKey = "$($item.Name.ToLower())|$expectedSize"
+                if ($nameSizeIndex.ContainsKey($xrefKey)) {
+                    $script:skipped++
+                    Write-Host "FILE_SKIP_ELSEWHERE:$relKey"
+                    [Console]::Out.Flush()
+                    continue
+                }
+            }
 
             $destFile = Join-Path $Dst $safeName
             if (Test-Path $destFile) {
@@ -708,7 +751,15 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 } catch {}
 
                 $script:copied++
-                Write-Host "FILE_OK:$destFile"
+                if ($expectedSize -gt 0) {
+                    Write-Host "FILE_OK:$destFile"
+                } else {
+                    # The phone never reported a size for this file, so
+                    # reaching "expected size" was never something we could
+                    # actually check -- flag it for a real local integrity
+                    # check once the transfer's done.
+                    Write-Host "FILE_OK_UNSIZED:$destFile"
+                }
             } else {
                 $script:errors++
                 Write-Host "FILE_ERR:$($relKey):transfer failed after 3 attempts"
@@ -995,6 +1046,7 @@ class PhoneBackupManager:
                 skip_folder_keys=skip_folder_keys,
                 force_verify=force_verify,
                 folder_sig_lookup=manifest.get("folder_sigs"),
+                name_size_index=self._build_name_size_index(manifest),
             )
         else:
             copy_result = self._copy_drive(
@@ -1269,6 +1321,28 @@ class PhoneBackupManager:
                 lookup[relkey] = {"size": entry.get("size", 0), "skip": False}
         return lookup
 
+    def _build_name_size_index(self, manifest: Dict[str, Any]) -> Dict[str, int]:
+        """
+        {"<lowercase filename>|<size>": 1} for every confirmed-ok file,
+        regardless of which folder it's in. Lets the copy script recognize a
+        file the phone has moved to a different folder (e.g. Android
+        reorganizing WhatsApp media) as already backed up, instead of
+        re-transferring content that's already been confirmed good — matched
+        by name+size only, the same trust level the rest of this manifest
+        already relies on, just applied across the whole phone instead of
+        one exact path.
+        """
+        index: Dict[str, int] = {}
+        for relkey, entry in manifest.get("files", {}).items():
+            if entry.get("status") != "ok":
+                continue
+            size = entry.get("size") or 0
+            if not size:
+                continue
+            name = relkey.rsplit("\\", 1)[-1].lower()
+            index[f"{name}|{size}"] = 1
+        return index
+
     def _record_failures(self, manifest: Dict[str, Any], failed_keys: List[str]) -> None:
         files = manifest.setdefault("files", {})
         for relkey in failed_keys:
@@ -1367,9 +1441,10 @@ class PhoneBackupManager:
         skip_folder_keys: Optional[set] = None,
         force_verify: bool = False,
         folder_sig_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+        name_size_index: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
-            "copied": 0, "skipped": 0, "skipped_manifest": 0,
+            "copied": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
             "folder_sigs": {},
@@ -1388,7 +1463,9 @@ class PhoneBackupManager:
         manifest_path = _write_temp_manifest_lookup(manifest_lookup)
         skip_folders_path = _write_temp_skip_folders(skip_folder_keys or set())
         folder_sig_path = _write_temp_manifest_lookup(folder_sig_lookup or {})
+        name_size_path = _write_temp_manifest_lookup(name_size_index or {})
         ps_path = _write_temp_script(_PS_COPY_MTP)
+        unverified_size_paths: List[str] = []
         # Which folder we most recently entered, and how many files had been
         # copied cumulatively at that moment — lets us tell, if this attempt
         # stalls, whether the folder we were listing made zero progress (i.e.
@@ -1407,6 +1484,7 @@ class PhoneBackupManager:
                 "-ManifestPath", manifest_path,
                 "-SkipFoldersPath", skip_folders_path,
                 "-FolderSigPath", folder_sig_path,
+                "-NameSizeIndexPath", name_size_path,
             ]
             if force_verify:
                 cmd.append("-ForceVerify")
@@ -1538,9 +1616,28 @@ class PhoneBackupManager:
                     if progress_callback:
                         progress_callback(-1, f"Copied: {fname}")
 
+                elif line.startswith("FILE_OK_UNSIZED:"):
+                    # Copied, but the phone never reported a size for this
+                    # file, so "it reached the expected byte count" was never
+                    # a check we could actually make — the only sign of
+                    # success was "the bytes stopped flowing". Queue it for a
+                    # real local integrity check once the transfer is done.
+                    path = line[17:]
+                    result["copied"] += 1
+                    unverified_size_paths.append(path)
+                    if progress_callback:
+                        progress_callback(-1, f"Copied: {Path(path).name}")
+
                 elif line.startswith("FILE_SKIP_MANIFEST:"):
                     result["skipped"] += 1
                     result["skipped_manifest"] += 1
+
+                elif line.startswith("FILE_SKIP_ELSEWHERE:"):
+                    # Never seen at this exact path before, but a file with
+                    # the same name+size is already confirmed backed up
+                    # somewhere else on the phone (Android reorganized it).
+                    result["skipped"] += 1
+                    result["skipped_elsewhere"] += 1
 
                 elif line.startswith("FILE_SKIP:"):
                     result["skipped"] += 1
@@ -1626,8 +1723,73 @@ class PhoneBackupManager:
                 os.unlink(folder_sig_path)
             except OSError:
                 pass
+            try:
+                os.unlink(name_size_path)
+            except OSError:
+                pass
+
+        if unverified_size_paths:
+            self._verify_unsized_copies(unverified_size_paths, dest, result, progress_callback)
 
         return result
+
+    def _verify_unsized_copies(
+        self,
+        paths: List[str],
+        dest: str,
+        result: Dict[str, Any],
+        progress_callback: Optional[ProgressCallback],
+    ) -> None:
+        """
+        Local, post-copy safety net for files the phone never reported a size
+        for — the only evidence of a good transfer for those was "the bytes
+        stopped flowing for a few seconds", which isn't real proof of an
+        intact file. Runs entirely against the local copy (no MTP involved,
+        so it's fast) using the same integrity checker the rest of the app
+        already relies on. A file that fails gets deleted rather than left in
+        place looking "confirmed" — the next attempt then sees it's simply
+        missing and re-copies it for real, the same recovery path already
+        used for any other copy failure.
+        """
+        from core.integrity import verify_deep, verify_readable
+
+        total = len(paths)
+        bad: List[tuple] = []
+        for i, path in enumerate(paths):
+            if progress_callback and (i % 5 == 0 or i == total - 1):
+                progress_callback(
+                    -2,
+                    f"Verifying transferred file {i + 1}/{total} "
+                    f"(phone couldn't report its size)…",
+                )
+            status, detail, _sha = verify_readable(path)
+            if status == "ok":
+                deep_status, deep_detail = verify_deep(path)
+                if deep_status not in ("ok", "unverified", "skipped"):
+                    bad.append((path, f"{deep_status}: {deep_detail}"))
+            else:
+                bad.append((path, f"{status}: {detail}"))
+
+        if not bad:
+            return
+
+        result["copied"] = max(0, result.get("copied", 0) - len(bad))
+        result["integrity_failed"] = [p for p, _ in bad]
+        for path, reason in bad[:20]:
+            result["errors"].append(
+                f"Copied but failed a local integrity check ({reason}) — "
+                f"deleted so it's re-copied properly next run: {Path(path).name}"
+            )
+        for path, _reason in bad:
+            try:
+                relkey = os.path.relpath(path, dest)
+                result["failed_keys"].append(relkey)
+            except ValueError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _copy_drive(
         self,
