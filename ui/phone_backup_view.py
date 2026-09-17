@@ -311,25 +311,38 @@ class DeviceBackupPanel(QFrame):
             self.progress_bar.setFormat("Complete ✓")
             self.finished_ok = True
 
-        copy_r = result.get("copy_result") or {}
+        # Totals for the whole run. A run that copies hundreds of files and
+        # then loses the phone ends on a failed reconnect attempt, and
+        # reporting THAT attempt's numbers made a successful transfer read as
+        # "0 copied, 0 skipped" — as if nothing had happened. Fall back to the
+        # last attempt only for results that predate run_totals.
+        totals = result.get("run_totals") or result.get("copy_result") or {}
         manifest_summary = result.get("manifest_summary") or {}
+        attempts_used = result.get("attempts_used") or 1
 
         confirmed_files = manifest_summary.get("confirmed_files")
         confirmed_bytes = manifest_summary.get("confirmed_bytes")
         lines = ["Preserved folder structure in latest/"]
 
-        copied_now = copy_r.get("copied")
-        skipped_now = copy_r.get("skipped")
-        skipped_manifest_now = copy_r.get("skipped_manifest") or 0
-        skipped_elsewhere_now = copy_r.get("skipped_elsewhere") or 0
+        copied_now = totals.get("copied")
+        skipped_now = totals.get("skipped")
+        skipped_manifest_now = totals.get("skipped_manifest") or 0
+        skipped_elsewhere_now = totals.get("skipped_elsewhere") or 0
         if copied_now is not None:
             extra_bits = []
             if skipped_manifest_now:
                 extra_bits.append(f"{skipped_manifest_now} already backed up, unchanged")
             if skipped_elsewhere_now:
                 extra_bits.append(f"{skipped_elsewhere_now} found already backed up under a different folder")
+            skipped_partial_now = totals.get("skipped_partial") or 0
+            if skipped_partial_now:
+                extra_bits.append(f"{skipped_partial_now} half-finished downloads")
+            scope = (
+                f"This run (across {attempts_used} attempts)"
+                if attempts_used > 1 else "This run"
+            )
             lines.append(
-                f"This pass: {copied_now} copied, {skipped_now} skipped"
+                f"{scope}: {copied_now} copied, {skipped_now} skipped"
                 + (f" ({', '.join(extra_bits)})" if extra_bits else "")
             )
             if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:

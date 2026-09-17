@@ -161,6 +161,7 @@ else { $out | ConvertTo-Json -Compress -Depth 2 }
 #   FILE_SKIP:<filename>                  (already in latest/ this run)
 #   FILE_SKIP_MANIFEST:<relkey>            (manifest says unchanged/permanently-skip)
 #   FILE_SKIP_ELSEWHERE:<relkey>           (same name+size already confirmed backed up under a different path)
+#   FILE_SKIP_PARTIAL:<relkey>             (half-finished download, e.g. .crdownload/.part)
 #   FILE_TIMEOUT:<relkey>
 #   FILE_ERR:<relkey>:<message>
 #   FOLDER_ENTER:<shell_path>
@@ -201,6 +202,21 @@ $lastBeat  = Get-Date
 $copyFlags = 1564
 
 $ALWAYS_SKIP = @('.thumbnails', '.trashed', '.cache', '.thumbcache', 'lost.dir')
+
+# Half-finished downloads: the bytes are incomplete by definition, and the
+# browser/torrent client will rename them when (if) they finish, so backing
+# them up stores a broken file under a name that will never be used again.
+# Deliberately NOT filtering ".trashed-" files: those are real files Android
+# has only soft-deleted, and having them in the backup is the point.
+$PARTIAL_DOWNLOAD_EXTS = @('.crdownload', '.part', '.partial', '.download', '.aria2', '.!ut', '.opdownload')
+
+function IsPartialDownload([string]$Name) {
+    $lower = $Name.ToLower()
+    foreach ($ext in $PARTIAL_DOWNLOAD_EXTS) {
+        if ($lower.EndsWith($ext)) { return $true }
+    }
+    return $false
+}
 
 $manifestLookup = @{}
 if ($ManifestPath -and (Test-Path $ManifestPath)) {
@@ -567,6 +583,13 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                     continue
                 }
                 CopyMTPFolderObject $childFolder "$Label\$safeName" $relKey (Join-Path $Dst $safeName)
+                continue
+            }
+
+            if (IsPartialDownload $itemName) {
+                $script:skipped++
+                Write-Host "FILE_SKIP_PARTIAL:$relKey"
+                [Console]::Out.Flush()
                 continue
             }
 
@@ -1200,6 +1223,15 @@ class PhoneBackupManager:
         stuck_folder_key: Optional[str] = None
         stuck_folder_repeats = 0
 
+        # Totals for the WHOLE run, not just the final attempt. Without this,
+        # a run that copies 236 files and then loses the phone reports the
+        # last attempt's numbers — "0 copied, 0 skipped" — which reads as
+        # "it did nothing" when in fact the work was done and saved.
+        run_totals: Dict[str, int] = {
+            "copied": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
+            "skipped_partial": 0,
+        }
+
         for attempt in range(1, max_attempts + 1):
             if should_stop and should_stop():
                 break
@@ -1219,6 +1251,10 @@ class PhoneBackupManager:
 
             copy_result = last_result.get("copy_result") or {}
             made_progress = int(copy_result.get("copied") or 0) > 0
+
+            for key in run_totals:
+                run_totals[key] += int(copy_result.get(key) or 0)
+            last_result["run_totals"] = dict(run_totals)
 
             needs_retry = bool(last_result.get("stalled") or last_result.get("connection_failed"))
             if needs_retry:
@@ -1312,6 +1348,7 @@ class PhoneBackupManager:
 
         last_result["attempts_used"] = last_result.get("attempt", 1)
         last_result["interruption_count"] = interruption_count
+        last_result["run_totals"] = dict(run_totals)
         if skip_folder_keys:
             last_result["skipped_folders"] = sorted(skip_folder_keys)
         # Folder-skip notices were recorded on whichever attempt discovered
@@ -1500,6 +1537,7 @@ class PhoneBackupManager:
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "copied": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
+            "skipped_partial": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
             "folder_sigs": {},
@@ -1688,6 +1726,10 @@ class PhoneBackupManager:
                 elif line.startswith("FILE_SKIP_MANIFEST:"):
                     result["skipped"] += 1
                     result["skipped_manifest"] += 1
+
+                elif line.startswith("FILE_SKIP_PARTIAL:"):
+                    result["skipped"] += 1
+                    result["skipped_partial"] += 1
 
                 elif line.startswith("FILE_SKIP_ELSEWHERE:"):
                     # Never seen at this exact path before, but a file with
