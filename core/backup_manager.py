@@ -4,7 +4,9 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+from core.config import ConfigManager
 from core.copy_engine import VerifiedCopyError, verified_copy
 from core.util import drive_map, human_bytes
 
@@ -35,21 +37,21 @@ USER_FOLDERS = (
 
 
 class BackupManager:
-    def __init__(self, config_manager):
+    def __init__(self, config_manager: ConfigManager):
         self.config_manager = config_manager
 
-    def get_default_destination(self):
+    def get_default_destination(self) -> str:
         settings = self.config_manager.get_backup_settings()
         return settings.get("default_destination", "").strip()
 
-    def set_default_destination(self, destination_root):
+    def set_default_destination(self, destination_root: Optional[str]) -> Dict[str, Any]:
         resolved = self.resolve_destination(destination_root)
         return self.save_destination(resolved, set_default=True)
 
-    def get_saved_destinations(self):
+    def get_saved_destinations(self) -> List[str]:
         settings = self.config_manager.get_backup_settings()
         saved = settings.get("saved_destinations", [])
-        normalized = []
+        normalized: List[str] = []
         seen = set()
         for item in saved:
             resolved = self.resolve_destination(item)
@@ -62,14 +64,14 @@ class BackupManager:
             normalized.append(resolved)
         return normalized
 
-    def save_destination(self, destination_root, set_default=False):
+    def save_destination(self, destination_root: Optional[str], set_default: bool = False) -> Dict[str, Any]:
         resolved = self.resolve_destination(destination_root)
         if not resolved:
             raise RuntimeError("Choose a destination path first.")
 
         current = self.config_manager.get_backup_settings()
         saved = current.get("saved_destinations", [])
-        normalized = []
+        normalized: List[str] = []
         seen = set()
         for item in [resolved, *saved]:
             normalized_item = self.resolve_destination(item)
@@ -81,12 +83,12 @@ class BackupManager:
             seen.add(key)
             normalized.append(normalized_item)
 
-        payload = {"saved_destinations": normalized}
+        payload: Dict[str, Any] = {"saved_destinations": normalized}
         if set_default:
-            payload["default_destination"] = resolved  # type: ignore
+            payload["default_destination"] = resolved
         return self.config_manager.update_backup_settings(payload)
 
-    def remove_saved_destination(self, destination_root):
+    def remove_saved_destination(self, destination_root: Optional[str]) -> Dict[str, Any]:
         resolved = self.resolve_destination(destination_root)
         current = self.config_manager.get_backup_settings()
         saved = [
@@ -94,14 +96,14 @@ class BackupManager:
             for item in current.get("saved_destinations", [])
             if self.resolve_destination(item).lower() != resolved.lower()
         ]
-        payload = {"saved_destinations": saved}
+        payload: Dict[str, Any] = {"saved_destinations": saved}
         if self.resolve_destination(current.get("default_destination", "")).lower() == resolved.lower():
-            payload["default_destination"] = saved[0] if saved else ""  # type: ignore
+            payload["default_destination"] = saved[0] if saved else ""
         return self.config_manager.update_backup_settings(payload)
 
-    def get_destination_candidates(self):
+    def get_destination_candidates(self) -> List[Dict[str, Any]]:
         current_default = self.get_default_destination()
-        candidates = []
+        candidates: List[Dict[str, Any]] = []
         for drive in drive_map().values():
             if not drive["is_backup_destination"]:
                 continue
@@ -113,10 +115,10 @@ class BackupManager:
             )
         return candidates
 
-    def get_destination_choices(self):
+    def get_destination_choices(self) -> List[str]:
         saved = self.get_saved_destinations()
         auto = [item["root"] for item in self.get_destination_candidates()]
-        choices = []
+        choices: List[str] = []
         seen = set()
         for item in [*saved, *auto]:
             resolved = self.resolve_destination(item)
@@ -129,7 +131,7 @@ class BackupManager:
             choices.append(resolved)
         return choices
 
-    def resolve_destination(self, destination_root=None):
+    def resolve_destination(self, destination_root: Optional[str] = None) -> str:
         candidate = (destination_root or self.get_default_destination()).strip()
         if not candidate:
             return ""
@@ -139,7 +141,9 @@ class BackupManager:
 
         return os.path.abspath(candidate)
 
-    def validate_destination(self, destination_root, required_bytes=0):
+    def validate_destination(
+        self, destination_root: Optional[str], required_bytes: int = 0
+    ) -> Tuple[bool, str, Optional[Any]]:
         resolved = self.resolve_destination(destination_root)
         if not resolved:
             return False, "No backup destination selected.", None
@@ -179,7 +183,7 @@ class BackupManager:
         self,
         mode,
         drives,
-        destination_root=None,
+        destination_root: Optional[str] = None,
         progress_callback=None,
         should_stop=None,
         device_id=None,

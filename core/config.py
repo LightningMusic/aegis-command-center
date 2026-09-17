@@ -1,6 +1,7 @@
 import json
 from copy import deepcopy
 from pathlib import Path
+from typing import Any, Dict
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -63,9 +64,9 @@ DEFAULT_CONFIG = {
 class ConfigManager:
     def __init__(self, path: Path | None = None):
         self.path = path or CONFIG_PATH
-        self._config = self._load()
+        self._config: Dict[str, Any] = self._load()
 
-    def _load(self):
+    def _load(self) -> Dict[str, Any]:
         if not self.path.exists():
             return deepcopy(DEFAULT_CONFIG)
 
@@ -88,37 +89,37 @@ class ConfigManager:
             encoding="utf-8",
         )
 
-    def get_brightspace_settings(self):
+    def get_brightspace_settings(self) -> Dict[str, Any]:
         return deepcopy(self._config["brightspace"])
 
-    def update_brightspace_settings(self, settings):
+    def update_brightspace_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         current = self._config["brightspace"]
         current.update(settings)
         self.save()
         return deepcopy(current)
 
-    def get_backup_settings(self):
+    def get_backup_settings(self) -> Dict[str, Any]:
         return deepcopy(self._config["backup"])
 
-    def update_backup_settings(self, settings):
+    def update_backup_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         current = self._config["backup"]
         current.update(settings)
         self.save()
         return deepcopy(current)
 
-    def get_google_workspace_settings(self):
+    def get_google_workspace_settings(self) -> Dict[str, Any]:
         return deepcopy(self._config["google_workspace"])
 
-    def update_google_workspace_settings(self, settings):
+    def update_google_workspace_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         current = self._config["google_workspace"]
         current.update(settings)
         self.save()
         return deepcopy(current)
 
-    def get_outlook_settings(self):
+    def get_outlook_settings(self) -> Dict[str, Any]:
         return deepcopy(self._config["outlook"])
 
-    def update_outlook_settings(self, settings):
+    def update_outlook_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         current = self._config["outlook"]
         current.update(settings)
         self.save()

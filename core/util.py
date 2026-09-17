@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from core.windows_drives import list_connected_drives
 
@@ -31,11 +31,11 @@ def human_bytes(n: float | int | None, decimals: int = 1) -> str:
 # changes second-to-second, so cache it briefly and let callers force a
 # refresh on an explicit "Refresh Drives" action.
 _drive_lock = threading.Lock()
-_drive_cache: List[Dict] = []
+_drive_cache: List[Dict[str, Any]] = []
 _drive_cache_at = 0.0
 
 
-def connected_drives(max_age: float = 3.0, force: bool = False) -> List[Dict]:
+def connected_drives(max_age: float = 3.0, force: bool = False) -> List[Dict[str, Any]]:
     global _drive_cache, _drive_cache_at
     with _drive_lock:
         if force or not _drive_cache or (time.monotonic() - _drive_cache_at) > max_age:
@@ -44,9 +44,9 @@ def connected_drives(max_age: float = 3.0, force: bool = False) -> List[Dict]:
         return list(_drive_cache)
 
 
-def refresh_drives() -> List[Dict]:
+def refresh_drives() -> List[Dict[str, Any]]:
     return connected_drives(force=True)
 
 
-def drive_map(max_age: float = 3.0, force: bool = False) -> Dict[str, Dict]:
+def drive_map(max_age: float = 3.0, force: bool = False) -> Dict[str, Dict[str, Any]]:
     return {d["root"]: d for d in connected_drives(max_age=max_age, force=force)}

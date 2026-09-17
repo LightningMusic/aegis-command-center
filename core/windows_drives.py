@@ -4,7 +4,7 @@ import shutil
 import string
 import threading
 import time
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
 DRIVE_UNKNOWN = 0
@@ -50,7 +50,7 @@ _cache_value: List[Dict] = []
 _cache_stamp = 0.0
 
 
-def list_connected_drives(use_cache: bool = True) -> List[Dict]:
+def list_connected_drives(use_cache: bool = True) -> List[Dict[str, Any]]:
     """
     Enumerate drives. Each call probes every drive letter with syscalls
     (GetDriveTypeW / disk_usage / os.access) that can each block for seconds on
