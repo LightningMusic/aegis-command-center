@@ -465,7 +465,7 @@ class DevicesView(QWidget):
                 dev_path = device.shell_path or device.drive_root
                 if (phone_path and dev_path == phone_path) or device.name == phone_name:
                     self.phone_backup_view.phone_list.setCurrentRow(i)
-                    self.phone_backup_view._start_or_stop()
+                    self.phone_backup_view.start_backup_for_specific_device(device)
                     return
 
             QMessageBox.warning(

@@ -12,16 +12,26 @@ Layout
 │  │ Galaxy S24  [MTP]        │   │  Pixel 8 Pro  (1 snapshot)   │
 │  │ Pixel 8 Pro [MTP]        │   │                              │
 │  └──────────────────────────┘   │  ──── Device detail ──────── │
-│                                 │  Name:      Galaxy S24       │
-│  ─── Backup ───────────────     │  Folder:    …/Phones/…       │
-│  [Start Backup]                 │  Snapshots: 3                │
-│  ████████░░░░  42 %             │  Last:      2026-05-30…      │
-│                                 │  Size:      4.2 GB           │
-│  ┌──────────────────────────┐   │                              │
-│  │ Backup log               │   │                              │
-│  │ …                        │   │                              │
+│  (multi-select: ctrl/shift-click│  Name:      Galaxy S24       │
+│   to back up several phones     │  Folder:    …/Phones/…       │
+│   connected at once)            │  Snapshots: 3                │
+│                                 │  Last:      2026-05-30…      │
+│  ─── Backup ───────────────     │  Size:      4.2 GB           │
+│  [Start Backup]                 │                              │
+│  ┌ Galaxy S24 ──────────────┐   │                              │
+│  │ ████████░░░░  42 %  [X] │   │                              │
+│  │ log…                     │   │                              │
+│  └──────────────────────────┘   │                              │
+│  ┌ Pixel 8 Pro ─────────────┐   │                              │
+│  │ ███░░░░░░░░░  18 %  [X] │   │                              │
+│  │ log…                     │   │                              │
 │  └──────────────────────────┘   │                              │
 └─────────────────────────────────┴──────────────────────────────┘
+
+Each connected device gets its own independent progress panel
+(DeviceBackupPanel) with its own worker thread, so two (or more) phones
+connected at once can back up concurrently without one blocking the other —
+each is a wholly separate MTP session against a different USB device.
 """
 
 from __future__ import annotations
@@ -41,6 +51,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTextEdit,
@@ -114,6 +125,273 @@ class PhoneDetectWorker(QObject):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-device backup panel — owns its own thread/worker, progress bar and log,
+# so N of these can run at once without sharing any UI state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DeviceBackupPanel(QFrame):
+    """
+    Self-contained backup run for one device: progress bar, status, activity
+    line, its own log, and a Stop button. Owns its own QThread/worker pair
+    following the same lifecycle rule used everywhere else in this app —
+    thread refs are only ever cleared from a thread.finished-connected slot,
+    never from worker.finished, so a still-running QThread never gets
+    garbage-collected out from under itself.
+    """
+
+    request_remove = pyqtSignal(object)      # self — parent should remove/discard this panel
+    run_finished    = pyqtSignal(object, dict)  # self, result — for history/DB bookkeeping
+    run_failed      = pyqtSignal(object, str)   # self, error message
+    activity_state_changed = pyqtSignal()     # any start/stop — parent re-evaluates button states
+
+    def __init__(self, manager: PhoneBackupManager, device: PhoneDevice) -> None:
+        super().__init__()
+        self.manager = manager
+        self.device = device
+        self.thread: Optional[QThread] = None
+        self.worker: Optional[PhoneBackupWorker] = None
+        self._started_at: Optional[float] = None
+        self._last_activity_at: Optional[float] = None
+        self.finished_ok = False
+
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet("DeviceBackupPanel { border: 1px solid #3a3a3a; border-radius: 4px; }")
+
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(1000)
+        self._activity_timer.timeout.connect(self._tick_activity)
+
+        self._build_ui()
+
+    # ── UI ───────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        self.setLayout(layout)
+
+        header = QHBoxLayout()
+        title = QLabel(self.device.display_name)
+        title.setStyleSheet("font-size: 13px; font-weight: 600;")
+        header.addWidget(title)
+        header.addStretch()
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setFixedWidth(60)
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        header.addWidget(self.stop_btn)
+
+        self.dismiss_btn = QPushButton("✕")
+        self.dismiss_btn.setFixedWidth(28)
+        self.dismiss_btn.setToolTip("Remove this panel")
+        self.dismiss_btn.setVisible(False)
+        self.dismiss_btn.clicked.connect(lambda: self.request_remove.emit(self))
+        header.addWidget(self.dismiss_btn)
+        layout.addLayout(header)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Starting…")
+        layout.addWidget(self.progress_bar)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet("font-size: 12px; color: #AAA;")
+        layout.addWidget(self.status_lbl)
+
+        self.activity_lbl = QLabel("")
+        self.activity_lbl.setStyleSheet("font-size: 11px; color: #777;")
+        layout.addWidget(self.activity_lbl)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(90)
+        self.log_box.setStyleSheet("font-size: 11px; font-family: Consolas, monospace;")
+        layout.addWidget(self.log_box)
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    def start(self, force_verify: bool) -> None:
+        verify_note = " (verifying everything — this will be slower)" if force_verify else ""
+        self.status_lbl.setText(f"Backing up…{verify_note}")
+        self.log_box.clear()
+
+        self._started_at = time.monotonic()
+        self._last_activity_at = self._started_at
+        self._activity_timer.start()
+
+        thread = QThread()
+        worker = PhoneBackupWorker(self.manager, self.device, force_verify=force_verify)
+        self.thread = thread
+        self.worker = worker
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
+
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(self._cleanup_thread)
+        thread.finished.connect(thread.deleteLater)
+
+        thread.start()
+        self.activity_state_changed.emit()
+
+    def is_running(self) -> bool:
+        return self.thread is not None
+
+    def _on_stop_clicked(self) -> None:
+        if self.worker is not None:
+            self.worker.stop()
+            self.stop_btn.setEnabled(False)
+            self.progress_bar.setFormat("Stopping…")
+            self.status_lbl.setText("Stopping — finishing the current file first…")
+
+    def shutdown(self) -> None:
+        self._activity_timer.stop()
+        stop_thread(self.thread, self.worker, wait_ms=6000)
+
+    def _cleanup_thread(self) -> None:
+        self.thread = None
+        self.worker = None
+        self._activity_timer.stop()
+        self.stop_btn.setVisible(False)
+        self.dismiss_btn.setVisible(True)
+        self.activity_state_changed.emit()
+
+    def _tick_activity(self) -> None:
+        if self._started_at is None:
+            return
+        now = time.monotonic()
+        elapsed = int(now - self._started_at)
+        since_activity = int(now - (self._last_activity_at or self._started_at))
+
+        elapsed_txt = f"{elapsed // 60}m {elapsed % 60:02d}s"
+        activity_txt = "active now" if since_activity < 10 else f"last update {since_activity}s ago"
+        self.activity_lbl.setText(f"Elapsed: {elapsed_txt} · {activity_txt}")
+
+    # ── worker signal handlers ──────────────────────────────────────────
+
+    def _on_progress(self, percent: int, message: str) -> None:
+        self._last_activity_at = time.monotonic()
+
+        if percent == -2:
+            self.status_lbl.setText(message)
+            return
+
+        if percent == -3:
+            self.status_lbl.setText(message)
+            self.log_box.append(f"\n— {message} —")
+            self._scroll_log_to_end()
+            return
+
+        if percent >= 0:
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"{percent}%")
+        self.log_box.append(message)
+        self._scroll_log_to_end()
+
+    def _on_finished(self, result: dict) -> None:
+        cancelled = result.get("cancelled", False)
+        stalled = result.get("stalled", False)
+        connection_failed = result.get("connection_failed", False)
+        unreachable = stalled or connection_failed
+
+        self.progress_bar.setValue(100)
+        if unreachable:
+            self.progress_bar.setFormat("Paused — phone unreachable")
+        elif cancelled:
+            self.progress_bar.setFormat("Stopped")
+        else:
+            self.progress_bar.setFormat("Complete ✓")
+            self.finished_ok = True
+
+        copy_r = result.get("copy_result") or {}
+        manifest_summary = result.get("manifest_summary") or {}
+
+        confirmed_files = manifest_summary.get("confirmed_files")
+        confirmed_bytes = manifest_summary.get("confirmed_bytes")
+        lines = ["Preserved folder structure in latest/"]
+
+        copied_now = copy_r.get("copied")
+        skipped_now = copy_r.get("skipped")
+        skipped_manifest_now = copy_r.get("skipped_manifest") or 0
+        skipped_elsewhere_now = copy_r.get("skipped_elsewhere") or 0
+        if copied_now is not None:
+            extra_bits = []
+            if skipped_manifest_now:
+                extra_bits.append(f"{skipped_manifest_now} already backed up, unchanged")
+            if skipped_elsewhere_now:
+                extra_bits.append(f"{skipped_elsewhere_now} found already backed up under a different folder")
+            lines.append(
+                f"This pass: {copied_now} copied, {skipped_now} skipped"
+                + (f" ({', '.join(extra_bits)})" if extra_bits else "")
+            )
+            if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:
+                lines.append(
+                    "  (nothing copied because everything matched what's "
+                    "already saved — check “Verify everything” above "
+                    "to re-check those files against the phone instead of "
+                    "trusting the record.)"
+                )
+
+        if confirmed_files is not None:
+            lines.append(
+                f"Confirmed on disk (all-time total): {confirmed_files} file(s)"
+                + (f", {human_bytes(confirmed_bytes)}" if confirmed_bytes else "")
+            )
+
+        errors = result.get("errors") or []
+        if errors:
+            lines += ["", "── Errors (first 10) ───────────────────"]
+            for e in errors[:10]:
+                lines.append(f"  {e}")
+
+        lines += [
+            "",
+            f"Folder : {result.get('device_folder', '?')}",
+            f"Latest : {result.get('latest_dir',  '?')}",
+            "─" * 40,
+        ]
+
+        if unreachable:
+            lines.append(
+                "The phone stopped responding or lost its USB/MTP connection, and "
+                "automatic retries were exhausted. Reconnect it and click Start "
+                "Backup to keep going — already-copied files won't be re-transferred."
+            )
+
+        self.log_box.append("\n".join(lines))
+        self._scroll_log_to_end()
+
+        if unreachable:
+            self.status_lbl.setText("Paused — phone unreachable after several retries. Reconnect and run again.")
+        elif cancelled:
+            self.status_lbl.setText("Backup stopped — progress saved.")
+        else:
+            self.status_lbl.setText("Backup complete.")
+
+        self.run_finished.emit(self, result)
+
+    def _on_failed(self, error_message: str) -> None:
+        self.progress_bar.setFormat("Failed")
+        self.status_lbl.setText(f"Error: {error_message}")
+        self.log_box.append(f"\nERROR: {error_message}")
+        self._scroll_log_to_end()
+        self.run_failed.emit(self, error_message)
+
+    def _scroll_log_to_end(self) -> None:
+        sb = self.log_box.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main view
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -132,39 +410,15 @@ class PhoneBackupView(QWidget):
         self.manager: PhoneBackupManager = phone_backup_manager
         self.device_manager: Optional[DeviceManager] = None
         self.detected: list[PhoneDevice] = []
-        self.backup_thread:  Optional[QThread]  = None
-        self.backup_worker:  Optional[PhoneBackupWorker] = None
+        self._panels: list[DeviceBackupPanel] = []
         self._detect_thread: Optional[QThread] = None
         self._detect_worker: Optional[PhoneDetectWorker] = None
         self._detect_callbacks: list[Callable[[], None]] = []
-        self._backup_started_at: Optional[float] = None
-        self._last_activity_at: Optional[float] = None
-
-        self.activity_timer = QTimer(self)
-        self.activity_timer.setInterval(1000)
-        self.activity_timer.timeout.connect(self._tick_activity)
 
         self._build_ui()
         # History is populated by the owner (DevicesView) from a worker thread
         # so manifest parsing never blocks construction / the page switch.
         self.populate_history([])
-
-
-    def _tick_activity(self) -> None:
-        if self._backup_started_at is None:
-            return
-        now = time.monotonic()
-        elapsed = int(now - self._backup_started_at)
-        since_activity = int(now - (self._last_activity_at or self._backup_started_at))
-
-        elapsed_txt = f"{elapsed // 60}m {elapsed % 60:02d}s"
-        if since_activity < 10:
-            activity_txt = "active now"
-        else:
-            activity_txt = f"last update {since_activity}s ago"
-
-        self.activity_lbl.setText(f"Elapsed: {elapsed_txt} · {activity_txt}")
-
 
     # ─────────────────────────────────────────────────────────────────────
     # UI construction
@@ -182,8 +436,9 @@ class PhoneBackupView(QWidget):
         root.addWidget(hdr)
 
         hint = QLabel(
-            "Connect your phone via USB cable, switch it to File Transfer (MTP) mode, "
-            "then click Detect."
+            "Connect one or more phones via USB, switch each to File Transfer "
+            "(MTP) mode, then click Detect. Select several phones (ctrl/shift-"
+            "click) to back them up at the same time."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 13px; color: #888;")
@@ -199,7 +454,7 @@ class PhoneBackupView(QWidget):
 
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([520, 320])
+        splitter.setSizes([560, 320])
 
     # ── Left panel ────────────────────────────────────────────────────────
 
@@ -225,7 +480,8 @@ class PhoneBackupView(QWidget):
 
         self.phone_list = QListWidget()
         self.phone_list.setMaximumHeight(150)
-        self.phone_list.currentRowChanged.connect(self._on_phone_selected)
+        self.phone_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.phone_list.itemSelectionChanged.connect(self._on_phone_selection_changed)
         detect_layout.addWidget(self.phone_list)
 
         self.no_phone_label = QLabel(
@@ -246,7 +502,7 @@ class PhoneBackupView(QWidget):
         self.backup_btn = QPushButton("Start Backup")
         self.backup_btn.setMinimumHeight(34)
         self.backup_btn.setEnabled(False)
-        self.backup_btn.clicked.connect(self._start_or_stop)
+        self.backup_btn.clicked.connect(self._start_selected_backups)
         backup_btns.addWidget(self.backup_btn)
 
         self.cleanup_btn = QPushButton("Clean Up Duplicates")
@@ -263,40 +519,42 @@ class PhoneBackupView(QWidget):
             "skipped on the assumption it's unchanged since the last backup. Check "
             "this to re-check every such file against the phone instead — much "
             "slower on a big phone, but nothing gets skipped just because it "
-            "couldn't be verified."
+            "couldn't be verified. Applies to backups started after you check it."
         )
         backup_layout.addWidget(self.verify_everything_chk)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Idle")
-        backup_layout.addWidget(self.progress_bar)
-
-        self.status_lbl = QLabel("Select a phone above, then click Start Backup.")
-        self.status_lbl.setWordWrap(True)
-        self.status_lbl.setStyleSheet("font-size: 13px; color: #AAA;")
-        backup_layout.addWidget(self.status_lbl)
-
-        self.activity_lbl = QLabel("")
-        self.activity_lbl.setStyleSheet("font-size: 12px; color: #777;")
-        backup_layout.addWidget(self.activity_lbl)
+        self.global_status_lbl = QLabel("Select one or more phones above, then click Start Backup.")
+        self.global_status_lbl.setWordWrap(True)
+        self.global_status_lbl.setStyleSheet("font-size: 13px; color: #AAA;")
+        backup_layout.addWidget(self.global_status_lbl)
 
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet("color: #333;")
         backup_layout.addWidget(line)
 
-        log_lbl = QLabel("Backup Log")
-        log_lbl.setStyleSheet("font-size: 13px; font-weight: 600;")
-        backup_layout.addWidget(log_lbl)
+        # Scrollable stack of per-device panels — each active (or just-
+        # finished) backup gets its own independent progress bar and log.
+        self.panels_scroll = QScrollArea()
+        self.panels_scroll.setWidgetResizable(True)
+        self.panels_scroll.setMinimumHeight(200)
+        self.panels_scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(120)
-        self.log_box.setStyleSheet("font-size: 12px; font-family: Consolas, monospace;")
-        backup_layout.addWidget(self.log_box)
+        self.panels_container = QWidget()
+        self.panels_layout = QVBoxLayout()
+        self.panels_layout.setContentsMargins(0, 0, 0, 0)
+        self.panels_layout.setSpacing(8)
+        self.panels_layout.addStretch()
+        self.panels_container.setLayout(self.panels_layout)
+        self.panels_scroll.setWidget(self.panels_container)
 
-        layout.addWidget(backup_group)
+        self.no_active_lbl = QLabel("No active or recent backups.")
+        self.no_active_lbl.setStyleSheet("color: #777; font-size: 12px;")
+        self.panels_layout.insertWidget(0, self.no_active_lbl)
+
+        backup_layout.addWidget(self.panels_scroll, 1)
+
+        layout.addWidget(backup_group, 1)
         return panel
 
     # ── Right panel ───────────────────────────────────────────────────────
@@ -389,7 +647,7 @@ class PhoneBackupView(QWidget):
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, device)
                 self.phone_list.addItem(item)
-            self.phone_list.setCurrentRow(0)  # backup_btn enabled by _on_phone_selected
+            self.phone_list.setCurrentRow(0)  # backup_btn enabled by _on_phone_selection_changed
 
         callbacks, self._detect_callbacks = self._detect_callbacks, []
         for callback in callbacks:
@@ -403,281 +661,179 @@ class PhoneBackupView(QWidget):
         self._detect_worker = None
 
     def shutdown(self) -> None:
-        if getattr(self, "activity_timer", None) is not None:
-            self.activity_timer.stop()
         stop_thread(getattr(self, "_detect_thread", None), getattr(self, "_detect_worker", None))
-        # A running phone backup can take a long time to reach a stop point;
-        # ask it to stop and give it a bounded wait, then terminate at exit.
-        stop_thread(getattr(self, "backup_thread", None), getattr(self, "backup_worker", None),
-                    wait_ms=6000)
+        # Running phone backups can take a long time to reach a stop point;
+        # ask each to stop and give it a bounded wait, then terminate at exit.
+        for panel in list(self._panels):
+            panel.shutdown()
 
-    def _on_phone_selected(self, row: int) -> None:
-        self.backup_btn.setEnabled(row >= 0 and self.backup_thread is None)
+    def _on_phone_selection_changed(self) -> None:
+        self._update_backup_btn_state()
+
+    def _update_backup_btn_state(self) -> None:
+        running_devices = {p.device.shell_path or p.device.drive_root or p.device.name
+                            for p in self._panels if p.is_running()}
+        selected = self.phone_list.selectedItems()
+        startable = [
+            item for item in selected
+            if isinstance(item.data(Qt.ItemDataRole.UserRole), PhoneDevice)
+            and (item.data(Qt.ItemDataRole.UserRole).shell_path
+                 or item.data(Qt.ItemDataRole.UserRole).drive_root
+                 or item.data(Qt.ItemDataRole.UserRole).name) not in running_devices
+        ]
+        self.backup_btn.setEnabled(bool(startable))
 
     # ─────────────────────────────────────────────────────────────────────
-    # Backup start / stop
+    # Backup start
     # ─────────────────────────────────────────────────────────────────────
 
-    def _start_or_stop(self) -> None:
-        # If a backup is running, request stop.
-        if self.backup_thread is not None and self.backup_worker is not None:
-            self.backup_worker.stop()
-            self.backup_btn.setEnabled(False)
-            self.progress_bar.setFormat("Stopping…")
-            self.status_lbl.setText("Stopping — finishing the current file first…")
+    def _start_selected_backups(self) -> None:
+        items = self.phone_list.selectedItems()
+        if not items:
             return
 
-        if self.backup_thread is not None:
-            return  # cleanup pending
+        running_devices = {p.device.shell_path or p.device.drive_root or p.device.name
+                            for p in self._panels if p.is_running()}
 
-        item = self.phone_list.currentItem()
-        if not item:
+        devices: list[PhoneDevice] = []
+        for item in items:
+            device = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(device, PhoneDevice):
+                continue
+            key = device.shell_path or device.drive_root or device.name
+            if key in running_devices:
+                continue
+            devices.append(device)
+
+        if not devices:
             return
 
-        device = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(device, PhoneDevice):
-            return
-
-        self._start_backup(device)
-
-
-    def _start_backup(self, device: PhoneDevice) -> None:
         force_verify = self.verify_everything_chk.isChecked()
 
-        self.log_box.clear()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Starting…")
-        verify_note = " (verifying everything — this will be slower)" if force_verify else ""
-        self.status_lbl.setText(f"Backing up {device.display_name}…{verify_note}")
-        self.activity_lbl.setText("")
-        self.backup_btn.setText("Stop Backup")
+        for device in devices:
+            self._start_backup_panel(device, force_verify)
+
+        count = len(devices)
+        self.global_status_lbl.setText(
+            f"Backing up {count} phone{'s' if count != 1 else ''}…"
+        )
         self.detect_btn.setEnabled(False)
-        self.verify_everything_chk.setEnabled(False)
+        self._update_backup_btn_state()
 
-        self._backup_started_at = time.monotonic()
-        self._last_activity_at = self._backup_started_at
-        self.activity_timer.start()
-        thread = QThread()
-        worker = PhoneBackupWorker(self.manager, device, force_verify=force_verify)
+    def start_backup_for_specific_device(self, device: PhoneDevice) -> bool:
+        """
+        Start a backup for exactly this device, bypassing the list selection —
+        used by the "Backup Now" entry point on the Devices page. Returns
+        False (and does nothing) if this device is already backing up.
+        """
+        key = device.shell_path or device.drive_root or device.name
+        running_devices = {p.device.shell_path or p.device.drive_root or p.device.name
+                            for p in self._panels if p.is_running()}
+        if key in running_devices:
+            return False
 
-        self.backup_thread = thread
-        self.backup_worker = worker
+        self._start_backup_panel(device, self.verify_everything_chk.isChecked())
+        self.global_status_lbl.setText(f"Backing up {device.display_name}…")
+        self.detect_btn.setEnabled(False)
+        self._update_backup_btn_state()
+        return True
 
-        worker.moveToThread(thread)
+    def _start_backup_panel(self, device: PhoneDevice, force_verify: bool) -> None:
+        self.no_active_lbl.setVisible(False)
 
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_progress)
-        worker.finished.connect(self._on_finished)
-        worker.failed.connect(self._on_failed)
+        panel = DeviceBackupPanel(self.manager, device)
+        panel.request_remove.connect(self._remove_panel)
+        panel.run_finished.connect(self._on_panel_finished)
+        panel.run_failed.connect(self._on_panel_failed)
+        panel.activity_state_changed.connect(self._on_panel_activity_changed)
 
-        # Cleanup chain
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(self._cleanup_backup_thread)
-        thread.finished.connect(thread.deleteLater)
+        # Newest panel at the top, above the trailing stretch.
+        self.panels_layout.insertWidget(0, panel)
+        self._panels.append(panel)
 
-        thread.start()
+        panel.start(force_verify)
 
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Signals from worker
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _on_progress(self, percent: int, message: str) -> None:
-        self._last_activity_at = time.monotonic()
-
-        if percent == -2:
-            # Heartbeat-only update — keep the status line fresh, skip the log.
-            self.status_lbl.setText(message)
+    def _remove_panel(self, panel: DeviceBackupPanel) -> None:
+        if panel.is_running():
             return
+        panel.shutdown()
+        if panel in self._panels:
+            self._panels.remove(panel)
+        self.panels_layout.removeWidget(panel)
+        panel.setParent(None)
+        panel.deleteLater()
+        self.no_active_lbl.setVisible(not self._panels)
 
-        if percent == -3:
-            # A meaningful phase change or retry milestone — worth logging.
-            self.status_lbl.setText(message)
-            self.log_box.append(f"\n— {message} —")
-            sb = self.log_box.verticalScrollBar()
-            if sb:
-                sb.setValue(sb.maximum())
-            return
-
-        if percent >= 0:
-            self.progress_bar.setValue(percent)
-            self.progress_bar.setFormat(f"{percent}%")
-        self.log_box.append(message)
-        sb = self.log_box.verticalScrollBar()
-        if sb:
-            sb.setValue(sb.maximum())
-
-    def _on_finished(self, result: dict) -> None:
-        cancelled = result.get("cancelled", False)
-        stalled = result.get("stalled", False)
-        connection_failed = result.get("connection_failed", False)
-        unreachable = stalled or connection_failed
-        attempts = result.get("attempts_used", 1)
-        interruptions = result.get("interruption_count", 0)
-
-        self.progress_bar.setValue(100)
-        if unreachable:
-            self.progress_bar.setFormat("Paused — phone unreachable")
-        elif cancelled:
-            self.progress_bar.setFormat("Stopped")
-        else:
-            self.progress_bar.setFormat("Complete ✓")
-
-        copy_r  = result.get("copy_result")   or {}
-        index_r = result.get("index_result") or {}
-        manifest_summary = result.get("manifest_summary") or {}
-
-        confirmed_files = manifest_summary.get("confirmed_files")
-        confirmed_bytes = manifest_summary.get("confirmed_bytes")
-        lines = [
-            "Preserved folder structure in latest/",
-        ]
-
-        # What THIS run's last pass actually did — separate from the
-        # "confirmed on disk" total below, which reflects everything ever
-        # backed up (including earlier sessions) and can look identical
-        # whether this run copied 20,000 files or zero.
-        copied_now = copy_r.get("copied")
-        skipped_now = copy_r.get("skipped")
-        skipped_manifest_now = copy_r.get("skipped_manifest") or 0
-        if copied_now is not None:
-            lines.append(
-                f"This pass: {copied_now} copied, {skipped_now} skipped"
-                + (f" ({skipped_manifest_now} already backed up, unchanged)"
-                   if skipped_manifest_now else "")
-            )
-            if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:
-                lines.append(
-                    "  (nothing copied because everything matched what's "
-                    "already saved — check “Verify everything” above "
-                    "to re-check those files against the phone instead of "
-                    "trusting the record.)"
+    def _on_panel_activity_changed(self) -> None:
+        self._update_backup_btn_state()
+        if not any(p.is_running() for p in self._panels):
+            self.detect_btn.setEnabled(True)
+            if self._panels:
+                done = sum(1 for p in self._panels if p.finished_ok)
+                self.global_status_lbl.setText(
+                    f"{done} of {len(self._panels)} backup(s) complete."
                 )
 
-        if confirmed_files is not None:
-            lines.append(
-                f"Confirmed on disk (all-time total): {confirmed_files} file(s)"
-                + (f", {human_bytes(confirmed_bytes)}" if confirmed_bytes else "")
-            )
+    # ─────────────────────────────────────────────────────────────────────
+    # Signals from panels — cross-cutting bookkeeping (history, DB)
+    # ─────────────────────────────────────────────────────────────────────
 
-        errors = result.get("errors") or []
-        if errors:
-            lines += ["", "── Errors (first 10) ───────────────────"]
-            for e in errors[:10]:
-                lines.append(f"  {e}")
-
-        lines += [
-            "",
-            f"Folder : {result.get('device_folder', '?')}",
-            f"Latest : {result.get('latest_dir',  '?')}",
-            "─" * 48,
-        ]
-
-        if unreachable:
-            lines.append(
-                "The phone stopped responding or lost its USB/MTP connection, and "
-                "automatic retries were exhausted. Reconnect it and click Start "
-                "Backup to keep going — already-copied files won't be re-transferred."
-            )
-
-        self.log_box.append("\n".join(lines))
-        sb = self.log_box.verticalScrollBar()
-        if sb:
-            sb.setValue(sb.maximum())
-
-        if unreachable:
-            self.status_lbl.setText("Paused — phone unreachable after several retries. Reconnect and run again.")
-        elif cancelled:
-            self.status_lbl.setText("Backup stopped — progress saved.")
-        else:
-            self.status_lbl.setText("Backup complete.")
-
+    def _on_panel_finished(self, panel: DeviceBackupPanel, result: dict) -> None:
+        cancelled = result.get("cancelled", False)
         self._refresh_history()
 
-        # Update last backup in database using device_manager
-        if not cancelled and hasattr(self, "device_manager") and self.device_manager:
-            try:
-                device_name = result.get("device")
-                if not device_name:
-                    return
-                device = self.device_manager.get_device_by_name(device_name)
-                if device:
-                    device_id = device.get("device_id")
-                    if not device_id:
-                        return
-                    copied_files = copy_r.get("copied", 0)
-                    self._last_activity_at = time.monotonic()
-                    latest_dir_str = result.get("latest_dir")
-                    if not latest_dir_str:
-                        return
+        if cancelled or not hasattr(self, "device_manager") or not self.device_manager:
+            return
 
-                    # The worker already indexed latest/ into the manifest; reuse
-                    # its byte total instead of walking the whole tree again on
-                    # the GUI thread (that walk froze the UI right at "complete").
-                    total_bytes = int(manifest_summary.get("confirmed_bytes") or 0)
-                    self.device_manager.update_last_backup(
-                        device_id,
-                        latest_dir_str,
-                        copied_files,
-                        total_bytes
-                    )
-            except Exception as e:
-                print(f"Error updating device backup in database: {e}")
+        copy_r = result.get("copy_result") or {}
+        manifest_summary = result.get("manifest_summary") or {}
+        try:
+            device_name = result.get("device")
+            if not device_name:
+                return
+            device = self.device_manager.get_device_by_name(device_name)
+            if not device:
+                return
+            device_id = device.get("device_id")
+            if not device_id:
+                return
+            latest_dir_str = result.get("latest_dir")
+            if not latest_dir_str:
+                return
 
-    def _on_failed(self, error_message: str) -> None:
-        self.progress_bar.setFormat("Failed")
-        self.status_lbl.setText(f"Error: {error_message}")
-        self.log_box.append(f"\nERROR: {error_message}")
+            copied_files = copy_r.get("copied", 0)
+            total_bytes = int(manifest_summary.get("confirmed_bytes") or 0)
+            self.device_manager.update_last_backup(
+                device_id, latest_dir_str, copied_files, total_bytes
+            )
+        except Exception as e:
+            print(f"Error updating device backup in database: {e}")
 
-        # A crash here doesn't mean nothing was backed up — files land on
-        # disk (and get indexed into the manifest) as they're copied,
-        # independent of whether this run finished cleanly. Show what's
-        # actually confirmed saved so far so a failure never just looks
-        # like a void with no way to tell what happened.
-        device = getattr(self.backup_worker, "device", None)
+    def _on_panel_failed(self, panel: DeviceBackupPanel, error_message: str) -> None:
         confirmed_note = None
-        if device is not None:
-            try:
-                for dev in self.manager.list_all_backed_up_devices():
-                    if Path(dev.get("folder", "")).name == device.safe_folder_name:
-                        confirmed = dev.get("confirmed_files", 0)
-                        confirmed_note = (
-                            f"{confirmed} file(s) confirmed backed up so far in "
-                            f"{dev.get('folder', '?')}. Nothing already copied is "
-                            f"lost — click Start Backup again to pick up where "
-                            f"this left off."
-                        )
-                        break
-            except Exception:
-                pass
+        try:
+            for dev in self.manager.list_all_backed_up_devices():
+                if Path(dev.get("folder", "")).name == panel.device.safe_folder_name:
+                    confirmed = dev.get("confirmed_files", 0)
+                    confirmed_note = (
+                        f"{confirmed} file(s) confirmed backed up so far in "
+                        f"{dev.get('folder', '?')}. Nothing already copied is "
+                        f"lost — click Start Backup again to pick up where "
+                        f"this left off."
+                    )
+                    break
+        except Exception:
+            pass
 
         if confirmed_note:
-            self.log_box.append(f"\n{confirmed_note}")
-
-        sb = self.log_box.verticalScrollBar()
-        if sb:
-            sb.setValue(sb.maximum())
+            panel.log_box.append(f"\n{confirmed_note}")
+            panel._scroll_log_to_end()
 
         QMessageBox.warning(
-            self, "Backup Failed",
+            self, f"Backup Failed — {panel.device.display_name}",
             f"{error_message}\n\n{confirmed_note}" if confirmed_note else error_message,
         )
-
-    def _cleanup_backup_thread(self) -> None:
-        self.backup_thread = None
-        self.backup_worker = None
-        self.activity_timer.stop()
-        self._backup_started_at = None
-
-        self.backup_btn.setText("Start Backup")
-
-        row = self.phone_list.currentRow()
-        self.backup_btn.setEnabled(row >= 0 and bool(self.detected))
-        self.detect_btn.setEnabled(True)
-        self.verify_everything_chk.setEnabled(True)
+        self._refresh_history()
 
     def _cleanup_duplicates(self) -> None:
         device_dir = None
