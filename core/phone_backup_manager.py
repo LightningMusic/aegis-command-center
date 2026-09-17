@@ -650,64 +650,40 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 }
             }
 
-            # Copy straight into the real destination. An earlier version of
-            # this script routed every copy through a throwaway staging
-            # folder (recreated per attempt) specifically to dodge a rare
-            # "already exists" conflict dialog from Explorer's WPD copy
-            # engine -- but a real MTP transfer negotiates an actual session
-            # with the phone, unlike a local-to-local copy, and constantly
-            # tearing down and recreating the destination folder/COM binding
-            # around that negotiation made real transfers fail outright
-            # (confirmed against a real device: every file failed after
-            # retries, zero copied in a run that took hours). Simpler and
-            # more reliable: copy directly, and rely on FOF_RENAMEONCOLLISION
-            # in $copyFlags plus the pre-copy dedup below to avoid the
-            # conflict dialog instead of fighting it with more machinery.
+            # Copy straight into the real destination -- and only ONE
+            # attempt per file per process, no in-place retry. CopyHere() is
+            # fire-and-forget: it can still be finishing asynchronously in
+            # the background well after we give up waiting on it. Retrying
+            # into the SAME destination path risks a second CopyHere landing
+            # while the first one is still writing there -- a collision of
+            # our own making, which is exactly what caused the "already
+            # exists" dialog before. A file that doesn't land cleanly this
+            # pass is simply left for the NEXT attempt instead -- a fresh
+            # PowerShell process and a fresh phone session, so there is no
+            # possibility of overlapping with whatever this attempt might
+            # still be doing. backup_phone_until_complete() already retries
+            # the whole phone automatically, so nothing is lost by not
+            # retrying in place here -- it's also just faster, since a
+            # stubborn file no longer burns several seconds of sleep-and-
+            # retry before moving on to everything else that's waiting.
             $copyOk = $false
-            for ($try = 1; $try -le 3 -and -not $copyOk; $try++) {
-                if (Test-Path $destFile) {
-                    try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
-                }
-
-                try {
-                    $dstNs.CopyHere($item, $copyFlags)
-                } catch {
-                    Beat "retrying $relKey (CopyHere error)"
-                    Start-Sleep -Milliseconds 800
-                    continue
-                }
-
+            try {
+                $dstNs.CopyHere($item, $copyFlags)
                 if (Wait-ForFile $destFile $relKey $expectedSize) {
                     $finalSize = -1
                     try { $finalSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $finalSize = -1 }
-
-                    if ($finalSize -lt 0) {
-                        Beat "retrying $relKey (vanished)"
-                        Start-Sleep -Milliseconds 800
-                        continue
-                    }
-                    if ($expectedSize -gt 0 -and $finalSize -lt $expectedSize) {
-                        # Truncated transfer - drop it so it isn't recorded as good.
-                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
-                        Beat "retrying $relKey (short: $finalSize/$expectedSize)"
-                        Start-Sleep -Milliseconds 1000
-                        continue
-                    }
-
-                    $copyOk = $true
-                } else {
-                    # Never appeared within the appear-timeout. Clean any stub.
-                    if (Test-Path $destFile) {
+                    if ($finalSize -ge 0 -and ($expectedSize -le 0 -or $finalSize -ge $expectedSize)) {
+                        $copyOk = $true
+                    } elseif (Test-Path $destFile) {
+                        # Truncated -- drop it so it isn't recorded as good;
+                        # a clean retry happens from scratch next attempt.
                         try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
                     }
-                    # A file that produces nothing at all rarely recovers
-                    # within the same run - one extra attempt, then leave it
-                    # for the whole-backup retry so we don't burn minutes per
-                    # dead file.
-                    if ($try -ge 2) { break }
-                    Beat "retrying $relKey (no data)"
-                    Start-Sleep -Milliseconds 1000
+                } elseif (Test-Path $destFile) {
+                    try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
                 }
+            } catch {
+                Beat "$relKey didn't land this pass (CopyHere error) -- will retry next attempt"
             }
 
             if ($copyOk) {
@@ -733,7 +709,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 }
             } else {
                 $script:errors++
-                Write-Host "FILE_ERR:$($relKey):transfer failed after 3 attempts"
+                Write-Host "FILE_ERR:$($relKey):didn't complete this pass, will retry next attempt"
             }
             [Console]::Out.Flush()
         }
