@@ -4,7 +4,7 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from core.config import ConfigManager
 from core.copy_engine import VerifiedCopyError, verified_copy
@@ -34,6 +34,9 @@ USER_FOLDERS = (
     "Favorites",
     "Saved Games",
 )
+
+ProgressCallback = Callable[[int, str], None]
+StopCallback = Callable[[], bool]
 
 
 class BackupManager:
@@ -173,7 +176,7 @@ class BackupManager:
 
         return True, "Destination is writable and has enough space.", usage
 
-    def estimate_backup_size(self, mode, drives):
+    def estimate_backup_size(self, mode: str, drives: List[str]) -> int:
         total = 0
         for path in self._iter_backup_sources(mode, drives):
             total += self._estimate_path_size(path)
@@ -181,15 +184,15 @@ class BackupManager:
 
     def run_backup(
         self,
-        mode,
-        drives,
+        mode: str,
+        drives: List[str],
         destination_root: Optional[str] = None,
-        progress_callback=None,
-        should_stop=None,
-        device_id=None,
-        device_name=None,
-        verify_copies=True,
-    ):
+        progress_callback: Optional[ProgressCallback] = None,
+        should_stop: Optional[StopCallback] = None,
+        device_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+        verify_copies: bool = True,
+    ) -> Dict[str, Any]:
         self._verify_copies = verify_copies
         drives = [drive if drive.endswith("\\") else f"{drive}\\" for drive in drives]
         resolved_destination = self.resolve_destination(destination_root)
@@ -228,7 +231,7 @@ class BackupManager:
         os.makedirs(backup_root, exist_ok=True)
         os.makedirs(log_root, exist_ok=True)
 
-        manifest = {
+        manifest: Dict[str, Any] = {
             "mode": mode,
             "started_at": datetime.now().isoformat(),
             "destination_root": resolved_destination,
@@ -312,7 +315,7 @@ class BackupManager:
             "reused_existing_set": reused_existing_set,
         }
 
-    def list_backup_folders(self, destination_root):
+    def list_backup_folders(self, destination_root: Optional[str]) -> List[str]:
         resolved_destination = self.resolve_destination(destination_root)
         if not resolved_destination:
             return []
@@ -329,10 +332,10 @@ class BackupManager:
                 folders.append(child.name)
         return sorted(folders, reverse=True)
 
-    def list_devices_with_backups(self, destination_root):
+    def list_devices_with_backups(self, destination_root: Optional[str]) -> List[Dict[str, Any]]:
         """
         List all devices that have backups organized by device name.
-        
+
         Returns:
             List of device info dicts with name, last_backup, and backup_path
         """
@@ -354,7 +357,7 @@ class BackupManager:
             latest_backup = device_folder / "latest"
             manifest_path = latest_backup / "backup_manifest.json"
 
-            device_info = {
+            device_info: Dict[str, Any] = {
                 "device_name": device_folder.name,
                 "backup_path": str(latest_backup),
                 "has_backup": latest_backup.exists(),
@@ -376,7 +379,9 @@ class BackupManager:
 
         return sorted(devices, key=lambda x: x["device_name"])
 
-    def merge_backup_folders(self, destination_root, source_folder, target_folder):
+    def merge_backup_folders(
+        self, destination_root: Optional[str], source_folder: str, target_folder: str
+    ) -> Dict[str, Any]:
         if not source_folder or not target_folder:
             raise RuntimeError("Select both a source and target backup folder.")
         if source_folder == target_folder:
@@ -454,7 +459,7 @@ class BackupManager:
             "log_file": str(log_file),
         }
 
-    def merge_folders(self, source_path, target_path):
+    def merge_folders(self, source_path: str, target_path: str) -> Dict[str, Any]:
         if not source_path or not target_path:
             raise RuntimeError("Choose both a source folder and a target folder.")
 
@@ -538,7 +543,9 @@ class BackupManager:
             "log_file": str(log_file),
         }
 
-    def _iter_backup_sources(self, mode, drives, destination_root=None):
+    def _iter_backup_sources(
+        self, mode: str, drives: List[str], destination_root: Optional[str] = None
+    ) -> Iterator[str]:
         if mode == "loose":
             yield from self._iter_loose_file_sources(drives, destination_root)
             return
@@ -549,13 +556,17 @@ class BackupManager:
 
         yield from self._iter_mirror_sources(drives, destination_root)
 
-    def _iter_mirror_sources(self, drives, destination_root=None):
+    def _iter_mirror_sources(
+        self, drives: List[str], destination_root: Optional[str] = None
+    ) -> Iterator[str]:
         for drive in drives:
             if self._is_same_or_parent_path(drive, destination_root):
                 continue
             yield drive
 
-    def _iter_loose_file_sources(self, drives, destination_root=None):
+    def _iter_loose_file_sources(
+        self, drives: List[str], destination_root: Optional[str] = None
+    ) -> Iterator[str]:
         for drive in drives:
             drive_root = Path(drive)
             try:
@@ -582,7 +593,9 @@ class BackupManager:
             except OSError:
                 continue
 
-    def _iter_windows_sources(self, drives, destination_root=None):
+    def _iter_windows_sources(
+        self, drives: List[str], destination_root: Optional[str] = None
+    ) -> Iterator[str]:
         for drive in drives:
             drive_root = Path(drive)
             users_root = drive_root / "Users"
@@ -594,7 +607,7 @@ class BackupManager:
                 if extra_path.exists() and not self._is_same_or_parent_path(extra_path, destination_root):
                     yield str(extra_path)
 
-    def _build_destination_root(self, backup_root, mode, source_root: Path):
+    def _build_destination_root(self, backup_root: str, mode: str, source_root: Path) -> Path:
         if source_root.drive:
             drive_name = source_root.drive.replace(":", "")
         else:
@@ -608,7 +621,13 @@ class BackupManager:
 
         return Path(backup_root) / f"{drive_name}_Loose_Files"
 
-    def _copy_tree(self, source_root: Path, destination_root: Path, manifest, should_stop=None):
+    def _copy_tree(
+        self,
+        source_root: Path,
+        destination_root: Path,
+        manifest: Dict[str, Any],
+        should_stop: Optional[StopCallback] = None,
+    ) -> None:
         for current_root, dirs, files in os.walk(source_root):
             if should_stop and should_stop():
                 return
@@ -647,7 +666,13 @@ class BackupManager:
                     should_stop=should_stop,
                 )
 
-    def _copy_file(self, source_file: Path, destination_file: Path, manifest, should_stop=None):
+    def _copy_file(
+        self,
+        source_file: Path,
+        destination_file: Path,
+        manifest: Dict[str, Any],
+        should_stop: Optional[StopCallback] = None,
+    ) -> None:
         if should_stop and should_stop():
             return
 
@@ -684,7 +709,7 @@ class BackupManager:
         except OSError:
             pass
 
-    def _estimate_path_size(self, path):
+    def _estimate_path_size(self, path: str) -> int:
         target = Path(path)
         if target.is_file():
             try:
@@ -710,25 +735,25 @@ class BackupManager:
                     continue
         return total
 
-    def _should_skip_dir(self, path: Path):
+    def _should_skip_dir(self, path: Path) -> bool:
         return path.name.lower() in EXCLUDED_DIR_NAMES
 
-    def _should_skip_file(self, path: Path):
+    def _should_skip_file(self, path: Path) -> bool:
         return path.name.lower() in {"pagefile.sys", "hiberfil.sys", "swapfile.sys"}
 
-    def _filter_source_drives(self, drives, destination_root):
+    def _filter_source_drives(self, drives: List[str], destination_root: Optional[str]) -> List[str]:
         if not destination_root:
             return drives
 
         destination_anchor = Path(destination_root).anchor.lower()
-        filtered = []
+        filtered: List[str] = []
         for drive in drives:
             if Path(drive).anchor.lower() == destination_anchor:
                 continue
             filtered.append(drive)
         return filtered
 
-    def _is_same_or_parent_path(self, candidate, reference):
+    def _is_same_or_parent_path(self, candidate: Optional[Any], reference: Optional[Any]) -> bool:
         if not candidate or not reference:
             return False
 
@@ -747,10 +772,17 @@ class BackupManager:
         except ValueError:
             return False
 
-    def _format_bytes(self, value):
+    def _format_bytes(self, value: int) -> str:
         return human_bytes(value, 2)
 
-    def _resolve_backup_root(self, destination_root, backup_root_name, mode, drives, stamp):
+    def _resolve_backup_root(
+        self,
+        destination_root: str,
+        backup_root_name: str,
+        mode: str,
+        drives: List[str],
+        stamp: str,
+    ) -> Tuple[str, bool]:
         root = Path(destination_root) / backup_root_name
         os.makedirs(root, exist_ok=True)
 
@@ -760,10 +792,12 @@ class BackupManager:
 
         return str(root / f"{mode}_{stamp}"), False
 
-    def _find_existing_backup_root(self, backup_root, mode, drives):
+    def _find_existing_backup_root(
+        self, backup_root: Path, mode: str, drives: List[str]
+    ) -> Optional[Path]:
         requested_drives = sorted(drive.lower() for drive in drives)
-        best_match = None
-        best_time = None
+        best_match: Optional[Path] = None
+        best_time: Optional[str] = None
 
         for child in backup_root.iterdir():
             if not child.is_dir():
@@ -790,11 +824,18 @@ class BackupManager:
 
         return best_match
 
-    def _write_backup_manifest(self, backup_root, manifest):
+    def _write_backup_manifest(self, backup_root: Any, manifest: Dict[str, Any]) -> None:
         manifest_path = Path(backup_root) / "backup_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    def _finish_cancelled_backup(self, manifest, resolved_destination, log_root, mode, stamp):
+    def _finish_cancelled_backup(
+        self,
+        manifest: Dict[str, Any],
+        resolved_destination: str,
+        log_root: str,
+        mode: str,
+        stamp: str,
+    ) -> Dict[str, Any]:
         manifest["completed_at"] = datetime.now().isoformat()
         manifest["cancelled"] = True
 
