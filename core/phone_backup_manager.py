@@ -328,19 +328,6 @@ function Get-PriorityOrderedItems($ItemList) {
     return @($priority) + @($rest)
 }
 
-# All CopyHere() calls land in a fresh, guaranteed-empty staging folder on the
-# SAME drive as the destination - never directly in the real destination tree.
-# This is what actually prevents the "There is already a file with this name"
-# conflict dialog that Explorer's WPD/MTP copy engine can pop up even with
-# FOF_NOCONFIRMATION (a long-standing quirk: that flag isn't fully honoured
-# for portable-device sources). The dialog can only appear if CopyHere's
-# target folder already has a same-named file, and a fresh per-run GUID
-# folder never does. The finished file is then moved into place with
-# Move-Item, a plain filesystem rename that never shows any UI.
-$runStageDir = Join-Path $DestPath ("_aegis_stage_" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $runStageDir -Force | Out-Null
-$stageNs = $shell.Namespace($runStageDir)
-
 function Get-ItemSizeBestEffort($Item) {
     # WPD/MTP shell namespace extensions are notoriously inconsistent about
     # exposing .Size - for many Android phones it's always $null. Try the
@@ -663,72 +650,56 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 }
             }
 
+            # Copy straight into the real destination. An earlier version of
+            # this script routed every copy through a throwaway staging
+            # folder (recreated per attempt) specifically to dodge a rare
+            # "already exists" conflict dialog from Explorer's WPD copy
+            # engine -- but a real MTP transfer negotiates an actual session
+            # with the phone, unlike a local-to-local copy, and constantly
+            # tearing down and recreating the destination folder/COM binding
+            # around that negotiation made real transfers fail outright
+            # (confirmed against a real device: every file failed after
+            # retries, zero copied in a run that took hours). Simpler and
+            # more reliable: copy directly, and rely on FOF_RENAMEONCOLLISION
+            # in $copyFlags plus the pre-copy dedup below to avoid the
+            # conflict dialog instead of fighting it with more machinery.
             $copyOk = $false
             for ($try = 1; $try -le 3 -and -not $copyOk; $try++) {
-                # CopyHere() is fire-and-forget - it can still be finishing
-                # asynchronously in the background well after Wait-ForFile
-                # gives up on it. Reusing one staging path across retries
-                # meant a late-arriving first attempt and a fresh retry could
-                # both land on the SAME name at the SAME time - a collision
-                # of our own making, which is exactly the "already exists"
-                # dialog this was supposed to prevent. Every attempt now gets
-                # its own throwaway folder, so two overlapping copies -
-                # however they're timed - can never touch the same path.
-                $attemptStageDir = Join-Path $runStageDir ([guid]::NewGuid().ToString("N"))
-                $stagedFile = $null
+                if (Test-Path $destFile) {
+                    try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                }
+
                 try {
-                    New-Item -ItemType Directory -Path $attemptStageDir -Force | Out-Null
-                    $attemptStageNs = $shell.Namespace($attemptStageDir)
-                    $stagedFile = Join-Path $attemptStageDir $item.Name
-                    $attemptStageNs.CopyHere($item, $copyFlags)
+                    $dstNs.CopyHere($item, $copyFlags)
                 } catch {
                     Beat "retrying $relKey (CopyHere error)"
-                    try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                     Start-Sleep -Milliseconds 800
                     continue
                 }
 
-                if (Wait-ForFile $stagedFile $relKey $expectedSize) {
+                if (Wait-ForFile $destFile $relKey $expectedSize) {
                     $finalSize = -1
-                    try { $finalSize = [int64](Get-Item -LiteralPath $stagedFile -ErrorAction Stop).Length } catch { $finalSize = -1 }
+                    try { $finalSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $finalSize = -1 }
 
                     if ($finalSize -lt 0) {
                         Beat "retrying $relKey (vanished)"
-                        try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                         Start-Sleep -Milliseconds 800
                         continue
                     }
                     if ($expectedSize -gt 0 -and $finalSize -lt $expectedSize) {
                         # Truncated transfer - drop it so it isn't recorded as good.
-                        try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
+                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
                         Beat "retrying $relKey (short: $finalSize/$expectedSize)"
                         Start-Sleep -Milliseconds 1000
                         continue
                     }
 
-                    # Staged copy is verified good - move it into the real
-                    # destination. Same drive, so this is an instant rename,
-                    # never a shell operation, never a dialog.
-                    try {
-                        if (Test-Path $destFile) { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop }
-                        Move-Item -LiteralPath $stagedFile -Destination $destFile -Force -ErrorAction Stop
-                    } catch {
-                        Beat "retrying $relKey (stage move failed: $_)"
-                        try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
-                        Start-Sleep -Milliseconds 800
-                        continue
-                    }
-
-                    try { Remove-Item -LiteralPath $attemptStageDir -Recurse -Force -ErrorAction Stop } catch {}
                     $copyOk = $true
                 } else {
-                    # Never appeared within the appear-timeout. Leave this
-                    # attempt's folder for the final cleanup rather than
-                    # deleting it here - if CopyHere really is still working
-                    # in the background, ripping the folder out from under it
-                    # is exactly the kind of thing that can throw its own
-                    # shell error. It's harmless clutter either way; the
-                    # per-run stage dir gets wiped wholesale at the end.
+                    # Never appeared within the appear-timeout. Clean any stub.
+                    if (Test-Path $destFile) {
+                        try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                    }
                     # A file that produces nothing at all rarely recovers
                     # within the same run - one extra attempt, then leave it
                     # for the whole-backup retry so we don't burn minutes per
@@ -776,7 +747,6 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
     }
 }
 
-try {
     # Many WPD/MTP phones only allow ONE active session at a time. A File
     # Explorer window left open browsing the phone (very easy to do - e.g.
     # checking on it, or it never got closed from a manual look) silently
@@ -824,10 +794,6 @@ try {
             Write-Host "CONNECT_FAILED:Could not read any files from the phone. Unlock it and keep the USB mode on File Transfer / MTP."
         }
     }
-} finally {
-    try { Remove-Item -LiteralPath $runStageDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-}
-
 Write-Host "DONE:$($script:copied):$($script:skipped):$($script:errors)"
 [Console]::Out.Flush()
 """
@@ -1454,9 +1420,11 @@ class PhoneBackupManager:
             result["errors"].append("MTP copy is only supported on Windows.")
             return result
 
-        # Clean up any staging folder left behind by an attempt that was
-        # killed mid-file (its own try/finally never got to run) — otherwise
-        # it just sits there as orphaned partial data forever.
+        # The copy script no longer stages through a throwaway folder (that
+        # approach turned out to make real MTP transfers unreliable — see
+        # the comment above the copy loop in _PS_COPY_MTP). This just mops
+        # up any leftover "_aegis_stage_*" debris from a run made under an
+        # earlier version of this script, so it doesn't sit there forever.
         for stray in Path(dest).glob("_aegis_stage_*"):
             shutil.rmtree(stray, ignore_errors=True)
 
