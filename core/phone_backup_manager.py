@@ -328,6 +328,45 @@ function Get-PriorityOrderedItems($ItemList) {
     return @($priority) + @($rest)
 }
 
+function Get-ItemFileName($Item) {
+    # $Item.Name is the DISPLAY name. With Explorer's "hide extensions for
+    # known file types" enabled -- the Windows default -- it comes back
+    # WITHOUT the extension ("IMG_1" for IMG_1.jpg), and that applies to the
+    # WPD/MTP namespace too, not just local folders.
+    #
+    # Using it for filenames broke this script in four compounding ways:
+    #   - relKey lost its extension, so it never matched the manifest (built
+    #     from the real filenames on disk) and EVERY file looked brand new on
+    #     EVERY run -- the "it isn't indexing anything" symptom;
+    #   - $destFile lost its extension, so Wait-ForFile watched a path
+    #     CopyHere was never going to create, and every transfer was reported
+    #     as failed after burning its full timeout;
+    #   - meanwhile CopyHere quietly wrote the file under its REAL name, so
+    #     the backup filled up with files the script didn't believe existed;
+    #   - which meant the next run hit a genuine name collision and raised
+    #     the Windows overwrite dialog.
+    #
+    # System.FileName is the actual filename including extension. Fall back
+    # through the other name properties, then to the display name with the
+    # extension re-attached, so a provider that exposes none of them still
+    # degrades to something sane.
+    foreach ($prop in @("System.FileName", "System.ItemName", "System.ItemNameDisplay")) {
+        try {
+            $candidate = [string]$Item.ExtendedProperty($prop)
+            if ($candidate -and $candidate.Trim()) { return $candidate }
+        } catch {}
+    }
+
+    $name = [string]$Item.Name
+    try {
+        $ext = [string]$Item.ExtendedProperty("System.FileExtension")
+        if ($ext -and -not $name.EndsWith($ext, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $name = "$name$ext"
+        }
+    } catch {}
+    return $name
+}
+
 function Get-ItemSizeBestEffort($Item) {
     # WPD/MTP shell namespace extensions are notoriously inconsistent about
     # exposing .Size - for many Android phones it's always $null. Try the
@@ -493,7 +532,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
         Beat "$Label has $($itemList.Count) entries"
 
         $currentCount = $itemList.Count
-        $currentSig = Get-FolderSignature (@($itemList | ForEach-Object { $_.Name }))
+        $currentSig = Get-FolderSignature (@($itemList | ForEach-Object { Get-ItemFileName $_ }))
         $sigKey = if ($RelLabel) { $RelLabel } else { $ROOT_SIG_KEY }
         $folderUnchanged = $false
         if (-not $ForceVerify -and $folderSigLookup.ContainsKey($sigKey)) {
@@ -509,11 +548,12 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
         foreach ($item in (Get-PriorityOrderedItems $itemList)) {
             Heartbeat
-            $safeName = $item.Name -replace '[\\/:*?"<>|]', '_'
+            $itemName = Get-ItemFileName $item
+            $safeName = $itemName -replace '[\\/:*?"<>|]', '_'
             $relKey = if ($RelLabel) { "$RelLabel\$safeName" } else { $safeName }
 
             if ($item.IsFolder) {
-                if (ShouldSkipItem $Label $item.Name) {
+                if (ShouldSkipItem $Label $itemName) {
                     Write-Host "FOLDER_SKIP:$($Label)\$($safeName)"
                     [Console]::Out.Flush()
                     continue
@@ -626,7 +666,7 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 # media folders do this often). Trust it at the same level
                 # the rest of this manifest already does, instead of paying
                 # to re-transfer content that's already safely backed up.
-                $xrefKey = "$($item.Name.ToLower())|$expectedSize"
+                $xrefKey = "$($itemName.ToLower())|$expectedSize"
                 if ($nameSizeIndex.ContainsKey($xrefKey)) {
                     $script:skipped++
                     Write-Host "FILE_SKIP_ELSEWHERE:$relKey"
