@@ -1057,11 +1057,18 @@ class PhoneBackupManager:
         copy_stopped = bool(copy_result.get("cancelled")) or bool(should_stop and should_stop())
 
         result["stage"] = "index"
-        if progress_callback:
-            progress_callback(-3, "Indexing preserved phone folders...")
 
-        index_result = self._index_existing_backup_tree(manifest, latest_dir)
-        result["index_result"] = index_result
+        # Re-walking latest/ is only worth it if this pass actually put
+        # something there. On an attempt that copied nothing — the usual shape
+        # of a failed reconnect — the local tree is byte-for-byte what the
+        # pre-copy index already recorded, so re-statting every file in it
+        # (20k+ files on a well-used backup) just makes each failed retry
+        # slower for no new information.
+        if int(copy_result.get("copied") or 0) > 0:
+            if progress_callback:
+                progress_callback(-3, "Indexing preserved phone folders...")
+            result["index_result"] = self._index_existing_backup_tree(manifest, latest_dir)
+
         self._save_manifest(device_dir, manifest)
         result["manifest_summary"] = self._summarize_manifest(manifest)
 
@@ -1090,6 +1097,63 @@ class PhoneBackupManager:
 
     MAX_RETRY_BACKOFF_SECONDS = 120
     DEVICE_POLL_INTERVAL_SECONDS = 5
+
+    # How long to keep watching for a phone that has dropped off the bus
+    # before spending another attempt on it. Generous on purpose: the whole
+    # point of the retry loop is that a backup can be left running, and a
+    # phone that needs a replug should be picked up whenever that happens
+    # rather than forcing a restart from the UI.
+    DEVICE_REAPPEAR_WAIT_SECONDS = 600
+
+    def _wait_for_device(
+        self,
+        device: PhoneDevice,
+        max_wait_seconds: int,
+        should_stop: Optional[StopCallback],
+        progress_callback: Optional[ProgressCallback],
+    ) -> Optional[PhoneDevice]:
+        """
+        Watch for *device* to come back, for up to *max_wait_seconds*.
+
+        Returns the re-detected PhoneDevice, or None if it never reappeared.
+        The returned device matters: Windows routinely assigns a different
+        MTP shell path after a drop, and retrying the stale one just fails
+        again immediately.
+        """
+        started = time.monotonic()
+        told_user = False
+
+        while True:
+            if should_stop and should_stop():
+                return None
+
+            refreshed = self._reacquire_device(device)
+            if refreshed:
+                return refreshed
+
+            waited = time.monotonic() - started
+            if waited >= max_wait_seconds:
+                return None
+
+            if progress_callback:
+                if not told_user:
+                    told_user = True
+                    progress_callback(
+                        -3,
+                        "The phone has dropped off USB and Windows can't see it. "
+                        "Unplug and replug the cable (and unlock the phone, keeping "
+                        "it on File Transfer/MTP) — this will pick it up on its own "
+                        "and carry on from where it stopped. Nothing copied so far "
+                        "is lost.",
+                    )
+                else:
+                    progress_callback(
+                        -2,
+                        f"Waiting for the phone to reappear… {int(waited)}s so far "
+                        f"(replugging the cable is the quickest fix)",
+                    )
+
+            time.sleep(self.DEVICE_POLL_INTERVAL_SECONDS)
 
     def backup_phone_until_complete(
         self,
@@ -1203,10 +1267,6 @@ class PhoneBackupManager:
                 "lost the USB/MTP connection" if last_result.get("connection_failed")
                 else "stopped responding"
             )
-            if made_progress:
-                wait_seconds = 3
-            else:
-                wait_seconds = min(10 * stall_streak, self.MAX_RETRY_BACKOFF_SECONDS)
             if progress_callback:
                 progress_callback(
                     -3,
@@ -1214,21 +1274,34 @@ class PhoneBackupManager:
                     f"pass — retrying (attempt {attempt + 1})…",
                 )
 
-            deadline = time.monotonic() + wait_seconds
-            refreshed = None
-            while time.monotonic() < deadline:
-                if should_stop and should_stop():
-                    break
-                refreshed = self._reacquire_device(current_device)
-                if refreshed:
-                    break
-                time.sleep(min(self.DEVICE_POLL_INTERVAL_SECONDS, 2))
-
-            # Always re-detect once more before retrying — Windows often hands the
-            # phone a fresh MTP shell path after even a momentary drop, and the
-            # stale one will just fail again.
-            if not refreshed:
-                refreshed = self._reacquire_device(current_device)
+            # How long to keep looking for the phone before spending another
+            # attempt on it.
+            #
+            # This used to key off "did we copy anything this pass", which had
+            # it exactly backwards for the most common real failure: copy a
+            # few hundred files, then have the phone's MTP stack fall off the
+            # USB bus entirely. That counted as progress, so it got the
+            # SHORTEST wait (3s) — far too little for a device that needs to
+            # re-enumerate, so the next attempts fired instantly against a
+            # phone that wasn't there and burned themselves for nothing.
+            #
+            # What actually matters is whether the phone is still reachable.
+            # If it isn't, be patient: a crashed MTP responder usually comes
+            # back on its own within a minute or two, and a replugged cable
+            # should be picked up automatically rather than making the user
+            # start over.
+            refreshed = self._reacquire_device(current_device)
+            if refreshed is None:
+                refreshed = self._wait_for_device(
+                    current_device,
+                    self.DEVICE_REAPPEAR_WAIT_SECONDS,
+                    should_stop,
+                    progress_callback,
+                )
+            elif not made_progress:
+                # Phone is visible but gave us nothing — a short breather,
+                # backing off as the empty passes pile up.
+                time.sleep(min(5 * stall_streak, self.MAX_RETRY_BACKOFF_SECONDS))
 
             if refreshed:
                 current_device = refreshed
