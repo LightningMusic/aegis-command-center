@@ -5,17 +5,22 @@ A "where did my space go" folder-size walk that covers the *whole* drive,
 including Program Files / Windows / game installs that the Aegis file index
 deliberately skips. stat-only (no hashing), depth-limited, cancellable.
 
-    result = scan_folder_sizes("C:\\", max_depth=2, should_stop=flag, progress=cb)
+    result = scan_folder_sizes("C:\\", should_stop=flag, progress=cb)
     result["total"]        -> bytes used under the root
-    result["children"]     -> [{"name","path","size","is_dir"}]  biggest first
-    result["categories"]   -> {"Windows": n, "Programs": n, "Games": n,
-                               "Users\\<name>": n, "Other": n}
+    result["tree"]         -> nested {"name","path","size","own_size",
+                                      "file_count","children":[...]}
+    result["children"]     -> tree["children"] (biggest first)
+    result["categories"]   -> {"Windows & system": n, "Programs": n,
+                               "Games": n, "Users": n, "Other": n}
+
+The tree is what the UI drills into, so it is built once here rather than
+re-scanning a folder every time someone expands a row.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from core.app_scanner import steam_library_paths
 
@@ -32,6 +37,19 @@ _SKIP_DIR_NAMES = {
 _SKIP_DIR_PATHS = ("\\windows\\winsxs", "\\windows\\installer")
 _SKIP_FILE_NAMES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "dumpstack.log.tmp"}
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+# How deep to keep per-folder detail. Deeper files still count toward the
+# total and toward their nearest kept ancestor — this only bounds how far
+# you can drill in, and how much the scan has to remember. Depth 6 reaches
+# inside an individual Steam game
+# (Program Files (x86) / Steam / steamapps / common / <game> / <subdir>).
+DEFAULT_MAX_DEPTH = 6
+
+# Folders smaller than this are rolled into their parent rather than listed
+# individually. Without a floor, a drive produces tens of thousands of
+# uninteresting 4 KB folders and the tree becomes unreadable.
+DEFAULT_MIN_NODE_BYTES = 64 * 1024 * 1024  # 64 MB
+DEFAULT_MAX_CHILDREN = 60
 
 ProgressCB = Callable[[int, str], None]
 StopCB = Callable[[], bool]
@@ -56,36 +74,47 @@ def _categorize(name: str, path: str, game_prefixes: List[str]) -> str:
 def scan_folder_sizes(
     root: str,
     *,
-    max_depth: int = 2,
-    top_n: int = 40,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    top_n: int = DEFAULT_MAX_CHILDREN,
+    min_node_bytes: int = DEFAULT_MIN_NODE_BYTES,
     should_stop: Optional[StopCB] = None,
     progress: Optional[ProgressCB] = None,
 ) -> Dict:
     root = root if root.endswith(os.sep) else root + os.sep
-    game_prefixes = [str(p).lower() for p in steam_library_paths()]
+
+    # Steam libraries can live anywhere; knowing where they are lets the
+    # category rollup call a game a game instead of "Other".
+    try:
+        game_prefixes = [str(p).lower() for p in steam_library_paths()]
+    except Exception:  # noqa: BLE001 - never let detection break the scan
+        game_prefixes = []
 
     total = 0
     file_count = 0
-    # size accumulated per folder path we still care about (depth <= max_depth)
-    sizes: Dict[str, int] = {}
-    root_depth = root.rstrip(os.sep).count(os.sep)
 
-    def bump(path: str, nbytes: int) -> None:
-        # attribute nbytes to every ancestor folder down to max_depth
-        parts = path[len(root):].split(os.sep)
-        for i in range(1, min(len(parts), max_depth) + 1):
-            key = root + os.sep.join(parts[:i])
-            sizes[key] = sizes.get(key, 0) + nbytes
+    # Bytes/files sitting DIRECTLY in each tracked folder, plus the parent
+    # link, so totals can be rolled up bottom-up once at the end. The old
+    # version instead re-split every file's path and credited each ancestor
+    # as it went — O(files x depth) string work in the hot loop, and it threw
+    # away everything below depth 1 anyway.
+    own_bytes: Dict[str, int] = {root: 0}
+    own_files: Dict[str, int] = {root: 0}
+    parent_of: Dict[str, str] = {}
 
-    stack = [root]
+    # (directory to scan, folder its files get credited to). Past max_depth
+    # the attribution folder stops advancing, so deep trees still count
+    # toward the total without the scan having to remember every folder.
+    stack: List[Tuple[str, str]] = [(root, root)]
+
     while stack:
         if should_stop and should_stop():
             break
-        current = stack.pop()
+        current, attribute_to = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
             continue
+
         for entry in entries:
             try:
                 name_low = entry.name.lower()
@@ -100,7 +129,16 @@ def scan_folder_sizes(
                             continue  # junction / symlink
                     except (AttributeError, OSError):
                         pass
-                    stack.append(entry.path)
+
+                    depth = entry.path[len(root):].count(os.sep) + 1
+                    if depth <= max_depth:
+                        own_bytes.setdefault(entry.path, 0)
+                        own_files.setdefault(entry.path, 0)
+                        parent_of[entry.path] = attribute_to
+                        stack.append((entry.path, entry.path))
+                    else:
+                        stack.append((entry.path, attribute_to))
+
                 elif entry.is_file(follow_symlinks=False):
                     if name_low in _SKIP_FILE_NAMES:
                         continue
@@ -112,25 +150,52 @@ def scan_folder_sizes(
                     size = st.st_size
                     total += size
                     file_count += 1
-                    bump(entry.path, size)
+                    own_bytes[attribute_to] = own_bytes.get(attribute_to, 0) + size
+                    own_files[attribute_to] = own_files.get(attribute_to, 0) + 1
                     if progress and file_count % 20000 == 0:
                         progress(file_count, f"{file_count:,} files · {_gb(total)} GB")
             except OSError:
                 continue
 
-    # top-level children (depth 1) sorted, plus the category rollup
-    children: List[Dict] = []
-    categories: Dict[str, int] = {}
-    for path, size in sizes.items():
-        rel = path[len(root):]
-        if os.sep in rel:  # only depth-1 entries for the children list
-            continue
-        children.append({"name": rel, "path": path, "size": size, "is_dir": True})
-        categories[_categorize(rel, path, game_prefixes)] = (
-            categories.get(_categorize(rel, path, game_prefixes), 0) + size
-        )
+    stopped = bool(should_stop and should_stop())
 
-    children.sort(key=lambda c: c["size"], reverse=True)
+    # Roll child totals into parents, deepest first so a folder's children
+    # are final before it is.
+    rolled: Dict[str, int] = dict(own_bytes)
+    rolled_files: Dict[str, int] = dict(own_files)
+    for path in sorted(own_bytes, key=lambda p: p.count(os.sep), reverse=True):
+        parent = parent_of.get(path)
+        if parent is not None and parent != path:
+            rolled[parent] = rolled.get(parent, 0) + rolled.get(path, 0)
+            rolled_files[parent] = rolled_files.get(parent, 0) + rolled_files.get(path, 0)
+
+    children_of: Dict[str, List[str]] = {}
+    for child, parent in parent_of.items():
+        children_of.setdefault(parent, []).append(child)
+
+    def build(path: str, name: str) -> Dict:
+        kids = []
+        for child in children_of.get(path, []):
+            if rolled.get(child, 0) < min_node_bytes:
+                continue
+            kids.append(build(child, os.path.basename(child.rstrip(os.sep))))
+        kids.sort(key=lambda c: c["size"], reverse=True)
+        return {
+            "name": name,
+            "path": path,
+            "size": rolled.get(path, 0),
+            "own_size": own_bytes.get(path, 0),
+            "file_count": rolled_files.get(path, 0),
+            "children": kids[:top_n],
+        }
+
+    tree = build(root, root)
+
+    categories: Dict[str, int] = {}
+    for child in tree["children"]:
+        key = _categorize(child["name"], child["path"], game_prefixes)
+        categories[key] = categories.get(key, 0) + child["size"]
+
     if progress:
         progress(file_count, f"{file_count:,} files · {_gb(total)} GB")
 
@@ -138,9 +203,12 @@ def scan_folder_sizes(
         "root": root,
         "total": total,
         "file_count": file_count,
-        "children": children[:top_n],
+        "tree": tree,
+        "children": tree["children"],
         "categories": dict(sorted(categories.items(), key=lambda kv: kv[1], reverse=True)),
-        "stopped": bool(should_stop and should_stop()),
+        "stopped": stopped,
+        "max_depth": max_depth,
+        "min_node_bytes": min_node_bytes,
     }
 
 

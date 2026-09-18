@@ -1,4 +1,6 @@
 import os
+from typing import Dict
+
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QTabWidget,
     QTextEdit,
+    QHeaderView,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -102,6 +105,7 @@ class DiskMapWorker(QObject):
 
     finished = pyqtSignal(str, dict)   # drive, payload
     progress = pyqtSignal(str, str)    # drive, message
+    partial  = pyqtSignal(str, dict)   # drive, payload-so-far
 
     def __init__(self, drive):
         super().__init__()
@@ -116,6 +120,24 @@ class DiskMapWorker(QObject):
         from core.disk_map import scan_folder_sizes
 
         payload = {}
+
+        # Steam's install list comes from the registry plus a handful of small
+        # manifest files — it's ready in well under a second. It used to run
+        # AFTER the whole-drive walk, so the Games & Apps tab sat empty for as
+        # long as the walk took and looked like Steam detection was broken.
+        # Emit what's cheap first, then fill in the expensive part.
+        try:
+            payload["steam"] = steam_games(self.drive)
+        except Exception:  # noqa: BLE001
+            payload["steam"] = []
+        self.partial.emit(self.drive, dict(payload))
+
+        try:
+            payload["programs"] = installed_programs(self.drive, should_stop=lambda: self._stop)
+        except Exception:  # noqa: BLE001
+            payload["programs"] = []
+        self.partial.emit(self.drive, dict(payload))
+
         try:
             payload["folders"] = scan_folder_sizes(
                 self.drive,
@@ -124,14 +146,7 @@ class DiskMapWorker(QObject):
             )
         except Exception as exc:  # noqa: BLE001
             payload["folders_error"] = str(exc)
-        try:
-            payload["steam"] = steam_games(self.drive)
-        except Exception:  # noqa: BLE001
-            payload["steam"] = []
-        try:
-            payload["programs"] = installed_programs(self.drive, should_stop=lambda: self._stop)
-        except Exception:  # noqa: BLE001
-            payload["programs"] = []
+
         self.finished.emit(self.drive, payload)
 
 
@@ -177,6 +192,66 @@ class BackupWorker(QObject):
 
     def should_stop(self):
         return self._stop_requested
+
+class SizeTreeWidget(QTreeWidget):
+    """
+    Expandable folder/size view for the Disk Map and Games & Apps tabs.
+
+    These used to be flat QTextEdit dumps of the top 40 folders, which
+    answered "what's big" but not "big because of what" — you could see
+    Program Files was 500 GB and had no way to look inside. The scan already
+    computes the nested sizes, so every row here can be opened without
+    touching the disk again.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setHeaderLabels(["Folder", "Size", "Share", "Files"])
+        self.setColumnCount(4)
+        self.setAlternatingRowColors(True)
+        self.setUniformRowHeights(True)
+        self.setSortingEnabled(False)
+        header = self.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in (1, 2, 3):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def show_message(self, text: str) -> None:
+        """Single informational row — the tree stand-in for setPlainText()."""
+        self.clear()
+        item = QTreeWidgetItem(self, [text, "", "", ""])
+        item.setFirstColumnSpanned(True)
+
+    def add_node(self, parent, name: str, size: int, total: int,
+                 file_count: int = 0, tooltip: str = "") -> QTreeWidgetItem:
+        share = f"{(size / total * 100):.1f}%" if total else ""
+        item = QTreeWidgetItem(
+            parent,
+            [name, _format_gb(size), share, f"{file_count:,}" if file_count else ""],
+        )
+        item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight)
+        item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight)
+        item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight)
+        if tooltip:
+            item.setToolTip(0, tooltip)
+        return item
+
+    def add_tree(self, parent, node: Dict, total: int) -> QTreeWidgetItem:
+        """Recursively add a node from scan_folder_sizes()'s nested tree."""
+        item = self.add_node(
+            parent,
+            node.get("name") or node.get("path", "?"),
+            int(node.get("size") or 0),
+            total,
+            int(node.get("file_count") or 0),
+            tooltip=node.get("path", ""),
+        )
+        for child in node.get("children") or []:
+            self.add_tree(item, child, total)
+        return item
+
 
 class DuplicateGroupsWidget(QWidget):
     def __init__(self, file_manager, drive, parent_view):
@@ -795,15 +870,16 @@ class FilesView(QWidget):
             for label, key in self._SUBTABS:
                 if key == "duplicates":
                     widget = DuplicateGroupsWidget(self.file_manager, root, self)
+                elif key in ("diskmap", "apps"):
+                    widget = SizeTreeWidget()
+                    widget.show_message(
+                        "Open this tab to scan — this walks the whole drive "
+                        "(Program Files, games, everything) and can take a minute."
+                    )
                 else:
                     widget = QTextEdit()
                     widget.setReadOnly(True)
                     widget.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-                    if key in ("diskmap", "apps"):
-                        widget.setPlainText(
-                            "Open this tab to scan — this walks the whole drive "
-                            "(Program Files, games, everything) and can take a minute."
-                        )
                 inner_tabs.addTab(widget, label)
                 sections[key] = widget
 
@@ -825,13 +901,13 @@ class FilesView(QWidget):
             return
         if self._diskmap_thread is not None and self._diskmap_thread.isRunning():
             # one full-drive walk at a time
-            self.drive_tabs[drive]["diskmap"].setPlainText(
+            self.drive_tabs[drive]["diskmap"].show_message(
                 "Another drive scan is running — open this tab again when it finishes."
             )
             return
         self._diskmap_state[drive] = "loading"
         for k in ("diskmap", "apps"):
-            self.drive_tabs[drive][k].setPlainText(f"Scanning {drive} …")
+            self.drive_tabs[drive][k].show_message(f"Scanning {drive} …")
 
         thread = QThread()
         worker = DiskMapWorker(drive)
@@ -839,8 +915,9 @@ class FilesView(QWidget):
         thread.started.connect(worker.run)
         worker.progress.connect(
             lambda d, msg: self.drive_tabs.get(d, {}).get("diskmap")
-            and self.drive_tabs[d]["diskmap"].setPlainText(f"Scanning {d} …\n{msg}")
+            and self.drive_tabs[d]["diskmap"].show_message(f"Scanning {d} …   {msg}")
         )
+        worker.partial.connect(self._on_diskmap_partial)
         worker.finished.connect(self._on_diskmap_ready)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -857,6 +934,14 @@ class FilesView(QWidget):
     def _cleanup_diskmap_thread(self):
         self._diskmap_thread = None
         self._diskmap_worker = None
+
+    def _on_diskmap_partial(self, drive, payload):
+        """Steam/app results land here well before the drive walk finishes."""
+        tabs = self.drive_tabs.get(drive)
+        if not tabs:
+            return
+        self._diskmap_cache[drive] = {**self._diskmap_cache.get(drive, {}), **payload}
+        self._render_apps(tabs["apps"], self._diskmap_cache[drive])
 
     def _on_diskmap_ready(self, drive, payload):
         self._diskmap_state[drive] = "done"
@@ -1270,53 +1355,102 @@ class FilesView(QWidget):
         widget.clear()
         fm = payload.get("folders")
         if not fm:
-            widget.append("Disk map unavailable: " + str(payload.get("folders_error", "")))
+            widget.show_message(
+                "Disk map unavailable: " + str(payload.get("folders_error", ""))
+            )
             return
-        widget.append(
-            f"Apparent size of {fm['root']}: {_format_gb(fm['total'])} "
-            f"across {fm['file_count']:,} files"
+
+        total = int(fm.get("total") or 0)
+
+        summary = widget.add_node(
+            widget,
+            f"{fm['root']} — apparent size"
+            + ("  (scan stopped early, totals partial)" if fm.get("stopped") else ""),
+            total,
+            total,
+            int(fm.get("file_count") or 0),
+            tooltip="Approximate: Windows hardlinks and OneDrive online-only "
+                    "files can inflate this.",
         )
-        widget.append(
-            "(approximate — Windows hardlinks and OneDrive online-only files "
-            "can inflate this)"
+        summary.setExpanded(True)
+
+        categories = fm.get("categories") or {}
+        if categories:
+            cat_root = widget.add_node(widget, "By category", total, total)
+            for name, size in categories.items():
+                widget.add_node(cat_root, name, int(size or 0), total)
+            cat_root.setExpanded(True)
+
+        tree = fm.get("tree")
+        children = (tree or {}).get("children") or fm.get("children") or []
+        folders_root = widget.add_node(
+            widget, "Biggest folders (expand to drill in)", total, total
         )
-        if fm.get("stopped"):
-            widget.append("— scan was stopped early, totals are partial —")
-        widget.append("")
-        widget.append("By category")
-        for name, size in fm.get("categories", {}).items():
-            widget.append(f"   {_format_gb(size):>12}   {name}")
-        widget.append("")
-        widget.append("Biggest folders")
-        for child in fm.get("children", []):
-            widget.append(f"   {_format_gb(child['size']):>12}   {child['name']}")
+        for child in children:
+            widget.add_tree(folders_root, child, total)
+        folders_root.setExpanded(True)
 
     def _render_apps(self, widget, payload):
         widget.clear()
+
         steam = payload.get("steam") or []
+        programs = payload.get("programs") or []
+
+        steam_total = sum(int(g.get("size_bytes") or 0) for g in steam)
+        prog_total = sum(
+            int(p.get("exclusive_bytes", p.get("size_bytes")) or 0) for p in programs
+        )
+
+        # Percentages are share OF THE DRIVE once the walk has finished —
+        # the most useful reading, and the only basis that isn't skewed by
+        # the two lists overlapping (the installed-programs scan reaches into
+        # steamapps/common, so it lists the same games the Steam section
+        # does; adding the two totals would count every game twice).
+        grand_total = int((payload.get("folders") or {}).get("total") or 0)
+        if not grand_total:
+            grand_total = prog_total or steam_total
+
         if steam:
-            total = sum(g["size_bytes"] for g in steam)
-            libs = sorted({g["library"] for g in steam})
-            widget.append(
-                f"Steam — {len(steam)} game(s), {_format_gb(total)}"
-                + (f"   ·   library: {'; '.join(libs)}" if libs else "")
+            libs = sorted({g.get("library", "") for g in steam if g.get("library")})
+            node = widget.add_node(
+                widget,
+                f"Steam — {len(steam)} game(s)",
+                steam_total,
+                grand_total,
+                tooltip="; ".join(libs),
             )
             for g in steam:
-                widget.append(f"   {_format_gb(g['size_bytes']):>12}   {g['name']}")
-        else:
-            widget.append("Steam: no games found on this drive.")
-        widget.append("")
-
-        programs = payload.get("programs") or []
-        if programs:
-            widget.append("Installed program folders (over 50 MB)")
-            for p in programs[:60]:
-                widget.append(
-                    f"   {_format_gb(p['size_bytes']):>12}   {p['name']}   "
-                    f"[{p['location']}]"
+                widget.add_node(
+                    node, g.get("name", "?"), int(g.get("size_bytes") or 0),
+                    grand_total, tooltip=g.get("path", ""),
                 )
+            node.setExpanded(True)
         else:
-            widget.append("No large program folders found on this drive.")
+            widget.add_node(widget, "Steam — no games found on this drive", 0, 0)
+
+        if programs:
+            node = widget.add_node(
+                widget,
+                f"Installed programs — {len(programs)} folder(s) over 50 MB",
+                prog_total,
+                grand_total,
+                tooltip="Sizes exclude anything already listed separately "
+                        "underneath, so launchers aren't counted twice.",
+            )
+            for p in programs[:80]:
+                size = int(p.get("size_bytes") or 0)
+                own = int(p.get("exclusive_bytes", size) or 0)
+                contains = int(p.get("contains") or 0)
+                label = f"{p.get('name', '?')}   [{p.get('location', '')}]"
+                if contains:
+                    label += f"   — {_format_gb(size)} incl. {contains} listed below"
+                widget.add_node(node, label, own, grand_total,
+                                tooltip=p.get("path", ""))
+            node.setExpanded(True)
+        elif "programs" in payload:
+            widget.add_node(widget, "No large program folders found on this drive", 0, 0)
+        else:
+            widget.add_node(widget, "Scanning installed programs…", 0, 0)
 
     def _render_duplicates(self, widget, data):
         duplicates = data.get("duplicates") or []

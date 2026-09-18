@@ -224,8 +224,39 @@ def installed_programs(drive: str, min_bytes: int = 50 * 1024 * 1024,
                     "location": root.name,
                 })
 
+    _add_exclusive_sizes(out)
     out.sort(key=lambda p: p["size_bytes"], reverse=True)
     return out
+
+
+def _add_exclusive_sizes(entries: List[Dict]) -> None:
+    """
+    Annotate entries that physically contain other entries.
+
+    The app roots overlap on purpose: scanning "Program Files (x86)" finds
+    Steam, and scanning "Steam\\steamapps\\common" finds each game. Both are
+    worth showing, but Steam's size already includes every one of those
+    games, so a flat list double-counts — on a real machine that reads as
+    ~1.1 TB of programs on a 930 GB drive, and any size-ranked "what should
+    I delete" recommendation built on it is nonsense.
+
+    Adds, without changing size_bytes:
+      exclusive_bytes - size not accounted for by other listed entries
+      contains        - how many listed entries live inside this one
+    """
+    prepared = [(e, e["path"].lower().rstrip("\\") + "\\") for e in entries]
+
+    for entry, prefix in prepared:
+        nested_total = 0
+        nested_count = 0
+        for other, other_prefix in prepared:
+            if other is entry:
+                continue
+            if other_prefix.startswith(prefix):
+                nested_total += int(other.get("size_bytes") or 0)
+                nested_count += 1
+        entry["contains"] = nested_count
+        entry["exclusive_bytes"] = max(0, int(entry.get("size_bytes") or 0) - nested_total)
 
 
 # ── helper ─────────────────────────────────────────────────────────────────
