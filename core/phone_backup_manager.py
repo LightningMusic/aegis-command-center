@@ -1707,7 +1707,7 @@ class PhoneBackupManager:
 
                 if line.startswith("FILE_OK:"):
                     result["copied"] += 1
-                    fname = Path(line[8:]).name
+                    fname = Path(line[len("FILE_OK:"):]).name
                     if progress_callback:
                         progress_callback(-1, f"Copied: {fname}")
 
@@ -1717,7 +1717,13 @@ class PhoneBackupManager:
                     # a check we could actually make — the only sign of
                     # success was "the bytes stopped flowing". Queue it for a
                     # real local integrity check once the transfer is done.
-                    path = line[17:]
+                    #
+                    # The offset here is derived from the prefix on purpose: a
+                    # hand-counted one was off by one, which silently ate the
+                    # drive letter ("D:\..." -> ":\...") and made every one of
+                    # these files fail its integrity check with a bogus
+                    # "cannot stat" against a path that could never resolve.
+                    path = line[len("FILE_OK_UNSIZED:"):]
                     result["copied"] += 1
                     unverified_size_paths.append(path)
                     if progress_callback:
@@ -1874,21 +1880,36 @@ class PhoneBackupManager:
 
         result["copied"] = max(0, result.get("copied", 0) - len(bad))
         result["integrity_failed"] = [p for p, _ in bad]
-        for path, reason in bad[:20]:
-            result["errors"].append(
-                f"Copied but failed a local integrity check ({reason}) — "
-                f"deleted so it's re-copied properly next run: {Path(path).name}"
-            )
-        for path, _reason in bad:
-            try:
-                relkey = os.path.relpath(path, dest)
-                result["failed_keys"].append(relkey)
-            except ValueError:
-                pass
+
+        for path, reason in bad:
+            # Only claim it was removed if it actually was. Reporting a
+            # deletion that silently failed is how a bad path turned into
+            # four confident "deleted so it's re-copied next run" messages
+            # about files that were sitting on disk the whole time.
+            removed = False
             try:
                 os.unlink(path)
+                removed = True
             except OSError:
                 pass
+
+            if removed:
+                try:
+                    result["failed_keys"].append(os.path.relpath(path, dest))
+                except ValueError:
+                    pass
+
+            if len(result["errors"]) < 20:
+                tail = (
+                    "removed, so it gets copied again cleanly next run"
+                    if removed else
+                    "could NOT be removed, so it is still in the backup as-is "
+                    "— check it by hand"
+                )
+                result["errors"].append(
+                    f"Copied but failed a local integrity check ({reason}) — "
+                    f"{tail}: {Path(path).name}"
+                )
 
     def _copy_drive(
         self,
