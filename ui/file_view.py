@@ -1361,33 +1361,53 @@ class FilesView(QWidget):
             return
 
         total = int(fm.get("total") or 0)
+        used = int(fm.get("disk_used") or 0)
+        capacity = int(fm.get("disk_capacity") or 0)
+        free = int(fm.get("disk_free") or 0)
+        basis = used or total
 
         summary = widget.add_node(
             widget,
-            f"{fm['root']} — apparent size"
+            f"{fm['root']} — {_format_gb(used)} used of {_format_gb(capacity)}"
             + ("  (scan stopped early, totals partial)" if fm.get("stopped") else ""),
-            total,
-            total,
+            used,
+            basis,
             int(fm.get("file_count") or 0),
-            tooltip="Approximate: Windows hardlinks and OneDrive online-only "
-                    "files can inflate this.",
+            tooltip="Used/free come from Windows itself, so they're the "
+                    "authoritative numbers to reconcile against.",
         )
+        widget.add_node(summary, "Free space", free, basis)
+        widget.add_node(
+            summary, "Accounted for by the folders below", total, basis,
+            int(fm.get("file_count") or 0),
+        )
+        gap = int(fm.get("unattributed") or 0)
+        if gap:
+            widget.add_node(
+                summary,
+                "Not counted — Windows component store (mostly hardlinks, "
+                "counting it would double-count), installer cache, System "
+                "Restore, and folders Windows won't let us read",
+                gap,
+                basis,
+            )
         summary.setExpanded(True)
 
         categories = fm.get("categories") or {}
         if categories:
-            cat_root = widget.add_node(widget, "By category", total, total)
+            cat_root = widget.add_node(widget, "By category", total, basis)
             for name, size in categories.items():
-                widget.add_node(cat_root, name, int(size or 0), total)
+                widget.add_node(cat_root, name, int(size or 0), basis)
             cat_root.setExpanded(True)
 
         tree = fm.get("tree")
         children = (tree or {}).get("children") or fm.get("children") or []
         folders_root = widget.add_node(
-            widget, "Biggest folders (expand to drill in)", total, total
+            widget, "Biggest folders (expand to drill in)", total, basis,
+            int(fm.get("file_count") or 0),
         )
         for child in children:
-            widget.add_tree(folders_root, child, total)
+            widget.add_tree(folders_root, child, basis)
         folders_root.setExpanded(True)
 
     def _render_apps(self, widget, payload):

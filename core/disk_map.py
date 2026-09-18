@@ -19,7 +19,10 @@ re-scanning a folder every time someone expands a row.
 
 from __future__ import annotations
 
+import ctypes
 import os
+import shutil
+from ctypes import wintypes
 from typing import Callable, Dict, List, Optional, Tuple
 
 from core.app_scanner import steam_library_paths
@@ -37,6 +40,53 @@ _SKIP_DIR_NAMES = {
 _SKIP_DIR_PATHS = ("\\windows\\winsxs", "\\windows\\installer")
 _SKIP_FILE_NAMES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "dumpstack.log.tmp"}
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_FILE_ATTRIBUTE_SPARSE_FILE = 0x200
+_FILE_ATTRIBUTE_COMPRESSED = 0x800
+# Files carrying either of these report a LOGICAL size in st_size that can be
+# wildly larger than the space they actually occupy, so they need asking a
+# second time (see _size_on_disk).
+_NEEDS_REAL_SIZE = _FILE_ATTRIBUTE_SPARSE_FILE | _FILE_ATTRIBUTE_COMPRESSED
+
+
+def _make_size_on_disk():
+    """
+    Actual allocated size of a file, which is not the same thing as st_size.
+
+    st_size is the file's LOGICAL length. A sparse file reports the size it
+    pretends to be: a real example from this machine is a Google Drive
+    virtual-disk image, userdata.img, reporting 512.00 GB while occupying
+    1.13 GB. Counting logical sizes made a 930 GB drive add up to 1,282 GB.
+
+    GetCompressedFileSizeW returns what the file really costs, accounting for
+    both sparseness and NTFS compression. It's a per-file call, so it is only
+    used for files whose attributes say it could matter — a few hundred out
+    of hundreds of thousands.
+    """
+    if os.name != "nt":
+        return lambda path: None
+    try:
+        fn = ctypes.windll.kernel32.GetCompressedFileSizeW
+        fn.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        fn.restype = wintypes.DWORD
+    except (AttributeError, OSError):
+        return lambda path: None
+
+    invalid = 0xFFFFFFFF
+
+    def size_on_disk(path: str) -> Optional[int]:
+        try:
+            high = wintypes.DWORD(0)
+            low = fn(path, ctypes.byref(high))
+            if low == invalid:
+                return None
+            return (high.value << 32) + low
+        except (OSError, ValueError):
+            return None
+
+    return size_on_disk
+
+
+_size_on_disk = _make_size_on_disk()
 
 # How deep to keep per-folder detail. Deeper files still count toward the
 # total and toward their nearest kept ancestor — this only bounds how far
@@ -143,11 +193,16 @@ def scan_folder_sizes(
                     if name_low in _SKIP_FILE_NAMES:
                         continue
                     st = entry.stat(follow_symlinks=False)
+                    attrs = getattr(st, "st_file_attributes", 0)
                     # cloud placeholder (OneDrive "online-only") — reports full
                     # size but takes ~no disk
-                    if getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
+                    if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
                         continue
                     size = st.st_size
+                    if attrs & _NEEDS_REAL_SIZE:
+                        real = _size_on_disk(entry.path)
+                        if real is not None:
+                            size = real
                     total += size
                     file_count += 1
                     own_bytes[attribute_to] = own_bytes.get(attribute_to, 0) + size
@@ -199,10 +254,26 @@ def scan_folder_sizes(
     if progress:
         progress(file_count, f"{file_count:,} files · {_gb(total)} GB")
 
+    # Windows' own figures, so the walk can be reconciled against reality
+    # rather than just asserted. The walk deliberately skips things that do
+    # occupy real space (the WinSxS component store, System Volume
+    # Information, files it has no permission to read), so "used" will
+    # normally exceed what we can attribute — and that gap is itself worth
+    # showing rather than hiding.
+    capacity = used = free = 0
+    try:
+        capacity, used, free = shutil.disk_usage(root)
+    except OSError:
+        pass
+
     return {
         "root": root,
         "total": total,
         "file_count": file_count,
+        "disk_capacity": capacity,
+        "disk_used": used,
+        "disk_free": free,
+        "unattributed": max(0, used - total),
         "tree": tree,
         "children": tree["children"],
         "categories": dict(sorted(categories.items(), key=lambda kv: kv[1], reverse=True)),
