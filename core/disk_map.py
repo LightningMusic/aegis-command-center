@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
+import time
 from ctypes import wintypes
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -101,6 +102,8 @@ DEFAULT_MAX_DEPTH = 6
 DEFAULT_MIN_NODE_BYTES = 64 * 1024 * 1024  # 64 MB
 DEFAULT_MAX_CHILDREN = 60
 
+_DAY = 86400.0
+
 ProgressCB = Callable[[int, str], None]
 StopCB = Callable[[], bool]
 
@@ -142,6 +145,13 @@ def scan_folder_sizes(
     total = 0
     file_count = 0
 
+    # Timestamps are taken with max(), so a single file with a nonsense date
+    # poisons every folder above it. This drive has one reporting the year
+    # 2255, which made the whole of C:\Users look like it had no date at all.
+    # Anything in the future (beyond a day's clock skew) or at/below the
+    # epoch is not a real modification time.
+    max_sane_mtime = time.time() + _DAY
+
     # Bytes/files sitting DIRECTLY in each tracked folder, plus the parent
     # link, so totals can be rolled up bottom-up once at the end. The old
     # version instead re-split every file's path and credited each ancestor
@@ -149,6 +159,10 @@ def scan_folder_sizes(
     # away everything below depth 1 anyway.
     own_bytes: Dict[str, int] = {root: 0}
     own_files: Dict[str, int] = {root: 0}
+    # Newest modification time seen directly in each folder, rolled up with
+    # max() alongside the sizes. This is what "least recently used" is judged
+    # on: a folder is only stale if nothing anywhere inside it is recent.
+    own_mtime: Dict[str, float] = {root: 0.0}
     parent_of: Dict[str, str] = {}
 
     # (directory to scan, folder its files get credited to). Past max_depth
@@ -184,6 +198,7 @@ def scan_folder_sizes(
                     if depth <= max_depth:
                         own_bytes.setdefault(entry.path, 0)
                         own_files.setdefault(entry.path, 0)
+                        own_mtime.setdefault(entry.path, 0.0)
                         parent_of[entry.path] = attribute_to
                         stack.append((entry.path, entry.path))
                     else:
@@ -207,6 +222,9 @@ def scan_folder_sizes(
                     file_count += 1
                     own_bytes[attribute_to] = own_bytes.get(attribute_to, 0) + size
                     own_files[attribute_to] = own_files.get(attribute_to, 0) + 1
+                    mtime = getattr(st, "st_mtime", 0.0) or 0.0
+                    if 0.0 < mtime <= max_sane_mtime and mtime > own_mtime.get(attribute_to, 0.0):
+                        own_mtime[attribute_to] = mtime
                     if progress and file_count % 20000 == 0:
                         progress(file_count, f"{file_count:,} files · {_gb(total)} GB")
             except OSError:
@@ -218,11 +236,14 @@ def scan_folder_sizes(
     # are final before it is.
     rolled: Dict[str, int] = dict(own_bytes)
     rolled_files: Dict[str, int] = dict(own_files)
+    rolled_mtime: Dict[str, float] = dict(own_mtime)
     for path in sorted(own_bytes, key=lambda p: p.count(os.sep), reverse=True):
         parent = parent_of.get(path)
         if parent is not None and parent != path:
             rolled[parent] = rolled.get(parent, 0) + rolled.get(path, 0)
             rolled_files[parent] = rolled_files.get(parent, 0) + rolled_files.get(path, 0)
+            if rolled_mtime.get(path, 0.0) > rolled_mtime.get(parent, 0.0):
+                rolled_mtime[parent] = rolled_mtime.get(path, 0.0)
 
     children_of: Dict[str, List[str]] = {}
     for child, parent in parent_of.items():
@@ -241,6 +262,7 @@ def scan_folder_sizes(
             "size": rolled.get(path, 0),
             "own_size": own_bytes.get(path, 0),
             "file_count": rolled_files.get(path, 0),
+            "newest_mtime": rolled_mtime.get(path, 0.0),
             "children": kids[:top_n],
         }
 

@@ -35,3 +35,6 @@ aegis.db-shm
 aegis.db-wal
 *.db-shm
 *.db-wal
+
+# Cached backup-drive index (rebuilt on demand)
+.backup_index_cache/
