@@ -63,6 +63,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from core import threat_scan
 from core.copy_engine import VerifiedCopyError, verified_copy
 
 ProgressCallback = Callable[[int, str], None]
@@ -1017,11 +1018,15 @@ class PhoneBackupManager:
             self._index_existing_backup_tree(manifest, latest_dir)
         manifest_lookup = self._build_manifest_lookup(manifest)
 
+        # Kept as a datetime as well as the ISO string, so the post-copy
+        # threat check can ask Defender specifically what this run brought in.
+        run_started = datetime.now()
+
         result: Dict[str, Any] = {
             "device":            device.display_name,
             "device_folder":     str(device_dir),
             "latest_dir":        str(latest_dir),
-            "started_at":        datetime.now().isoformat(),
+            "started_at":        run_started.isoformat(),
             "completed_at":      None,
             "cancelled":         False,
             "stalled":           False,
@@ -1030,6 +1035,7 @@ class PhoneBackupManager:
             "copy_result":       None,
             "index_result":      None,
             "organize_result":   None,
+            "threat_scan":       None,
             "errors":            [],
         }
 
@@ -1095,6 +1101,12 @@ class PhoneBackupManager:
         self._save_manifest(device_dir, manifest)
         result["manifest_summary"] = self._summarize_manifest(manifest)
 
+        result["threat_scan"] = self._check_for_threats(
+            latest_dir,
+            since=run_started,
+            progress_callback=progress_callback,
+        )
+
         needs_retry = bool(result.get("stalled")) or bool(result.get("connection_failed"))
 
         if copy_stopped or needs_retry:
@@ -1115,6 +1127,74 @@ class PhoneBackupManager:
             progress_callback(100, "Backup complete.")
 
         return result
+
+    # ── Threat check ─────────────────────────────────────────────────────────
+
+    def _check_for_threats(
+        self,
+        latest_dir: Path,
+        *,
+        since: Optional[datetime] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Dict[str, Any]:
+        """
+        Ask Defender whether anything in this device's backup is malicious.
+
+        Phones collect sideloaded APKs, and a backup drive that gets carried
+        between machines is exactly how something on one device reaches
+        another. Defender's real-time protection already inspects each file as
+        it is written here, so this does not rescan — it reads the verdicts
+        Defender has already reached, which takes under a second.
+
+        Two lists come back, because they answer different questions:
+
+        ``new``      flagged during this run — what the phone just handed over.
+        ``present``  flagged at any point and *still sitting in the backup* —
+                     the standing problem. A file skipped by every subsequent
+                     run because it is already backed up will never appear in
+                     ``new`` again, but it is still there, and still infected.
+
+        Never raises: a backup that succeeded must not be reported as failed
+        because a security query went wrong.
+        """
+        out: Dict[str, Any] = {
+            "checked": False,
+            "reason": "",
+            "new": [],
+            "present": [],
+            "summary": "",
+            "realtime_protection": None,
+        }
+
+        try:
+            if not threat_scan.defender_available():
+                out["reason"] = "Microsoft Defender is not available on this machine."
+                return out
+
+            if progress_callback:
+                progress_callback(-3, "Checking the backup against Defender…")
+
+            out["realtime_protection"] = threat_scan.realtime_protection_on()
+
+            found = threat_scan.list_detections(under_path=str(latest_dir))
+            out["checked"] = True
+            out["present"] = [d for d in found if d["still_present"]]
+            if since:
+                out["new"] = threat_scan.detected_since(found, since)
+            out["summary"] = threat_scan.summarize(found)
+
+            if progress_callback and out["present"]:
+                worst = out["present"][0]
+                progress_callback(
+                    -3,
+                    f"Defender flagged {len(out['present'])} file(s) still in this "
+                    f"backup — worst is {worst['threat']} ({worst['severity_label']}) "
+                    f"on {worst['name']}",
+                )
+        except Exception as exc:  # noqa: BLE001 - never fail a backup over this
+            out["reason"] = f"Threat check could not complete: {exc}"
+
+        return out
 
     # ── Backup (self-reliant, retries automatically) ────────────────────────
 
@@ -1232,6 +1312,14 @@ class PhoneBackupManager:
             "skipped_partial": 0,
         }
 
+        # Threats attributed to this run, accumulated across attempts for the
+        # same reason the file totals are. The final attempt's "present" list
+        # is a full query of the backup folder and stands on its own, but each
+        # attempt's "new" list only covers its own window — so a file flagged
+        # during attempt 1 would vanish from the report if the run ended on
+        # attempt 4. Keyed by path, since a retry can re-copy the same file.
+        run_threats_new: Dict[str, Dict[str, Any]] = {}
+
         for attempt in range(1, max_attempts + 1):
             if should_stop and should_stop():
                 break
@@ -1255,6 +1343,9 @@ class PhoneBackupManager:
             for key in run_totals:
                 run_totals[key] += int(copy_result.get(key) or 0)
             last_result["run_totals"] = dict(run_totals)
+
+            for det in (last_result.get("threat_scan") or {}).get("new") or []:
+                run_threats_new.setdefault(str(det.get("path", "")).lower(), det)
 
             needs_retry = bool(last_result.get("stalled") or last_result.get("connection_failed"))
             if needs_retry:
@@ -1349,6 +1440,21 @@ class PhoneBackupManager:
         last_result["attempts_used"] = last_result.get("attempt", 1)
         last_result["interruption_count"] = interruption_count
         last_result["run_totals"] = dict(run_totals)
+
+        if run_threats_new:
+            scan = last_result.get("threat_scan")
+            if not isinstance(scan, dict):
+                # The final attempt never got as far as its threat check
+                # (cancelled early, say). What earlier attempts found is still
+                # true and still worth reporting.
+                scan = {"checked": True, "reason": "", "new": [], "present": [],
+                        "summary": "", "realtime_protection": None}
+                last_result["threat_scan"] = scan
+            scan["new"] = sorted(
+                run_threats_new.values(),
+                key=lambda d: (d.get("severity", 0), d.get("detected_at", "")),
+                reverse=True,
+            )
         if skip_folder_keys:
             last_result["skipped_folders"] = sorted(skip_folder_keys)
         # Folder-skip notices were recorded on whichever attempt discovered
@@ -2073,6 +2179,20 @@ class PhoneBackupManager:
         copy_r = result.get("copy_result") or {}
         index_r = result.get("index_result") or {}
 
+        # Just enough of the threat check to answer "when did this first show
+        # up in my backup" months later, without copying whole detection
+        # records into a file that keeps 50 of these.
+        threat_r = result.get("threat_scan") or {}
+        threats_present = threat_r.get("present") or []
+        threat_entry = None
+        if threat_r.get("checked"):
+            threat_entry = {
+                "flagged_still_present": len(threats_present),
+                "flagged_this_run": len(threat_r.get("new") or []),
+                "worst": (threats_present[0].get("threat") if threats_present else None),
+                "files": [d.get("path") for d in threats_present[:10]],
+            }
+
         history.append({
             "started_at":      result.get("started_at"),
             "completed_at":    result.get("completed_at"),
@@ -2085,6 +2205,7 @@ class PhoneBackupManager:
             "files_indexed":   index_r.get("indexed_files", 0),
             "error_count":     len(result.get("errors") or []),
             "manifest_summary": result.get("manifest_summary"),
+            "threats":         threat_entry,
         })
         history = history[-50:]
 

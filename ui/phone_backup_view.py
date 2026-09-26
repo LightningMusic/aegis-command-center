@@ -37,7 +37,7 @@ each is a wholly separate MTP session against a different USB device.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 import time
 from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -296,6 +296,72 @@ class DeviceBackupPanel(QFrame):
         self.log_box.append(message)
         self._scroll_log_to_end()
 
+    @staticmethod
+    def _threat_lines(scan: Optional[dict]) -> List[str]:
+        """
+        Defender's verdict on this backup, as log lines.
+
+        Deliberately reports files that are *still in the backup* rather than
+        only what this run flagged: a file Defender objected to last month is
+        skipped by every run since (it's already backed up, unchanged), so it
+        would never be mentioned again while sitting there the whole time.
+        """
+        if not isinstance(scan, dict):
+            return []
+
+        if not scan.get("checked"):
+            reason = scan.get("reason")
+            return ["", f"Threat check: skipped — {reason}"] if reason else []
+
+        present = scan.get("present") or []
+        new = scan.get("new") or []
+
+        if not present and not new:
+            out = ["", "Threat check: Defender has nothing against any file in this backup."]
+            if scan.get("realtime_protection") is False:
+                out.append(
+                    "  Note: real-time protection is OFF, so that clean result only "
+                    "covers files Defender happened to look at. Turn it back on, or "
+                    "run a scan of the backup folder, before trusting it."
+                )
+            return out
+
+        out = ["", "── Defender ────────────────────────────"]
+
+        if present:
+            out.append(f"{len(present)} flagged file(s) STILL IN THIS BACKUP:")
+            for d in present[:10]:
+                seen = d.get("times_seen") or 1
+                repeat = f", seen {seen}x" if seen > 1 else ""
+                out.append(f"  [{str(d.get('severity_label','?')).upper()}] {d.get('threat','?')}{repeat}")
+                out.append(f"      {d.get('path','?')}")
+            if len(present) > 10:
+                out.append(f"  …and {len(present) - 10} more")
+            out.append(
+                "  These are on the backup drive now. Anything that reads this drive "
+                "gets handed them, so deal with them here rather than letting them "
+                "ride along to the next device."
+            )
+
+        # Deliberately does not claim Defender quarantined these. All that is
+        # known is that Defender objected and the file is no longer at that
+        # path — which is also what a move, a rename or a cleaned-up temp
+        # folder looks like. Saying "quarantined" would be inventing a cause.
+        gone = [d for d in new if not d.get("still_present")]
+        if gone:
+            out.append(
+                f"{len(gone)} other file(s) flagged during this run are no longer "
+                f"at the path Defender saw them at (quarantined, or moved since)."
+            )
+
+        if scan.get("realtime_protection") is False:
+            out.append(
+                "  Real-time protection is OFF — this list is only what Defender "
+                "already knew about, not a fresh check."
+            )
+
+        return out
+
     def _on_finished(self, result: dict) -> None:
         cancelled = result.get("cancelled", False)
         stalled = result.get("stalled", False)
@@ -358,6 +424,8 @@ class DeviceBackupPanel(QFrame):
                 f"Confirmed on disk (all-time total): {confirmed_files} file(s)"
                 + (f", {human_bytes(confirmed_bytes)}" if confirmed_bytes else "")
             )
+
+        lines += self._threat_lines(result.get("threat_scan"))
 
         errors = result.get("errors") or []
         if errors:
