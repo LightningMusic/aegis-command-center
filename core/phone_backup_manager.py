@@ -1552,20 +1552,6 @@ class PhoneBackupManager:
                 entry["skip"] = True
             files[relkey] = entry
 
-    def _record_successes(self, manifest: Dict[str, Any], manifest_entries: List[Dict[str, Any]]) -> None:
-        files = manifest.setdefault("files", {})
-        now = datetime.now().isoformat()
-        for entry in manifest_entries:
-            files[entry["source_relative"]] = {
-                "size": entry.get("size", 0),
-                "modified": entry.get("modified"),
-                "category": entry.get("category"),
-                "dest_path": entry.get("dest_relative"),
-                "status": "ok",
-                "copied_at": now,
-                "fail_count": 0,
-            }
-
     def _index_existing_backup_tree(self, manifest: Dict[str, Any], latest_dir: Path) -> Dict[str, int]:
         """
         Rebuild the manifest's known-good file entries from the preserved
@@ -1606,6 +1592,281 @@ class PhoneBackupManager:
             total_bytes += stat.st_size
 
         return {"indexed_files": indexed, "indexed_bytes": total_bytes}
+
+    # ── Manifest repair ──────────────────────────────────────────────────────
+
+    def repair_manifest(
+        self,
+        device_dir: str | Path,
+        *,
+        dry_run: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> Dict[str, Any]:
+        """
+        Reconcile a device's manifest with what is actually in ``latest/``.
+
+        Backups made before the switch to preserving the phone's own folder
+        structure sorted files into category folders instead — ``Private_Files\\``,
+        ``Messages\\``, ``Audio\\``. Those runs recorded each file under its
+        *phone* path as the key while writing it to its *category* path, so the
+        entry points at a location that holds nothing:
+
+            key       Internal shared storage\\Documents\\Adobe Scan\\x.pdf
+            dest_path Private_Files\\x.pdf          <- the file is actually here
+
+        Two things follow, and both are fixed here. The tree indexer also
+        records that file under its real path, so one file owns two entries and
+        every total counting them is inflated. And because the stale entry says
+        ``status: ok``, the copy stage skips that phone path forever, so the
+        file never migrates into the structure the rest of the backup uses.
+
+        The repair needs no re-transfer: the stale entry's own key *is* the
+        phone-relative path, so the file can be moved into place locally. On
+        one volume that is a rename, so 50 GB costs nothing.
+
+        Defaults to *dry_run* — call with ``dry_run=False`` to apply.
+        """
+        device_dir = Path(device_dir)
+        latest_dir = device_dir / "latest"
+        manifest = self._load_manifest(device_dir, device_dir.name)
+        files: Dict[str, Any] = manifest.setdefault("files", {})
+
+        report: Dict[str, Any] = {
+            "dry_run": dry_run,
+            "device_folder": str(device_dir),
+            "entries_before": len(files),
+            "moved": 0, "moved_bytes": 0,
+            "phantom_entries_removed": 0,
+            "stale_entries_pruned": 0,
+            "failure_records_kept": 0,
+            "collisions": 0,
+            "errors": [],
+            "actions": [],
+        }
+
+        if not latest_dir.exists():
+            report["errors"].append(f"no latest/ folder at {latest_dir}")
+            return report
+
+        on_disk = {
+            str(p.relative_to(latest_dir)).lower()
+            for p in latest_dir.rglob("*") if p.is_file()
+        }
+
+        if progress_callback:
+            progress_callback(-3, f"Reconciling {len(files):,} manifest entries "
+                                  f"against {len(on_disk):,} files on disk…")
+
+        # ── plan ────────────────────────────────────────────────────────────
+        # Planned first, applied second, because several stale entries can name
+        # the SAME dest_path. The old scheme flattened the phone into category
+        # folders, so "Pictures\custom.png" and "Pictures\custom (1).png" both
+        # ended up recorded against "Private_Files\custom.png" — one physical
+        # file, two claims on it. Moving as we walk would satisfy whichever
+        # entry came first and then fail on the rest with a missing source.
+        contenders: Dict[str, List[tuple]] = {}
+        phantoms: List[str] = []
+
+        for key, entry in files.items():
+            if not isinstance(entry, dict) or key.lower() in on_disk:
+                continue
+
+            # No size means this was never a successful copy — it is a failure
+            # record, and dropping it would just make the next run retry a file
+            # that has already failed repeatedly.
+            if "size" not in entry:
+                report["failure_records_kept"] += 1
+                continue
+
+            dest = entry.get("dest_path")
+            if not dest or dest.lower() == key.lower() or dest.lower() not in on_disk:
+                phantoms.append(key)   # nothing behind it anywhere
+                continue
+
+            contenders.setdefault(dest.lower(), []).append((key, entry, dest))
+
+        moves: List[tuple] = []      # (src_rel, tgt_rel, size, key, entry)
+
+        for _, group in contenders.items():
+            dest = group[0][2]
+            src_path = latest_dir / dest
+            try:
+                actual_size = src_path.stat().st_size
+            except OSError as exc:
+                report["errors"].append(f"{dest}: {exc}")
+                continue
+
+            if len(group) == 1:
+                winner, losers = group[0], []
+            else:
+                # Only one target can be satisfied honestly. Prefer the entry
+                # whose recorded size matches the file actually present; the
+                # others described content this scheme overwrote years ago.
+                exact = [g for g in group if int(g[1].get("size") or 0) == actual_size]
+                winner = exact[0] if exact else group[0]
+                losers = [g for g in group if g is not winner]
+                report["contended_sources"] = report.get("contended_sources", 0) + 1
+
+            for key, _entry, _d in losers:
+                phantoms.append(key)
+
+            key, entry, _d = winner
+            tgt_path = latest_dir / key
+            size = int(entry.get("size") or 0)
+
+            # A *file* cannot be sitting here: entries whose key is already on
+            # disk were filtered out above, and no two entries share a key, so
+            # no two moves share a target. A *directory* at the target path is
+            # possible though, and os.replace would fail on it — so check, and
+            # leave the file where it is rather than raise.
+            if tgt_path.exists():
+                report["collisions"] += 1
+                report["actions"].append(("collision", dest, key, size))
+                continue
+
+            moves.append((dest, key, size, key, entry))
+
+        # These moves cannot interfere with one another, which is worth stating
+        # because it is the reason no ordering logic is needed. Every move
+        # reads from a path that is on disk and writes to one that is not
+        # (entries whose key already exists were filtered out at the top), so
+        # no move's target is any other move's source. And keys are unique in
+        # the manifest dict, so no two moves share a target either.
+        report["moved"] = len(moves)
+        report["moved_bytes"] = sum(m[2] for m in moves)
+        report["phantom_entries_removed"] = len(phantoms)
+        report["actions"].extend(("move", m[0], m[1], m[2]) for m in moves)
+
+        # ── apply ───────────────────────────────────────────────────────────
+        if not dry_run:
+            for dest, key, size, _k, entry in moves:
+                try:
+                    tgt_path = latest_dir / key
+                    tgt_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(latest_dir / dest, tgt_path)
+                    files[key] = {
+                        "size": size,
+                        "modified": entry.get("modified"),
+                        "source_relative": key,
+                        "dest_path": key,
+                        "status": "ok",
+                        "indexed_at": datetime.now().isoformat(),
+                        "fail_count": 0,
+                    }
+                except OSError as exc:
+                    report["errors"].append(f"move {dest} -> {key}: {exc}")
+                    report["moved"] -= 1
+                    report["moved_bytes"] -= size
+
+
+            for key in phantoms:
+                files.pop(key, None)
+
+            # Reconcile against the tree as it now stands. The moves above
+            # emptied the old category paths, and the tree indexer that
+            # recorded those paths cannot retract its own entries — it only
+            # adds what it finds on a walk. So every migrated file briefly
+            # owns two entries: the rewritten one at its phone path, and the
+            # indexer's orphan at the category path it just left. An entry
+            # claiming a copied file with no file behind it is exactly what
+            # made the copy stage skip a path it had never actually written.
+            still_present = {
+                str(p.relative_to(latest_dir)).lower()
+                for p in latest_dir.rglob("*") if p.is_file()
+            }
+            stale = [
+                k for k, v in files.items()
+                if isinstance(v, dict) and "size" in v and k.lower() not in still_present
+            ]
+            for key in stale:
+                files.pop(key, None)
+            report["stale_entries_pruned"] = len(stale)
+
+        if not dry_run:
+            _prune_empty_dirs(latest_dir)
+            self._index_existing_backup_tree(manifest, latest_dir)
+            self._save_manifest(device_dir, manifest)
+
+        report["entries_after"] = len(files)
+        report["summary"] = self._summarize_manifest(manifest)
+        return report
+
+    def purge_from_backup(
+        self,
+        device_dir: str | Path,
+        relative_paths: List[str],
+        *,
+        mark_skip: bool = True,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Delete specific files from a device's backup and stop them coming back.
+
+        Deleting the file alone is not enough: if it is still on the phone the
+        next run simply copies it again. Setting ``skip`` on the manifest entry
+        is what makes the exclusion stick — the copy stage already honours that
+        flag for files that have failed too often, and it serves equally well
+        for "I do not want this backed up".
+
+        *relative_paths* are paths under ``latest/``.
+        """
+        device_dir = Path(device_dir)
+        latest_dir = device_dir / "latest"
+        manifest = self._load_manifest(device_dir, device_dir.name)
+        files: Dict[str, Any] = manifest.setdefault("files", {})
+
+        out: Dict[str, Any] = {
+            "dry_run": dry_run, "deleted": 0, "deleted_bytes": 0,
+            "marked_skip": 0, "not_found": 0, "errors": [], "files": [],
+        }
+
+        # A manifest key may differ in case from the path on disk.
+        by_lower = {k.lower(): k for k in files}
+
+        for rel in relative_paths:
+            p = latest_dir / rel
+            if not p.exists():
+                out["not_found"] += 1
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError as exc:
+                out["errors"].append(f"{rel}: {exc}")
+                continue
+
+            out["deleted"] += 1
+            out["deleted_bytes"] += size
+            out["files"].append({"path": rel, "bytes": size})
+
+            if not dry_run:
+                try:
+                    p.unlink()
+                except OSError as exc:
+                    out["errors"].append(f"unlink {rel}: {exc}")
+                    out["deleted"] -= 1
+                    out["deleted_bytes"] -= size
+                    continue
+
+            key = by_lower.get(rel.lower())
+            if key is not None:
+                out["marked_skip"] += 1
+                if not dry_run:
+                    if mark_skip:
+                        files[key] = {
+                            **files[key],
+                            "status": "excluded",
+                            "skip": True,
+                            "excluded_at": datetime.now().isoformat(),
+                        }
+                    else:
+                        del files[key]
+
+        if not dry_run:
+            _prune_empty_dirs(latest_dir)
+            self._save_manifest(device_dir, manifest)
+            out["summary"] = self._summarize_manifest(manifest)
+
+        return out
 
     def _summarize_manifest(self, manifest: Dict[str, Any]) -> Dict[str, int]:
         ok = 0
