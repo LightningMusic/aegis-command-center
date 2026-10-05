@@ -651,6 +651,20 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 $entry = $manifestLookup[$relKey]
                 $isPermSkip = $false
                 try { $isPermSkip = [bool]$entry.skip } catch { $isPermSkip = $false }
+                $isExcluded = $false
+                try { $isExcluded = [bool]$entry.excluded } catch { $isExcluded = $false }
+
+                # An explicit exclusion outranks -ForceVerify. Verifying
+                # everything means not trusting the record of what was COPIED;
+                # it does not mean overriding a decision not to copy something.
+                # Re-fetching here would silently undo a deletion the user asked
+                # for, and would do it on every run.
+                if ($isExcluded) {
+                    $script:skipped++
+                    Write-Host "FILE_SKIP_EXCLUDED:$relKey"
+                    [Console]::Out.Flush()
+                    continue
+                }
 
                 if ($isPermSkip -and -not $ForceVerify) {
                     $script:skipped++
@@ -1042,7 +1056,7 @@ class PhoneBackupManager:
         should_stop: Optional[StopCallback] = None,
         reindex_before: bool = True,
         skip_folder_keys: Optional[set] = None,
-        force_verify: bool = False,
+        force_verify: bool = True,
     ) -> Dict[str, Any]:
         """
         One incremental backup attempt for *device*.
@@ -1058,7 +1072,11 @@ class PhoneBackupManager:
         folder that has repeatedly timed out, so one bad folder can't block
         the rest of the phone forever.
 
-        *force_verify*, if True (MTP devices only), turns off the last-resort
+        *force_verify* defaults to True: nothing is skipped on trust alone.
+        See below for exactly what it turns off, and pass False for a fast pass
+        that leans on the cached record instead.
+
+        If True (MTP devices only), turns off the last-resort
         "trust the manifest" fallback that applies when this phone's MTP
         provider can't report a file's size OR its modified date — normally
         that ambiguous case is skipped on trust, but under force_verify it's
@@ -1331,7 +1349,7 @@ class PhoneBackupManager:
         should_stop: Optional[StopCallback] = None,
         max_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
         max_total_seconds: int = DEFAULT_MAX_TOTAL_RUNTIME_SECONDS,
-        force_verify: bool = False,
+        force_verify: bool = True,
     ) -> Dict[str, Any]:
         """
         Run backup_phone() in an automatic retry loop so a single call can be
@@ -1374,7 +1392,7 @@ class PhoneBackupManager:
         # last attempt's numbers — "0 copied, 0 skipped" — which reads as
         # "it did nothing" when in fact the work was done and saved.
         run_totals: Dict[str, int] = {
-            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
+            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
             "skipped_partial": 0,
         }
 
@@ -1576,13 +1594,30 @@ class PhoneBackupManager:
             pass
 
     def _build_manifest_lookup(self, manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """{relative_path: {"size": int, "skip": bool}} for the copy stage to consult."""
+        """
+        {relative_path: {"size", "skip", "excluded"}} for the copy stage.
+
+        ``skip`` and ``excluded`` are deliberately separate, because
+        "Verify everything" treats them differently and must. A ``skip`` set by
+        repeated copy failures is a guess the run is entitled to revisit — the
+        whole point of verifying everything is to stop trusting earlier
+        verdicts. An ``excluded`` entry is not a verdict about the file, it is
+        the user saying they do not want it backed up; re-fetching it because
+        they asked for a thorough pass would quietly undo a deletion they
+        requested.
+        """
         lookup: Dict[str, Dict[str, Any]] = {}
         for relkey, entry in manifest.get("files", {}).items():
-            if entry.get("skip"):
-                lookup[relkey] = {"size": entry.get("size", 0), "skip": True}
+            excluded = entry.get("status") == "excluded"
+            if entry.get("skip") or excluded:
+                lookup[relkey] = {
+                    "size": entry.get("size", 0),
+                    "skip": True,
+                    "excluded": excluded,
+                }
             elif entry.get("status") == "ok":
-                lookup[relkey] = {"size": entry.get("size", 0), "skip": False}
+                lookup[relkey] = {"size": entry.get("size", 0), "skip": False,
+                                  "excluded": False}
         return lookup
 
     def _build_name_size_index(self, manifest: Dict[str, Any]) -> Dict[str, str]:
@@ -1971,12 +2006,12 @@ class PhoneBackupManager:
         progress_callback: Optional[ProgressCallback],
         should_stop: Optional[StopCallback],
         skip_folder_keys: Optional[set] = None,
-        force_verify: bool = False,
+        force_verify: bool = True,
         folder_sig_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
         name_size_index: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
-            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
+            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
             "skipped_partial": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
@@ -2176,6 +2211,13 @@ class PhoneBackupManager:
                 elif line.startswith("FILE_SKIP_PARTIAL:"):
                     result["skipped"] += 1
                     result["skipped_partial"] += 1
+
+                elif line.startswith("FILE_SKIP_EXCLUDED:"):
+                    # Deliberately excluded by the user. Counted apart from
+                    # ordinary skips so "nothing was copied" can be told from
+                    # "you asked for these to be left alone".
+                    result["skipped"] += 1
+                    result["skipped_excluded"] += 1
 
                 elif line.startswith("FILE_LOCAL_COPY:"):
                     # Same name+size was already on the backup drive under a

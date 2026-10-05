@@ -76,7 +76,7 @@ class PhoneBackupWorker(QObject):
     finished  = pyqtSignal(dict)
     failed    = pyqtSignal(str)
 
-    def __init__(self, manager: PhoneBackupManager, device: PhoneDevice, force_verify: bool = False) -> None:
+    def __init__(self, manager: PhoneBackupManager, device: PhoneDevice, force_verify: bool = True) -> None:
         super().__init__()
         self.manager = manager
         self.device  = device
@@ -420,12 +420,15 @@ class DeviceBackupPanel(QFrame):
                     f"  of those, {local_now} were duplicated from a copy already "
                     f"on the drive rather than re-transferred from the phone"
                 )
+            excluded_now = totals.get("skipped_excluded") or 0
+            if excluded_now:
+                lines.append(
+                    f"  {excluded_now} left alone because you excluded them"
+                )
             if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:
                 lines.append(
-                    "  (nothing copied because everything matched what's "
-                    "already saved — check “Verify everything” above "
-                    "to re-check those files against the phone instead of "
-                    "trusting the record.)"
+                    "  (nothing copied because every file matched what's already "
+                    "saved, checked against the phone rather than taken on trust.)"
                 )
 
         if confirmed_files is not None:
@@ -603,13 +606,22 @@ class PhoneBackupView(QWidget):
         backup_btns.addStretch()
         backup_layout.addLayout(backup_btns)
 
-        self.verify_everything_chk = QCheckBox("Verify everything (ignore fast-skip — slower, but nothing is taken on trust)")
+        # On by default. Thoroughness is the point of a backup, and the cost of
+        # the fast path is files that quietly never arrive — so the slower,
+        # correct behaviour is what you get unless you deliberately ask for
+        # speed. Unchecking it is an opt-out for a quick top-up run.
+        self.verify_everything_chk = QCheckBox(
+            "Verify everything against the phone (on by default — uncheck for a faster, less thorough pass)"
+        )
+        self.verify_everything_chk.setChecked(True)
         self.verify_everything_chk.setToolTip(
-            "Normally, if a file can't be sized or dated by the phone at all, it's "
-            "skipped on the assumption it's unchanged since the last backup. Check "
-            "this to re-check every such file against the phone instead — much "
-            "slower on a big phone, but nothing gets skipped just because it "
-            "couldn't be verified. Applies to backups started after you check it."
+            "Leave this on. Every file is checked against the phone, and nothing "
+            "is skipped merely because the record says it was copied before.\n\n"
+            "Unchecked, a file the phone can't report a size or date for is "
+            "assumed unchanged, and folders whose contents look the same as last "
+            "time aren't re-examined. That's faster on a big phone, but it is how "
+            "files end up missing from a backup that reports itself complete.\n\n"
+            "Files you've explicitly excluded stay excluded either way."
         )
         backup_layout.addWidget(self.verify_everything_chk)
 
