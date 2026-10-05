@@ -411,6 +411,15 @@ class DeviceBackupPanel(QFrame):
                 f"{scope}: {copied_now} copied, {skipped_now} skipped"
                 + (f" ({', '.join(extra_bits)})" if extra_bits else "")
             )
+            # Worth calling out separately: these cost a local disk copy rather
+            # than an MTP transfer, because the same bytes were already on the
+            # drive under a different path.
+            local_now = totals.get("copied_locally") or 0
+            if local_now:
+                lines.append(
+                    f"  of those, {local_now} were duplicated from a copy already "
+                    f"on the drive rather than re-transferred from the phone"
+                )
             if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:
                 lines.append(
                     "  (nothing copied because everything matched what's "

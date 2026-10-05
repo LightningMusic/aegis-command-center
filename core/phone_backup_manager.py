@@ -219,6 +219,27 @@ function IsPartialDownload([string]$Name) {
     return $false
 }
 
+# Shell.Application mounts archives as browsable folders. A .zip reports
+# IsFolder = $true, Type = "Compressed (zipped) Folder", and GetFolder()
+# succeeds -- so a walker that trusts IsFolder recurses INTO the archive,
+# creates a real directory named after it, tries to pull each entry out
+# one at a time, and never backs up the archive itself as a file.
+#
+# That is how a 463 MB SpotiDownloader zip full of MP3s ended up on the backup
+# drive as a directory holding a handful of extracted tracks and several empty
+# folders named after songs: zip entry names that could not be created on
+# Windows (trailing spaces, which Android and zip allow and Windows strips).
+#
+# An archive is a file. Copy it as one and its contents travel intact.
+$ARCHIVE_SHELL_FOLDER_EXTS = @('.zip', '.cab')
+
+function IsArchiveMountedAsFolder([string]$Name) {
+    if (-not $Name) { return $false }
+    $ext = [System.IO.Path]::GetExtension($Name)
+    if (-not $ext) { return $false }
+    return $ARCHIVE_SHELL_FOLDER_EXTS -contains $ext.ToLower()
+}
+
 $manifestLookup = @{}
 if ($ManifestPath -and (Test-Path $ManifestPath)) {
     try {
@@ -287,10 +308,16 @@ if ($FolderSigPath -and (Test-Path $FolderSigPath)) {
     }
 }
 
-# "<lowercase filename>|<size>" -> 1, for every file already confirmed
-# backed up anywhere on the phone (any folder). Lets a file the phone has
-# moved to a different folder since the last run be recognized as already
-# covered instead of re-transferred.
+# "<lowercase filename>|<size>" -> the backup-relative path that already
+# holds those exact bytes, for every file confirmed backed up anywhere on the
+# phone. When the phone presents the same file at a new path, this says where
+# a copy already sits so it can be duplicated locally off the backup drive
+# instead of pulled down the MTP wire again.
+#
+# It maps to a PATH rather than just $true because knowing only "we have this
+# somewhere" is not enough to act on: the previous version skipped the file
+# outright, which left the new path permanently empty and recorded nothing,
+# so every later run reached the same conclusion and skipped it again.
 $nameSizeIndex = @{}
 if ($NameSizeIndexPath -and (Test-Path $NameSizeIndexPath)) {
     try {
@@ -299,7 +326,7 @@ if ($NameSizeIndexPath -and (Test-Path $NameSizeIndexPath)) {
             $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
             if ($parsed) {
                 foreach ($prop in $parsed.PSObject.Properties) {
-                    $nameSizeIndex[$prop.Name] = $true
+                    $nameSizeIndex[$prop.Name] = [string]$prop.Value
                 }
             }
         }
@@ -569,7 +596,9 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             $safeName = $itemName -replace '[\\/:*?"<>|]', '_'
             $relKey = if ($RelLabel) { "$RelLabel\$safeName" } else { $safeName }
 
-            if ($item.IsFolder) {
+            # An archive only LOOKS like a folder to the shell (see
+            # IsArchiveMountedAsFolder) -- treat it as the file it is.
+            if ($item.IsFolder -and -not (IsArchiveMountedAsFolder $itemName)) {
                 if (ShouldSkipItem $Label $itemName) {
                     Write-Host "FOLDER_SKIP:$($Label)\$($safeName)"
                     [Console]::Out.Flush()
@@ -682,24 +711,61 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             $expectedSize = Get-ItemSizeBestEffort $item
             if ($null -eq $expectedSize) { $expectedSize = 0 }
 
+            $destFile = Join-Path $Dst $safeName
+
             if (-not $ownPathKnown -and -not $ForceVerify -and $expectedSize -gt 0) {
-                # Never seen at this exact path before -- but if a file with
-                # the same name AND size is already confirmed backed up
-                # somewhere else on the phone, this is almost certainly that
-                # same file after Android moved/reorganized it (WhatsApp
-                # media folders do this often). Trust it at the same level
-                # the rest of this manifest already does, instead of paying
-                # to re-transfer content that's already safely backed up.
+                # Never seen at this exact path -- but the same name AND size is
+                # already confirmed backed up elsewhere on the phone, so the
+                # bytes are already on the backup drive.
+                #
+                # This used to just skip, which was wrong in both directions.
+                # If Android had MOVED the file, the backup kept it at the old
+                # path and never populated the new one, so the backup stopped
+                # mirroring the phone. If the user genuinely had the same file
+                # in two places -- the same song in Music and on the SD card --
+                # only one ever got stored, and the other folder stayed empty.
+                # Either way nothing was written to the manifest, so the next
+                # run reached the identical conclusion and skipped it again,
+                # for ever, while reporting the phone fully backed up.
+                #
+                # Copying it locally off the backup drive gets the structure
+                # right for a fraction of the cost of an MTP transfer, which
+                # is what made skipping attractive in the first place.
                 $xrefKey = "$($itemName.ToLower())|$expectedSize"
                 if ($nameSizeIndex.ContainsKey($xrefKey)) {
-                    $script:skipped++
-                    Write-Host "FILE_SKIP_ELSEWHERE:$relKey"
-                    [Console]::Out.Flush()
-                    continue
+                    $twinRel = $nameSizeIndex[$xrefKey]
+                    $twinFull = if ($twinRel) { Join-Path $DestPath $twinRel } else { $null }
+                    if ($twinFull -and (Test-Path -LiteralPath $twinFull -PathType Leaf)) {
+                        $localOk = $false
+                        try {
+                            $parent = Split-Path -Parent $destFile
+                            if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                            }
+                            Copy-Item -LiteralPath $twinFull -Destination $destFile -Force -ErrorAction Stop
+                            $landed = -1
+                            try { $landed = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $landed = -1 }
+                            $localOk = ($landed -eq $expectedSize)
+                            if (-not $localOk -and (Test-Path -LiteralPath $destFile)) {
+                                try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                            }
+                        } catch {
+                            $localOk = $false
+                        }
+                        if ($localOk) {
+                            $script:copied++
+                            Write-Host "FILE_LOCAL_COPY:$destFile"
+                            [Console]::Out.Flush()
+                            continue
+                        }
+                        # Local duplication failed -- fall through and fetch it
+                        # from the phone rather than leave the path empty.
+                    }
+                    # No usable local twin (the manifest knew of a copy that is
+                    # no longer on disk): fetch from the phone as normal.
                 }
             }
 
-            $destFile = Join-Path $Dst $safeName
             if (Test-Path $destFile) {
                 # Already present. Only re-fetch if we can prove it's short.
                 $haveSize = -1
@@ -1308,7 +1374,7 @@ class PhoneBackupManager:
         # last attempt's numbers — "0 copied, 0 skipped" — which reads as
         # "it did nothing" when in fact the work was done and saved.
         run_totals: Dict[str, int] = {
-            "copied": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
+            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
             "skipped_partial": 0,
         }
 
@@ -1519,26 +1585,33 @@ class PhoneBackupManager:
                 lookup[relkey] = {"size": entry.get("size", 0), "skip": False}
         return lookup
 
-    def _build_name_size_index(self, manifest: Dict[str, Any]) -> Dict[str, int]:
+    def _build_name_size_index(self, manifest: Dict[str, Any]) -> Dict[str, str]:
         """
-        {"<lowercase filename>|<size>": 1} for every confirmed-ok file,
-        regardless of which folder it's in. Lets the copy script recognize a
-        file the phone has moved to a different folder (e.g. Android
-        reorganizing WhatsApp media) as already backed up, instead of
-        re-transferring content that's already been confirmed good — matched
-        by name+size only, the same trust level the rest of this manifest
-        already relies on, just applied across the whole phone instead of
-        one exact path.
+        {"<lowercase filename>|<size>": "<backup-relative path>"} for every
+        confirmed-ok file, regardless of which folder it is in.
+
+        Lets the copy script recognise a file the phone now presents at a new
+        path as one whose bytes are already on the backup drive, and say where
+        — so it can be duplicated locally instead of pulled down the MTP wire
+        again. Matched on name+size, the same trust level the rest of this
+        manifest relies on, applied across the whole phone rather than one
+        exact path.
+
+        It maps to a path rather than a bare flag because the script has to be
+        able to *act* on the match. Knowing only that a copy existed somewhere
+        led it to skip the file and record nothing, so the new path stayed
+        empty and every later run skipped it again for the same reason.
         """
-        index: Dict[str, int] = {}
+        index: Dict[str, str] = {}
         for relkey, entry in manifest.get("files", {}).items():
-            if entry.get("status") != "ok":
+            if entry.get("status") != "ok" or entry.get("skip"):
                 continue
             size = entry.get("size") or 0
             if not size:
                 continue
             name = relkey.rsplit("\\", 1)[-1].lower()
-            index[f"{name}|{size}"] = 1
+            # First writer wins; any confirmed copy serves equally as a source.
+            index.setdefault(f"{name}|{size}", relkey)
         return index
 
     def _record_failures(self, manifest: Dict[str, Any], failed_keys: List[str]) -> None:
@@ -1903,7 +1976,7 @@ class PhoneBackupManager:
         name_size_index: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
-            "copied": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
+            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0,
             "skipped_partial": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
@@ -2104,10 +2177,22 @@ class PhoneBackupManager:
                     result["skipped"] += 1
                     result["skipped_partial"] += 1
 
+                elif line.startswith("FILE_LOCAL_COPY:"):
+                    # Same name+size was already on the backup drive under a
+                    # different path, so it was duplicated locally rather than
+                    # pulled over MTP again. A real copy that really landed —
+                    # counted as copied, and the post-copy index records it
+                    # like any other file.
+                    path = line[len("FILE_LOCAL_COPY:"):]
+                    result["copied"] += 1
+                    result["copied_locally"] += 1
+                    if progress_callback:
+                        progress_callback(-1, f"Copied locally: {Path(path).name}")
+
                 elif line.startswith("FILE_SKIP_ELSEWHERE:"):
-                    # Never seen at this exact path before, but a file with
-                    # the same name+size is already confirmed backed up
-                    # somewhere else on the phone (Android reorganized it).
+                    # Kept for backwards compatibility with any in-flight
+                    # script from an older build; current runs duplicate the
+                    # file locally and emit FILE_LOCAL_COPY instead.
                     result["skipped"] += 1
                     result["skipped_elsewhere"] += 1
 
