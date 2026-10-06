@@ -784,7 +784,13 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 # Already present. Only re-fetch if we can prove it's short.
                 $haveSize = -1
                 try { $haveSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $haveSize = -1 }
-                if ($expectedSize -gt 0 -and $haveSize -ge 0 -and $haveSize -lt $expectedSize) {
+                if ($haveSize -eq 0 -and $expectedSize -ne 0) {
+                    # An empty destination is not a backup of a file the phone
+                    # has. This used to be kept whenever the phone couldn't
+                    # report a size either, so a copy that produced nothing sat
+                    # there standing in for the real file on every later run.
+                    try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
+                } elseif ($expectedSize -gt 0 -and $haveSize -ge 0 -and $haveSize -lt $expectedSize) {
                     try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
                 } else {
                     $script:skipped++
@@ -1660,6 +1666,31 @@ class PhoneBackupManager:
                 entry["skip"] = True
             files[relkey] = entry
 
+    # Extensions whose files cannot legitimately be zero bytes: a real video,
+    # audio file, image, archive, document or installer carries a header at
+    # minimum. A 0-byte one is a copy that didn't happen, and recording it as a
+    # success means the backup reports content it does not have.
+    #
+    # Android, by contrast, is full of genuinely empty files -- .nomedia
+    # markers, .uid stream tags, SQLite -wal journals, Unity "config" stubs --
+    # and those are faithfully backed up by being empty. Hence an allow-list of
+    # types that must have bytes, rather than treating every empty file as
+    # broken.
+    _MUST_HAVE_BYTES_EXTS = frozenset({
+        ".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".3gp", ".flv", ".wmv",
+        ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac", ".wma",
+        ".jpg", ".jpeg", ".png", ".gif", ".heic", ".webp", ".bmp", ".tiff",
+        ".zip", ".7z", ".rar", ".cab", ".tar", ".gz",
+        ".pdf", ".docx", ".xlsx", ".pptx", ".epub", ".cbz",
+        ".apk", ".exe", ".dll", ".iso", ".img",
+    })
+
+    @classmethod
+    def _is_empty_but_shouldnt_be(cls, rel: str, size: int) -> bool:
+        if size != 0:
+            return False
+        return os.path.splitext(rel)[1].lower() in cls._MUST_HAVE_BYTES_EXTS
+
     def _index_existing_backup_tree(self, manifest: Dict[str, Any], latest_dir: Path) -> Dict[str, int]:
         """
         Rebuild the manifest's known-good file entries from the preserved
@@ -1670,9 +1701,10 @@ class PhoneBackupManager:
         now = datetime.now().isoformat()
         indexed = 0
         total_bytes = 0
+        empty_files = 0
 
         if not latest_dir.exists():
-            return {"indexed_files": 0, "indexed_bytes": 0}
+            return {"indexed_files": 0, "indexed_bytes": 0, "empty_files": 0}
 
         for path in latest_dir.rglob("*"):
             if not path.is_file():
@@ -1686,20 +1718,34 @@ class PhoneBackupManager:
             except OSError:
                 continue
 
+            prior = files.get(rel, {})
+            # A content-bearing file with no content is not a backup of
+            # anything. Recording it "ok" is what let four 0-byte .webm files
+            # count toward "confirmed on disk" indefinitely: the phone had only
+            # the .trashed- version by then, so nothing ever revisited the path
+            # and the empty file stood in for the real one for good.
+            empty = self._is_empty_but_shouldnt_be(rel, stat.st_size)
             files[rel] = {
-                **files.get(rel, {}),
+                **prior,
                 "size": stat.st_size,
                 "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 "source_relative": rel,
                 "dest_path": rel,
-                "status": "ok",
+                "status": "empty" if empty else "ok",
                 "indexed_at": now,
-                "fail_count": 0,
+                # Don't reset a running failure count for an empty file — it is
+                # how the retry ceiling eventually stops trying a file the
+                # phone genuinely cannot serve.
+                "fail_count": int(prior.get("fail_count") or 0) if empty else 0,
             }
+            if empty:
+                empty_files += 1
+                continue
             indexed += 1
             total_bytes += stat.st_size
 
-        return {"indexed_files": indexed, "indexed_bytes": total_bytes}
+        return {"indexed_files": indexed, "indexed_bytes": total_bytes,
+                "empty_files": empty_files}
 
     # ── Manifest repair ──────────────────────────────────────────────────────
 
@@ -1981,12 +2027,17 @@ class PhoneBackupManager:
         failed_pending = 0
         skipped_permanent = 0
         confirmed_bytes = 0
+        empty = 0
         for entry in manifest.get("files", {}).values():
             if entry.get("skip"):
                 skipped_permanent += 1
             elif entry.get("status") == "ok":
                 ok += 1
                 confirmed_bytes += int(entry.get("size") or 0)
+            elif entry.get("status") == "empty":
+                # Present on the drive but with no content, so deliberately
+                # NOT counted as confirmed — that overstatement is the bug.
+                empty += 1
             elif entry.get("status") == "failed":
                 failed_pending += 1
         return {
@@ -1994,6 +2045,7 @@ class PhoneBackupManager:
             "confirmed_bytes": confirmed_bytes,
             "pending_retry_files": failed_pending,
             "permanently_skipped_files": skipped_permanent,
+            "empty_files": empty,
         }
 
     # ── Copy helpers ──────────────────────────────────────────────────────

@@ -437,6 +437,20 @@ class DeviceBackupPanel(QFrame):
                 + (f", {human_bytes(confirmed_bytes)}" if confirmed_bytes else "")
             )
 
+        # Files sitting in the backup with no content. Reported separately and
+        # excluded from the confirmed total on purpose: counting them was how a
+        # handful of 0-byte videos passed as backed up indefinitely.
+        empty_files = manifest_summary.get("empty_files") or 0
+        if empty_files:
+            lines.append(
+                f"Present but EMPTY (0 bytes, not a usable backup): {empty_files} file(s)"
+            )
+            lines.append(
+                "  These are file types that cannot legitimately be empty. The phone "
+                "will be asked for them again; if it still can't supply the bytes "
+                "they'll be retried a few times and then left alone."
+            )
+
         lines += self._threat_lines(result.get("threat_scan"))
 
         errors = result.get("errors") or []
