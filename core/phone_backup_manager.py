@@ -418,12 +418,26 @@ function Get-ItemSizeBestEffort($Item) {
     # providers implement far more reliably than the legacy .Size getter),
     # then fall back to .Size. Returns $null if genuinely unavailable -
     # callers must treat that as "unknown", never as "changed".
+    #
+    # "Zero bytes" and "I don't know" are DIFFERENT answers, and returning
+    # $null for both is what made the backup delete empty files it had copied
+    # perfectly well. A failed download leaves a real 0-byte file on the phone;
+    # copying it produces a real 0-byte file here, which is correct. But with
+    # the size reported as unknown, the post-copy integrity check saw an empty
+    # file it could not justify, deleted it as a broken transfer, and logged an
+    # error -- then did it again on the next run, for ever.
     try {
         $extSize = $Item.ExtendedProperty("System.Size")
-        if ($null -ne $extSize -and $extSize -gt 0) { return [int64]$extSize }
+        # System.Size is a typed property: genuinely absent comes back $null,
+        # so a 0 here means the file really is empty. The old code demanded
+        # -gt 0 and so threw that answer away.
+        if ($null -ne $extSize) { return [int64]$extSize }
     } catch {}
 
     try {
+        # The legacy getter is the untrustworthy one - some MTP providers
+        # return 0 from it to mean "no idea" - so a zero from here stays
+        # "unknown" rather than being believed.
         if ($Item.Size -and $Item.Size -gt 0) { return [int64]$Item.Size }
     } catch {}
 
@@ -722,8 +736,12 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
 
             $ownPathKnown = $manifestLookup.ContainsKey($relKey)
 
-            $expectedSize = Get-ItemSizeBestEffort $item
-            if ($null -eq $expectedSize) { $expectedSize = 0 }
+            # $sizeKnown is carried alongside, because "the phone says 0 bytes"
+            # and "the phone won't say" need different handling and collapsing
+            # both to 0 loses the only thing that tells them apart.
+            $rawSize = Get-ItemSizeBestEffort $item
+            $sizeKnown = ($null -ne $rawSize)
+            $expectedSize = if ($sizeKnown) { [int64]$rawSize } else { 0 }
 
             $destFile = Join-Path $Dst $safeName
 
@@ -784,11 +802,11 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 # Already present. Only re-fetch if we can prove it's short.
                 $haveSize = -1
                 try { $haveSize = [int64](Get-Item -LiteralPath $destFile -ErrorAction Stop).Length } catch { $haveSize = -1 }
-                if ($haveSize -eq 0 -and $expectedSize -ne 0) {
-                    # An empty destination is not a backup of a file the phone
-                    # has. This used to be kept whenever the phone couldn't
-                    # report a size either, so a copy that produced nothing sat
-                    # there standing in for the real file on every later run.
+                if ($haveSize -eq 0 -and -not ($sizeKnown -and $expectedSize -eq 0)) {
+                    # An empty destination is only a valid backup when the
+                    # phone's copy is empty too. Otherwise it is the residue of
+                    # a transfer that produced nothing, and keeping it let every
+                    # later run accept it as already done.
                     try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
                 } elseif ($expectedSize -gt 0 -and $haveSize -ge 0 -and $haveSize -lt $expectedSize) {
                     try { Remove-Item -LiteralPath $destFile -Force -ErrorAction Stop } catch {}
@@ -850,6 +868,13 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 $script:copied++
                 if ($expectedSize -gt 0) {
                     Write-Host "FILE_OK:$destFile"
+                } elseif ($sizeKnown) {
+                    # The phone reports this file as 0 bytes and we produced a
+                    # 0-byte file: a faithful copy, not a failed one. Typically
+                    # a download that died before writing anything. Reported
+                    # distinctly so the integrity check does not treat the
+                    # emptiness as its own evidence of failure.
+                    Write-Host "FILE_OK_EMPTY:$destFile"
                 } else {
                     # The phone never reported a size for this file, so
                     # reaching "expected size" was never something we could
@@ -1171,6 +1196,22 @@ class PhoneBackupManager:
             # any folder that hasn't changed at all since this pass.
             manifest.setdefault("folder_sigs", {}).update(copy_result["folder_sigs"])
 
+        # Remember which empty files are empty on the phone. Recorded before
+        # the tree index runs, so that index can tell "this file has no content
+        # because the phone's copy has none" from "this file has no content
+        # because the copy failed" — the first is a correct backup and must not
+        # be re-flagged as broken on every future run.
+        # Seeded rather than updated: a file copied for the first time this run
+        # has no entry yet, and the indexer below merges over whatever is
+        # already there (``{**prior, ...}``), so the flag set here survives.
+        empty_src = manifest.setdefault("files", {})
+        for relkey in copy_result.get("empty_source_keys") or []:
+            entry = empty_src.get(relkey)
+            if isinstance(entry, dict):
+                entry["source_empty"] = True
+            else:
+                empty_src[relkey] = {"source_empty": True}
+
         self._record_failures(manifest, copy_result.get("failed_keys", []))
 
         copy_stopped = bool(copy_result.get("cancelled")) or bool(should_stop and should_stop())
@@ -1398,7 +1439,7 @@ class PhoneBackupManager:
         # last attempt's numbers — "0 copied, 0 skipped" — which reads as
         # "it did nothing" when in fact the work was done and saved.
         run_totals: Dict[str, int] = {
-            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
+            "copied": 0, "copied_locally": 0, "copied_empty": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
             "skipped_partial": 0,
         }
 
@@ -1719,12 +1760,17 @@ class PhoneBackupManager:
                 continue
 
             prior = files.get(rel, {})
-            # A content-bearing file with no content is not a backup of
-            # anything. Recording it "ok" is what let four 0-byte .webm files
-            # count toward "confirmed on disk" indefinitely: the phone had only
-            # the .trashed- version by then, so nothing ever revisited the path
-            # and the empty file stood in for the real one for good.
-            empty = self._is_empty_but_shouldnt_be(rel, stat.st_size)
+            # A content-bearing file with no content is normally a copy that
+            # didn't happen, and recording it "ok" would have the backup claim
+            # content it does not hold.
+            #
+            # Unless the phone's own copy is empty — a download that died
+            # before writing anything leaves a real 0-byte file, and faithfully
+            # copying it is the correct outcome, not a failure to re-attempt
+            # for ever. ``source_empty`` is set by the copy stage when the
+            # device itself reported 0 bytes.
+            empty = (self._is_empty_but_shouldnt_be(rel, stat.st_size)
+                     and not prior.get("source_empty"))
             files[rel] = {
                 **prior,
                 "size": stat.st_size,
@@ -2063,7 +2109,7 @@ class PhoneBackupManager:
         name_size_index: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
-            "copied": 0, "copied_locally": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
+            "copied": 0, "copied_locally": 0, "copied_empty": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
             "skipped_partial": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
@@ -2088,6 +2134,10 @@ class PhoneBackupManager:
         name_size_path = _write_temp_manifest_lookup(name_size_index or {})
         ps_path = _write_temp_script(_PS_COPY_MTP)
         unverified_size_paths: List[str] = []
+        # Copies the phone itself reports as 0 bytes. Tracked so the manifest
+        # can record that the emptiness came from the source, which stops a
+        # later re-index deciding the file is a broken copy.
+        empty_source_paths: List[str] = []
         # Which folder we most recently entered, and how many files had been
         # copied cumulatively at that moment — lets us tell, if this attempt
         # stalls, whether the folder we were listing made zero progress (i.e.
@@ -2238,6 +2288,20 @@ class PhoneBackupManager:
                     if progress_callback:
                         progress_callback(-1, f"Copied: {fname}")
 
+                elif line.startswith("FILE_OK_EMPTY:"):
+                    # The phone reports 0 bytes and we got 0 bytes — a correct
+                    # copy of an empty file, usually a download that died
+                    # before writing anything. Not queued for the integrity
+                    # check: its emptiness is the expected result, and treating
+                    # that as failure is what deleted these files and logged an
+                    # error on every single run.
+                    path = line[len("FILE_OK_EMPTY:"):]
+                    result["copied"] += 1
+                    result["copied_empty"] += 1
+                    empty_source_paths.append(path)
+                    if progress_callback:
+                        progress_callback(-1, f"Copied (empty on the phone): {Path(path).name}")
+
                 elif line.startswith("FILE_OK_UNSIZED:"):
                     # Copied, but the phone never reported a size for this
                     # file, so "it reached the expected byte count" was never
@@ -2381,6 +2445,16 @@ class PhoneBackupManager:
 
         if unverified_size_paths:
             self._verify_unsized_copies(unverified_size_paths, dest, result, progress_callback)
+
+        # Backup-relative paths whose emptiness is the phone's, not ours.
+        dest_root = Path(dest)
+        rels = []
+        for p in empty_source_paths:
+            try:
+                rels.append(str(Path(p).relative_to(dest_root)))
+            except ValueError:
+                continue
+        result["empty_source_keys"] = rels
 
         return result
 

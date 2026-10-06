@@ -443,12 +443,15 @@ class DeviceBackupPanel(QFrame):
         empty_files = manifest_summary.get("empty_files") or 0
         if empty_files:
             lines.append(
-                f"Present but EMPTY (0 bytes, not a usable backup): {empty_files} file(s)"
+                f"Present but EMPTY (0 bytes): {empty_files} file(s) — not counted above"
             )
             lines.append(
-                "  These are file types that cannot legitimately be empty. The phone "
-                "will be asked for them again; if it still can't supply the bytes "
-                "they'll be retried a few times and then left alone."
+                "  File types that normally carry content, holding none. If the phone "
+                "still has the file it will be fetched again; if the phone's own copy "
+                "is empty too (a download that died before writing anything) it gets "
+                "recorded as a correct backup of an empty file. Those still listed "
+                "here are ones no longer on the phone to re-read, so this is simply "
+                "what the backup holds."
             )
 
         lines += self._threat_lines(result.get("threat_scan"))
