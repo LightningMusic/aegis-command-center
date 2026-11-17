@@ -163,6 +163,7 @@ else { $out | ConvertTo-Json -Compress -Depth 2 }
 #   FILE_SKIP_MANIFEST:<relkey>            (manifest says unchanged/permanently-skip)
 #   FILE_SKIP_ELSEWHERE:<relkey>           (same name+size already confirmed backed up under a different path)
 #   FILE_SKIP_PARTIAL:<relkey>             (half-finished download, e.g. .crdownload/.part)
+#   FILE_REFETCH_MISSING:<relkey>          (manifest claimed it, but the backup copy is gone -> fetching again)
 #   FILE_TIMEOUT:<relkey>
 #   FILE_ERR:<relkey>:<message>
 #   FOLDER_ENTER:<shell_path>
@@ -637,6 +638,40 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
                 continue
             }
 
+            # Where this file belongs on the backup drive, and whether it is
+            # actually there right now.
+            $destFile = Join-Path $Dst $safeName
+            $destPresent = Test-Path -LiteralPath $destFile -PathType Leaf
+
+            # Every "already backed up" decision below was made from the
+            # manifest alone, so deleting a file out of the backup did not
+            # bring it back: the entry was still in the manifest, the phone had
+            # not changed, and the file was skipped for ever while the run
+            # reported success. A record of a copy is not the copy.
+            #
+            # Dropping the entry from this run's lookup is all that is needed --
+            # every skip path below is guarded by ContainsKey, so they all fall
+            # through to the normal fetch on their own.
+            #
+            # Two kinds of entry are deliberately left in place:
+            #   excluded - the user asked for this file NOT to be here, so a
+            #              missing file is the desired state, not a gap
+            #   skip     - a file that has failed repeatedly. It has no
+            #              destination either, and re-adding it every run is
+            #              exactly the thrashing that flag exists to stop.
+            if (-not $destPresent -and $manifestLookup.ContainsKey($relKey)) {
+                $gapEntry = $manifestLookup[$relKey]
+                $gapExcluded = $false
+                try { $gapExcluded = [bool]$gapEntry.excluded } catch { $gapExcluded = $false }
+                $gapPermSkip = $false
+                try { $gapPermSkip = [bool]$gapEntry.skip } catch { $gapPermSkip = $false }
+                if (-not $gapExcluded -and -not $gapPermSkip) {
+                    $manifestLookup.Remove($relKey)
+                    Write-Host "FILE_REFETCH_MISSING:$relKey"
+                    [Console]::Out.Flush()
+                }
+            }
+
             # Fast path: this folder's whole contents (names + count) match
             # exactly what was here last time we looked, so nothing in it
             # was added, removed, or renamed. Skip the per-file Size/Date
@@ -743,7 +778,8 @@ function CopyMTPFolderObject($Folder, [string]$Label, [string]$RelLabel, [string
             $sizeKnown = ($null -ne $rawSize)
             $expectedSize = if ($sizeKnown) { [int64]$rawSize } else { 0 }
 
-            $destFile = Join-Path $Dst $safeName
+            # $destFile / $destPresent were established before the manifest
+            # checks above, which need them.
 
             if (-not $ownPathKnown -and -not $ForceVerify -and $expectedSize -gt 0) {
                 # Never seen at this exact path -- but the same name AND size is
@@ -1439,7 +1475,7 @@ class PhoneBackupManager:
         # last attempt's numbers — "0 copied, 0 skipped" — which reads as
         # "it did nothing" when in fact the work was done and saved.
         run_totals: Dict[str, int] = {
-            "copied": 0, "copied_locally": 0, "copied_empty": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
+            "copied": 0, "copied_locally": 0, "copied_empty": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0, "refetch_missing": 0,
             "skipped_partial": 0,
         }
 
@@ -2109,7 +2145,7 @@ class PhoneBackupManager:
         name_size_index: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         result: Dict[str, Any] = {
-            "copied": 0, "copied_locally": 0, "copied_empty": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0,
+            "copied": 0, "copied_locally": 0, "copied_empty": 0, "skipped": 0, "skipped_manifest": 0, "skipped_elsewhere": 0, "skipped_excluded": 0, "refetch_missing": 0,
             "skipped_partial": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
@@ -2323,6 +2359,18 @@ class PhoneBackupManager:
                 elif line.startswith("FILE_SKIP_MANIFEST:"):
                     result["skipped"] += 1
                     result["skipped_manifest"] += 1
+
+                elif line.startswith("FILE_REFETCH_MISSING:"):
+                    # The manifest said this was backed up, but the file is not
+                    # on the backup drive any more — deleted by hand, or lost.
+                    # It is being fetched again. Not counted as copied here:
+                    # the copy itself reports that when it lands.
+                    relkey = line[len("FILE_REFETCH_MISSING:"):]
+                    result["refetch_missing"] += 1
+                    if progress_callback:
+                        leaf = relkey.replace("\\", "/").rsplit("/", 1)[-1]
+                        progress_callback(
+                            -1, f"Missing from the backup, fetching again: {leaf}")
 
                 elif line.startswith("FILE_SKIP_PARTIAL:"):
                     result["skipped"] += 1
@@ -2544,21 +2592,17 @@ class PhoneBackupManager:
         shutil, consulting the same manifest as the MTP path so unchanged
         files are skipped without even being statted twice.
         """
-        result: Dict[str, Any] = {
-            "copied": 0, "skipped": 0, "skipped_manifest": 0,
-            "errors": [], "failed_keys": [],
-            "cancelled": False, "stalled": False,
-        }
-
         _SKIP_DIRS = {
             "windows", "system volume information", "$recycle.bin",
             "program files", "program files (x86)", "programdata",
             ".thumbnails", ".trashed", ".cache", "lost.dir",
         }
 
-
+        # This was previously declared twice, the second overwriting the first,
+        # so the keys only present on the first were silently unavailable.
         result: Dict[str, Any] = {
             "copied": 0, "skipped": 0, "skipped_manifest": 0,
+            "skipped_excluded": 0, "refetch_missing": 0,
             "errors": [], "failed_keys": [],
             "cancelled": False, "stalled": False, "connection_failed": False,
         }
@@ -2614,26 +2658,45 @@ class PhoneBackupManager:
                 pct = int(idx / total * 100)
                 progress_callback(pct, f"Copying: {src_file.name}")
 
+            dst_file = dest_path / rel_key
+            dst_present = dst_file.is_file()
+
             manifest_entry = manifest_lookup.get(rel_key)
             if manifest_entry:
+                if manifest_entry.get("excluded"):
+                    # The user asked for this file not to be in the backup, so
+                    # its absence is the desired state. The MTP path already
+                    # honoured this; this path did not, which meant an excluded
+                    # file came back on any phone that mounts as a drive.
+                    result["skipped"] += 1
+                    result["skipped_excluded"] += 1
+                    continue
                 if manifest_entry.get("skip"):
                     result["skipped"] += 1
                     result["skipped_manifest"] += 1
                     continue
-                try:
-                    if manifest_entry.get("size") == src_file.stat().st_size:
-                        result["skipped"] += 1
-                        result["skipped_manifest"] += 1
-                        continue
-                except OSError:
-                    pass
-
-            dst_file = dest_path / rel_key
+                if dst_present:
+                    try:
+                        if manifest_entry.get("size") == src_file.stat().st_size:
+                            result["skipped"] += 1
+                            result["skipped_manifest"] += 1
+                            continue
+                    except OSError:
+                        pass
+                else:
+                    # The manifest claims this is backed up but the file is
+                    # gone. A record of a copy is not the copy — fetch it
+                    # again instead of skipping it for ever.
+                    result["refetch_missing"] += 1
+                    if progress_callback:
+                        progress_callback(
+                            -1, f"Missing from the backup, fetching again: "
+                                f"{src_file.name}")
 
             try:
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
 
-                if dst_file.exists():
+                if dst_present:
                     src_stat = src_file.stat()
                     dst_stat = dst_file.stat()
                     if (

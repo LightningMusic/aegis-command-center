@@ -425,6 +425,15 @@ class DeviceBackupPanel(QFrame):
                 lines.append(
                     f"  {excluded_now} left alone because you excluded them"
                 )
+            # Called out separately because the old behaviour here was silence:
+            # a file deleted out of the backup was skipped on the manifest's
+            # word and the run reported nothing to do.
+            refetched_now = totals.get("refetch_missing") or 0
+            if refetched_now:
+                lines.append(
+                    f"  {refetched_now} were missing from the backup and fetched "
+                    f"again (deleted or lost since the last run)"
+                )
             if copied_now == 0 and skipped_manifest_now == (skipped_now or 0) and skipped_manifest_now > 0:
                 lines.append(
                     "  (nothing copied because every file matched what's already "
