@@ -23,7 +23,13 @@ def _bootstrap_local_venv() -> None:
 _bootstrap_local_venv()
 
 from core.database import Database
+from core.media_logging import quiet_ffmpeg, quiet_qt_multimedia_rules
 from modules.task_manager import TaskManager
+
+# Qt reads QT_LOGGING_RULES when it first initialises, which happens inside
+# main(), so adding the multimedia rule here is early enough. Keeps the
+# terminal quiet when the preview panel opens a video; see core.media_logging.
+quiet_qt_multimedia_rules()
 
 
 def _load_stylesheet(app) -> None:
@@ -66,6 +72,10 @@ def main() -> None:
             print("  .venv\\Scripts\\python.exe -m pip install -r requirements.txt")
             raise SystemExit(1) from exc
         raise
+
+    # Drop FFmpeg's info-level stream dumps. Errors still print, and
+    # AEGIS_FFMPEG_LOG=info brings the detail back for debugging playback.
+    quiet_ffmpeg()
 
     from ui.main_window import MainWindow
 
