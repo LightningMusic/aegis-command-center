@@ -38,3 +38,6 @@ aegis.db-wal
 
 # Cached backup-drive index (rebuilt on demand)
 .backup_index_cache/
+
+# Timestamped config backups written by the app
+config.*.bak.json
