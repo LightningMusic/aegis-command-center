@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.doc_text import DOC_TEXT_EXTS, extract_text
 from core.integrity import _AUD_EXTS, _IMG_EXTS, _TEXT_EXTS, _VID_EXTS, verify_playthrough
 
 # Optional Qt modules — present in the standard PyQt6 wheel, but degrade quietly.
@@ -96,6 +97,7 @@ class PreviewPanel(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._path = ""
+        self._orig_pixmap: Optional[QPixmap] = None   # unscaled, for re-fitting
         self._verify_thread: Optional[QThread] = None
         self._verify_worker: Optional[_VerifyWorker] = None
         self._media_verify = False
@@ -122,7 +124,7 @@ class PreviewPanel(QWidget):
         root.addWidget(self.badge)
 
         self.stack = QStackedWidget()
-        self.stack.setMinimumHeight(280)
+        self.stack.setMinimumHeight(200)
         root.addWidget(self.stack, 1)
 
         # 0 — fallback / message
@@ -138,6 +140,13 @@ class PreviewPanel(QWidget):
         self.image_scroll = QScrollArea()
         self.image_scroll.setWidgetResizable(True)
         self.image_scroll.setWidget(self.image_label)
+        # The image is always scaled to fit, so scrollbars would never be
+        # needed -- and leaving them enabled causes a feedback loop where a bar
+        # appears, shrinks the viewport, and triggers another re-fit.
+        self.image_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.image_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.stack.addWidget(self.image_scroll)
 
         # 2 — media
@@ -196,7 +205,14 @@ class PreviewPanel(QWidget):
 
         self.video = QVideoWidget()
         self.video.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.video.setMinimumHeight(200)
+        # Letterbox inside whatever room the pane has rather than filling and
+        # cropping, and allow it to shrink well below a 16:9 frame so a short
+        # pane squeezes the picture instead of cutting it off.
+        try:
+            self.video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+        except Exception:  # noqa: BLE001 - older Qt without the setter
+            pass
+        self.video.setMinimumHeight(120)
         self.video.setStyleSheet("background: #000;")
         lay.addWidget(self.video, 1)
 
@@ -258,6 +274,8 @@ class PreviewPanel(QWidget):
             self._show_pdf(path)
         elif ext in _TEXT_EXTS:
             self._show_text(path)
+        elif ext in DOC_TEXT_EXTS:
+            self._show_document(path)
         else:
             self.stack.setCurrentWidget(self.msg_page)
             self.msg_page.setText(
@@ -271,6 +289,7 @@ class PreviewPanel(QWidget):
         if pix.isNull():
             pix = self._pil_pixmap(path)  # HEIC/AVIF/etc via Pillow(+pillow-heif)
         if pix is None or pix.isNull():
+            self._orig_pixmap = None
             ext = Path(path).suffix.lower()
             self.stack.setCurrentWidget(self.msg_page)
             self.msg_page.setText(
@@ -281,11 +300,33 @@ class PreviewPanel(QWidget):
                 "“Verify (full decode)” to check it."
             )
             return
-        view_w = max(self.image_scroll.viewport().width(), 200)
-        if pix.width() > view_w:
-            pix = pix.scaledToWidth(view_w, Qt.TransformationMode.SmoothTransformation)
-        self.image_label.setPixmap(pix)
+        self._orig_pixmap = pix
         self.stack.setCurrentWidget(self.image_scroll)
+        self._fit_image()
+
+    def _fit_image(self) -> None:
+        """Scale the current image down to sit wholly inside the pane.
+
+        Fits both dimensions, not just width -- scaling to width alone left
+        anything portrait-shaped running off the bottom. Never scales up, so a
+        small image is shown at its true size rather than interpolated.
+        """
+        pix = self._orig_pixmap
+        if pix is None or pix.isNull():
+            return
+        vp = self.image_scroll.viewport().size()
+        avail = QSize(max(vp.width() - 4, 64), max(vp.height() - 4, 64))
+        if pix.width() > avail.width() or pix.height() > avail.height():
+            pix = pix.scaled(avail, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        self.image_label.setPixmap(pix)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        # Re-fit as the splitter or window changes, so the image tracks the
+        # pane instead of being sized once when it was loaded.
+        if self.stack.currentWidget() is self.image_scroll:
+            self._fit_image()
 
     @staticmethod
     def _pil_pixmap(path: str) -> Optional[QPixmap]:
@@ -328,6 +369,24 @@ class PreviewPanel(QWidget):
             text = f"(could not read: {exc})"
         if os.path.getsize(path) > 200_000:
             text += "\n\n… (truncated preview) …"
+        self.text_view.setPlainText(text)
+        self.stack.setCurrentWidget(self.text_view)
+
+    def _show_document(self, path: str) -> None:
+        """.docx / .rtf / .doc / .odt / .pptx — extracted body text."""
+        text, note = extract_text(path)
+        if not text:
+            ext = Path(path).suffix.lower()
+            self.stack.setCurrentWidget(self.msg_page)
+            self.msg_page.setText(
+                f"No text could be read out of this {ext} file"
+                + (f":\n{note}" if note else ".")
+                + "\n\nIt may hold only images, or be corrupt. "
+                "Use “Open in default app”, or “Verify (full decode)”."
+            )
+            return
+        if note:
+            text = f"[{note}]\n\n{text}"
         self.text_view.setPlainText(text)
         self.stack.setCurrentWidget(self.text_view)
 
