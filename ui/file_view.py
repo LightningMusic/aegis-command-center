@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 from core.scan_worker import ScanWorker
 from core.util import human_bytes
 from ui.consolidate_view import ConsolidateView
+from ui.review_view import ReviewView
 from ui.thread_utils import stop_thread
 
 
@@ -553,11 +554,13 @@ class FilesView(QWidget):
         merge_tab.setLayout(merge_tab_layout)
 
         self.consolidate_view = ConsolidateView(self.file_manager)
+        self.review_view = ReviewView()
 
         self.tools_tabs.addTab(scan_tab, "Scanner")
         self.tools_tabs.addTab(backup_tab, "Backup Manager")
         self.tools_tabs.addTab(merge_tab, "Merge Folders")
         self.tools_tabs.addTab(self.consolidate_view, "Consolidate Drives")
+        self.tools_tabs.addTab(self.review_view, "Review & Triage")
 
         scan_group = QGroupBox("Scanner")
         scan_layout = QVBoxLayout()
@@ -1556,6 +1559,7 @@ class FilesView(QWidget):
             ("_diskmap_thread", "_diskmap_worker"),
         ):
             stop_thread(getattr(self, tname, None), getattr(self, wname, None))
-        cv = getattr(self, "consolidate_view", None)
-        if cv is not None and hasattr(cv, "shutdown"):
-            cv.shutdown()
+        for name in ("consolidate_view", "review_view"):
+            view = getattr(self, name, None)
+            if view is not None and hasattr(view, "shutdown"):
+                view.shutdown()
